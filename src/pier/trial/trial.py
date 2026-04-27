@@ -204,6 +204,9 @@ class Trial:
             trial_paths=self._trial_paths,
             task_env_config=self._task.config.environment,
             logger=self._logger,
+            agent_install_spec=self._agent.install_spec(),
+            network_allowlist=self._agent.network_allowlist(),
+            default_user=self._task.config.agent.user,
         )
 
         self._verifier_timeout_sec = min(
