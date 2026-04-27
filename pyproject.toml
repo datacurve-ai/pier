@@ -1,9 +1,21 @@
 [project]
 name = "pier"
 version = "0.1.0"
-description = "Run CLI coding agents and preserve their raw trajectories"
+description = "A framework for running coding agents in sandboxed environments and keeping full trajectories for analysis."
 requires-python = ">=3.12"
-dependencies = ["harbor>=0.1.0", "typer>=0.12"]
+dependencies = [
+    "anthropic>=0.97.0",
+    "anyio>=4.13.0",
+    "harbor>=0.1.0",
+    "loguru>=0.7.3",
+    "mcp>=1.27.0",
+    "modal>=1.4.2",
+    "pydantic>=2.13.3",
+    "shortuuid>=1.0.13",
+    "tenacity>=9.1.4",
+    "toml>=0.10.2",
+    "typer>=0.12",
+]
 
 [project.scripts]
 pier = "pier.cli.main:app"
