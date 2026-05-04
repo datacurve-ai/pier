@@ -16,13 +16,10 @@ from tenacity import (
     wait_exponential,
 )
 
-from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import BaseInstalledAgent, NonZeroAgentExitCodeError
 from pier.environments.base import HealthcheckError
-from pier.environments.factory import EnvironmentFactory
 from pier.models.agent.context import AgentContext
-from pier.models.agent.name import AgentName
-from pier.models.task.config import MultiStepRewardStrategy, StepConfig, TaskOS
+from pier.models.task.config import MultiStepRewardStrategy, StepConfig
 from pier.models.task.task import Task
 from pier.models.trial.config import ArtifactConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
@@ -34,24 +31,27 @@ from pier.models.trial.result import (
 )
 from pier.models.verifier.result import VerifierResult
 from pier.trial.hooks import TrialEvent, TrialHookEvent
+from pier.trial.execution import (
+    AgentSetupTimeoutError,
+    AgentTimeoutError,
+    EnvironmentStartTimeoutError,
+    TrialExecution,
+)
 from pier.utils.logger import logger
 from pier.verifier.verifier import Verifier
-
-
-class AgentSetupTimeoutError(asyncio.TimeoutError):
-    pass
-
-
-class AgentTimeoutError(asyncio.TimeoutError):
-    pass
 
 
 class VerifierTimeoutError(asyncio.TimeoutError):
     pass
 
 
-class EnvironmentStartTimeoutError(asyncio.TimeoutError):
-    pass
+__all__ = [
+    "AgentSetupTimeoutError",
+    "AgentTimeoutError",
+    "EnvironmentStartTimeoutError",
+    "Trial",
+    "VerifierTimeoutError",
+]
 
 
 TrialHookCallback = Callable[[TrialHookEvent], Awaitable[None]]
@@ -134,7 +134,7 @@ class Trial:
     6. Uploads the results.
     """
 
-    _AGENT_SETUP_TIMEOUT_SEC = 360
+    _AGENT_SETUP_TIMEOUT_SEC = 360.0
     _ARTIFACT_TAR_PATH = "/tmp/.hb-artifact-snapshot.tar.gz"
     _ARTIFACT_TAR_NAME = ".hb-artifact-snapshot.tar.gz"
 
@@ -161,53 +161,21 @@ class Trial:
         self._log_handler: logging.Handler | None = None
         self._init_logger()
 
-        _agent_base_timeout = (
-            config.agent.override_timeout_sec or self._task.config.agent.timeout_sec
-        )
-        _agent_cap = config.agent.max_timeout_sec or float("inf")
-        _agent_multiplier = (
-            config.agent_timeout_multiplier
-            if config.agent_timeout_multiplier is not None
-            else config.timeout_multiplier
-        )
-        if _agent_base_timeout is not None:
-            self._agent_timeout_sec: float | None = (
-                min(_agent_base_timeout, _agent_cap) * _agent_multiplier
-            )
-        else:
-            self._agent_timeout_sec = None
-
-        extra_kwargs = {}
-        if config.agent.name == AgentName.ORACLE.value:
-            extra_kwargs = {
-                "task_dir": self._task._task_dir,
-                "trial_paths": self._trial_paths,
-                "agent_timeout_sec": self._agent_timeout_sec,
-            }
-        if self._task.config.environment.mcp_servers:
-            extra_kwargs["mcp_servers"] = self._task.config.environment.mcp_servers
-        if self._task.config.environment.skills_dir:
-            extra_kwargs["skills_dir"] = self._task.config.environment.skills_dir
-
-        self._agent = AgentFactory.create_agent_from_config(
-            config.agent,
-            logs_dir=self._trial_paths.agent_dir,
-            logger=self._logger,
-            **extra_kwargs,
-        )
-
-        self._environment = EnvironmentFactory.create_environment_from_config(
-            config=config.environment,
-            environment_dir=self._task.paths.environment_dir,
-            environment_name=self._task.name,
-            session_id=self.config.trial_name,
+        self._execution = TrialExecution.create(
+            task=self._task,
+            agent_config=config.agent,
+            environment_config=config.environment,
             trial_paths=self._trial_paths,
-            task_env_config=self._task.config.environment,
+            session_id=self.config.trial_name,
             logger=self._logger,
-            agent_install_spec=self._agent.install_spec(),
-            network_allowlist=self._agent.network_allowlist(),
-            default_user=self._task.config.agent.user,
+            timeout_multiplier=config.timeout_multiplier,
+            agent_timeout_multiplier=config.agent_timeout_multiplier,
+            agent_setup_timeout_multiplier=config.agent_setup_timeout_multiplier,
+            environment_build_timeout_multiplier=config.environment_build_timeout_multiplier,
+            default_agent_setup_timeout_sec=self._AGENT_SETUP_TIMEOUT_SEC,
         )
+        self._agent = self._execution.agent
+        self._environment = self._execution.environment
 
         self._verifier_timeout_sec = min(
             config.verifier.override_timeout_sec
@@ -217,25 +185,6 @@ class Trial:
             config.verifier_timeout_multiplier
             if config.verifier_timeout_multiplier is not None
             else config.timeout_multiplier
-        )
-
-        self._agent_setup_timeout_sec = (
-            config.agent.override_setup_timeout_sec
-            if config.agent.override_setup_timeout_sec is not None
-            else self._AGENT_SETUP_TIMEOUT_SEC
-        ) * (
-            config.agent_setup_timeout_multiplier
-            if config.agent_setup_timeout_multiplier is not None
-            else self.config.timeout_multiplier
-        )
-
-        self._environment_build_timeout_sec = (
-            self._task.config.environment.build_timeout_sec
-            * (
-                config.environment_build_timeout_multiplier
-                if config.environment_build_timeout_multiplier is not None
-                else self.config.timeout_multiplier
-            )
         )
 
         self._result: TrialResult | None = None
@@ -301,52 +250,16 @@ class Trial:
         )
 
         try:
-            await self._start_environment_with_retry()
+            await self._execution.start_environment(
+                force_build=self.config.environment.force_build
+            )
         finally:
             self.result.environment_setup.finished_at = datetime.now(timezone.utc)
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(EnvironmentStartTimeoutError),
-    )
-    async def _start_environment_with_retry(self) -> None:
-        try:
-            await asyncio.wait_for(
-                self._environment.start(
-                    force_build=self.config.environment.force_build
-                ),
-                timeout=self._environment_build_timeout_sec,
-            )
-        except asyncio.TimeoutError as e:
-            raise EnvironmentStartTimeoutError(
-                f"Environment start timed out after {
-                    self._environment_build_timeout_sec
-                } seconds"
-            ) from e
-
     async def _setup_agent(self) -> None:
-        if (
-            self._environment.task_os == TaskOS.WINDOWS
-            and not self._agent.SUPPORTS_WINDOWS
-        ):
-            raise RuntimeError(
-                f"Agent '{self._agent.name()}' does not support Windows containers. "
-                "Only agents with SUPPORTS_WINDOWS = True can run Windows tasks "
-                "(currently: oracle, nop)."
-            )
-
         self.result.agent_setup = TimingInfo(started_at=datetime.now(timezone.utc))
         try:
-            await asyncio.wait_for(
-                self._agent.setup(environment=self._environment),
-                timeout=self._agent_setup_timeout_sec,
-            )
-        except asyncio.TimeoutError as e:
-            raise AgentSetupTimeoutError(
-                f"Agent setup timed out after {self._agent_setup_timeout_sec} seconds"
-            ) from e
+            await self._execution.setup_agent()
         finally:
             self.result.agent_setup.finished_at = datetime.now(timezone.utc)
 
@@ -358,18 +271,10 @@ class Trial:
         try:
             self.result.agent_result = AgentContext()
 
-            await asyncio.wait_for(
-                self._agent.run(
-                    instruction=self._task.instruction,
-                    environment=self._environment,
-                    context=self.result.agent_result,
-                ),
-                timeout=self._agent_timeout_sec,
+            await self._execution.run_agent(
+                instruction=self._task.instruction,
+                context=self.result.agent_result,
             )
-        except asyncio.TimeoutError as e:
-            raise AgentTimeoutError(
-                f"Agent execution timed out after {self._agent_timeout_sec} seconds"
-            ) from e
         finally:
             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
 

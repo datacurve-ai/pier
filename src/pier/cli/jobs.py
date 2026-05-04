@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 from typer import Option, Typer
 
+from pier.cli.host_env import confirm_host_env_access
 from pier.cli.utils import parse_env_vars, parse_kwargs, run_async
 from pier.models.agent.name import AgentName
 from pier.models.environment_type import EnvironmentType
@@ -32,137 +33,6 @@ jobs_app = Typer(
     no_args_is_help=True, context_settings={"help_option_names": ["-h", "--help"]}
 )
 console = Console()
-
-
-def _confirm_host_env_access(
-    job,
-    console: Console,
-    *,
-    explicit_env_file_keys: set[str] | None = None,
-    skip_confirm: bool = False,
-) -> None:
-    import os
-
-    from pier.models.agent.name import AgentName
-    from pier.models.task.task import Task
-    from pier.utils.env import get_required_host_vars
-
-    is_oracle = any(a.name == AgentName.ORACLE.value for a in job.config.agents)
-    explicit_env_file_keys = explicit_env_file_keys or set()
-    explicit_job_environment_keys = set(job.config.environment.env)
-    explicit_job_verifier_keys = set(job.config.verifier.env)
-    sections: dict[str, list[tuple[str, str | None]]] = {}
-
-    for task_config in job._task_configs:
-        try:
-            local_path = task_config.get_local_path()
-        except ValueError:
-            continue
-        if not local_path.exists():
-            continue
-        try:
-            task = Task(local_path)
-        except Exception:
-            continue
-
-        env_sections = [
-            ("environment", task.config.environment.env),
-            ("verifier", task.config.verifier.env),
-        ]
-        if is_oracle:
-            env_sections.append(("solution", task.config.solution.env))
-
-        for section_name, env_dict in env_sections:
-            filtered_env_dict = env_dict
-            if section_name == "environment" and explicit_job_environment_keys:
-                filtered_env_dict = {
-                    key: value
-                    for key, value in env_dict.items()
-                    if key not in explicit_job_environment_keys
-                }
-            elif section_name == "verifier" and explicit_job_verifier_keys:
-                filtered_env_dict = {
-                    key: value
-                    for key, value in env_dict.items()
-                    if key not in explicit_job_verifier_keys
-                }
-
-            required = [
-                item
-                for item in get_required_host_vars(filtered_env_dict)
-                if item[0] not in explicit_env_file_keys
-            ]
-            if required:
-                key = f"[{section_name}.env]"
-                existing = list(sections.get(key, []))
-                for item in required:
-                    if item not in existing:
-                        existing.append(item)
-                if existing:
-                    sections[key] = existing
-
-    if not sections:
-        return
-
-    missing = []
-    for section, vars_list in sections.items():
-        for var_name, default in vars_list:
-            if default is None and var_name not in os.environ:
-                missing.append((section, var_name))
-
-    if missing:
-        table = Table(
-            title="Missing Environment Variables",
-            title_style="bold red",
-            show_header=True,
-            header_style="bold",
-            padding=(0, 2),
-            show_edge=False,
-            show_lines=False,
-        )
-        table.add_column("Variable", style="cyan")
-        table.add_column("Phase", style="dim")
-
-        for section, var_name in missing:
-            escaped = section.replace("[", "\\[")
-            table.add_row(var_name, escaped)
-
-        console.print()
-        console.print(table)
-        console.print(
-            "\n[yellow]Export them in your shell or pass --env-file.[/yellow]"
-        )
-        raise SystemExit(1)
-
-    if skip_confirm:
-        return
-
-    table = Table(
-        title="Environment Variables",
-        title_style="bold",
-        show_header=True,
-        header_style="bold",
-        padding=(0, 2),
-        show_edge=False,
-        show_lines=False,
-    )
-    table.add_column("Variable", style="cyan")
-    table.add_column("Phase", style="dim")
-
-    for section, vars_list in sections.items():
-        escaped = section.replace("[", "\\[")
-        for var_name, default in vars_list:
-            table.add_row(var_name, escaped)
-
-    console.print()
-    console.print(table)
-    console.print()
-
-    response = console.input(
-        "Tasks in this run will load these from your environment. [yellow]Proceed? (Y/n):[/yellow] "
-    )
-    if response.strip().lower() in ("n", "no"):
-        raise SystemExit(0)
 
 
 def _format_duration(started_at: datetime | None, finished_at: datetime | None) -> str:
@@ -838,9 +708,12 @@ def start(
 
     async def _run_job():
         job = await Job.create(config)
-        _confirm_host_env_access(
-            job,
-            console,
+        confirm_host_env_access(
+            task_configs=job._task_configs,
+            agents=job.config.agents,
+            environment=job.config.environment,
+            verifier=job.config.verifier,
+            console=console,
             explicit_env_file_keys=explicit_env_file_keys,
             skip_confirm=yes,
         )

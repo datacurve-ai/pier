@@ -1,0 +1,149 @@
+---
+title: Diagnostic Jobs
+description: Running agentic diagnostics over completed trials
+---
+
+A diagnostic job runs a judge agent over the artifacts from an existing Pier job. It does not solve the task and it does not run the verifier as the source trial. Instead, Pier starts a fresh sandbox for each selected source trial, loads both the task and that trial's result artifacts into the sandbox, gives the diagnostic agent an external prompt, and collects the diagnostic result.
+
+Use diagnostic jobs to answer questions such as:
+
+- Why did this trial pass or fail?
+- Did the solving agent misunderstand the task, run out of time, hit an API failure, or make a wrong implementation?
+- Does the task prompt, repository setup, hidden test, verifier, or environment look unfair or broken?
+- Is the source trial itself evaluable, or was it dominated by run orchestration such as a shortened timeout?
+
+Diagnostic jobs are intentionally prompt-agnostic. Pier provides the execution substrate and artifact contract; you provide the judge prompt.
+
+## Run a diagnostic job
+
+Run diagnostics against an existing job directory:
+
+```bash
+pier diagnose run jobs/2026-05-04__08-41-11 \
+  --prompt ./diagnostic-prompt.md \
+  --agent codex \
+  --model gpt-5.3-codex \
+  --env docker
+```
+
+You can also reuse agent and environment defaults from a Pier job config:
+
+```bash
+pier diagnose run jobs/2026-05-04__08-41-11 \
+  --prompt ./diagnostic-prompt.md \
+  --config ./agents.yaml \
+  --agent-index 0 \
+  --env modal
+```
+
+Common filters:
+
+```bash
+# Diagnose one source trial
+pier diagnose run jobs/example --prompt ./prompt.md --trial-name task__abc123
+
+# Diagnose only failed source trials
+pier diagnose run jobs/example --prompt ./prompt.md --failing
+
+# Run a small sample first
+pier diagnose run jobs/example --prompt ./prompt.md --limit 5
+```
+
+Most agent and environment flags mirror `pier run`, including `--agent`, `--model`, `--agent-kwarg`, `--agent-env`, `--env`, `--force-build`, `--delete`, resource overrides, timeout multipliers, `--n-concurrent`, `--env-file`, and `--yes`.
+
+## What Pier provides to the judge
+
+Each diagnostic item gets a normal task sandbox. Before the judge agent runs, Pier uploads:
+
+```
+/diagnostic/input/
+|-- task/    # the source task directory
+`-- trial/   # the completed source trial directory
+```
+
+The diagnostic prompt can use these template variables:
+
+| Variable | Meaning |
+|----------|---------|
+| `{task_dir}` | Sandbox path to the uploaded task directory |
+| `{trial_dir}` | Sandbox path to the uploaded source trial directory |
+| `{source_trial_name}` | Name of the source trial directory |
+| `{task_name}` | Task name from `task.toml` |
+| `{diagnostic_result_path}` | Required JSON output path |
+| `{diagnostic_markdown_path}` | Optional Markdown notes output path |
+
+Pier appends a runtime contract to the prompt with the concrete task, trial, and output paths.
+
+## Output contract
+
+The judge agent must write a valid JSON object to:
+
+```bash
+/logs/artifacts/diagnostic-result.json
+```
+
+It may also write human-readable notes to:
+
+```bash
+/logs/artifacts/diagnostic-result.md
+```
+
+Pier collects those files like normal artifacts and stores the parsed JSON object on the diagnostic item result.
+
+## Result layout
+
+A diagnostic run is stored under the source job:
+
+```
+<job_dir>/
+|-- result.json
+|-- <source_trial>/
+|   `-- result.json
+`-- diagnostics/
+    `-- <diagnostic_run_name>/
+        |-- config.json
+        |-- prompt.md
+        |-- result.json
+        `-- <source_trial>/
+            |-- diagnostic-config.json
+            |-- diagnostic-metadata.json
+            |-- diagnostic.log
+            |-- agent/
+            `-- artifacts/
+                |-- diagnostic-result.json
+                |-- diagnostic-result.md
+                `-- manifest.json
+```
+
+`diagnostics/<run>/result.json` is the diagnostic job summary. Each per-trial `diagnostic-metadata.json` records the diagnostic agent metadata, timings, source trial URI, diagnostic trial URI, parsed `diagnostic_result`, and any diagnostic-run exception.
+
+Diagnostic trial directories intentionally do not contain `trial.log` or source-trial `result.json` names at their root. This keeps them distinct from normal Pier trial directories.
+
+## Prompt Ownership
+
+Pier copies your judge prompt into the diagnostic run directory:
+
+- `prompt.md`
+
+The persisted copy is the source of truth for resumes. If the original file changes after the first run, resuming the diagnostic job continues to use the prompt stored under `diagnostics/<run>/`.
+
+Use `--overwrite` to replace a diagnostic run. Without `--overwrite`, Pier resumes matching diagnostic runs and rejects a run name if the stored config does not match the requested config.
+
+## Recommended diagnostic shape
+
+Pier accepts any JSON object, but a useful diagnostic result usually separates these concepts:
+
+- **Trial outcome:** what happened in this particular source trial.
+- **Trial validity:** whether the source trial produced a meaningfully evaluable final attempt.
+- **Agent assessment:** what the solving agent did wrong, when the run gave it a meaningful chance.
+- **Orchestration assessment:** whether runner settings, timeouts, endpoint failures, retries, or intentionally shortened budgets influenced the outcome.
+- **Task fairness:** whether the task prompt, repo setup, hidden tests, verifier, or expected behavior are fair independent of this trial's orchestration.
+- **Environment assessment:** whether sandbox or verifier behavior blocked a fair result.
+
+## Relation to verifier rewards
+
+A normal Pier trial asks an agent to solve a task and asks the verifier to write reward artifacts.
+
+A diagnostic job asks a judge agent to inspect a completed trial and write diagnostic artifacts.
+
+The diagnostic result is not a replacement for the verifier reward. It is extra evidence for understanding trial outcomes and task quality.
