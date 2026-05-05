@@ -99,7 +99,7 @@ A diagnostic run is stored under the source job:
 |-- result.json
 |-- <source_trial>/
 |   `-- result.json
-`-- diagnostics/
+`-- .diagnostics/
     `-- <diagnostic_run_name>/
         |-- config.json
         |-- prompt.md
@@ -115,7 +115,7 @@ A diagnostic run is stored under the source job:
                 `-- manifest.json
 ```
 
-`diagnostics/<run>/result.json` is the diagnostic job summary. Each per-trial `diagnostic-metadata.json` records the diagnostic agent metadata, timings, source trial URI, diagnostic trial URI, parsed `diagnostic_result`, and any diagnostic-run exception.
+`.diagnostics/<run>/result.json` is the diagnostic job summary. Each per-trial `diagnostic-metadata.json` records the diagnostic agent metadata, timings, source trial URI, diagnostic trial URI, parsed `diagnostic_result`, and any diagnostic-run exception.
 
 Diagnostic trial directories intentionally do not contain `trial.log` or source-trial `result.json` names at their root. This keeps them distinct from normal Pier trial directories.
 
@@ -125,7 +125,7 @@ Pier copies your judge prompt into the diagnostic run directory:
 
 - `prompt.md`
 
-The persisted copy is the source of truth for resumes. If the original file changes after the first run, resuming the diagnostic job continues to use the prompt stored under `diagnostics/<run>/`.
+The persisted copy is the source of truth for resumes. If the original file changes after the first run, resuming the diagnostic job continues to use the prompt stored under `.diagnostics/<run>/`.
 
 Use `--overwrite` to replace a diagnostic run. Without `--overwrite`, Pier resumes matching diagnostic runs and rejects a run name if the stored config does not match the requested config.
 

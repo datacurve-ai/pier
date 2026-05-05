@@ -90,6 +90,16 @@ def test_mini_swe_model_kwargs_pass_through_nested_values(tmp_path: Path):
     )
 
 
+def test_mini_swe_set_cache_control_can_be_enabled(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openrouter/qwen/qwen3.6-plus",
+        set_cache_control="default_end",
+    )
+
+    assert "-c model.set_cache_control=default_end" in agent._build_config_flags()
+
+
 def test_convert_openai_responses_usage_to_atif_metrics():
     trajectory = convert_mini_swe_agent_to_atif(
         {
@@ -222,3 +232,59 @@ def test_convert_chat_message_keeps_reasoning_separate_from_visible_content():
     assert len(agent_steps) == 1
     assert agent_steps[0].message == "I will create the file."
     assert agent_steps[0].reasoning_content == "The task asks for hello.txt."
+
+
+def test_convert_openrouter_byok_uses_upstream_cost_details():
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "trajectory_format": "mini-swe-agent-1.1",
+            "info": {
+                "mini_version": "2.2.8",
+                "model_stats": {"instance_cost": 0.0, "api_calls": 1},
+                "config": {
+                    "model": {"model_name": "moonshotai/kimi-k2.6"}
+                },
+            },
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "task"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command": "pwd"}',
+                            },
+                        }
+                    ],
+                    "extra": {
+                        "response": {
+                            "usage": {
+                                "prompt_tokens": 1000,
+                                "completion_tokens": 100,
+                                "cost": 0,
+                                "is_byok": True,
+                                "prompt_tokens_details": {
+                                    "cached_tokens": 800,
+                                    "cache_write_tokens": 0,
+                                },
+                                "cost_details": {
+                                    "upstream_inference_cost": 0.00123,
+                                },
+                            }
+                        }
+                    },
+                },
+            ],
+        },
+        "session",
+    )
+
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_cost_usd == 0.00123
+    agent_steps = [step for step in trajectory.steps if step.source == "agent"]
+    assert agent_steps[0].metrics is not None
+    assert agent_steps[0].metrics.cost_usd == 0.00123

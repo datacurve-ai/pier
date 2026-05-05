@@ -122,13 +122,19 @@ def _build_step_metrics(
     completion_tokens_details: dict[str, Any],
     total_cost_usd: float,
     total_completion_tokens: int,
+    step_cost_usd: float | None = None,
 ) -> Metrics | None:
     """Build metrics for an individual step."""
     if prompt_tokens == 0 and completion_tokens == 0:
         return None
 
-    step_cost = None
-    if total_cost_usd > 0 and total_completion_tokens > 0 and completion_tokens > 0:
+    step_cost = step_cost_usd
+    if (
+        step_cost is None
+        and total_cost_usd > 0
+        and total_completion_tokens > 0
+        and completion_tokens > 0
+    ):
         step_cost = (completion_tokens / total_completion_tokens) * total_cost_usd
 
     extra_metrics: dict[str, Any] = {}
@@ -205,6 +211,20 @@ def _usage_from_message(message: dict[str, Any]) -> dict[str, Any]:
     response_data = extra.get("response") or {}
     usage = response_data.get("usage") or message.get("usage") or {}
     return usage if isinstance(usage, dict) else {}
+
+
+def _cost_from_usage(usage: dict[str, Any]) -> float | None:
+    cost = usage.get("cost")
+    if isinstance(cost, int | float) and cost > 0:
+        return float(cost)
+
+    cost_details = usage.get("cost_details")
+    if not isinstance(cost_details, dict):
+        return None
+    upstream_cost = cost_details.get("upstream_inference_cost")
+    if isinstance(upstream_cost, int | float) and upstream_cost > 0:
+        return float(upstream_cost)
+    return None
 
 
 def _response_output_text_reasoning_and_tool_calls(
@@ -294,6 +314,7 @@ def convert_mini_swe_agent_to_atif(
     total_reasoning_tokens = 0
     total_text_tokens = 0
     total_cost_usd = (info.get("model_stats") or {}).get("instance_cost") or 0.0
+    total_usage_cost = 0.0
 
     # First pass: count total completion tokens for cost apportioning
     for message in messages:
@@ -301,6 +322,10 @@ def convert_mini_swe_agent_to_atif(
         total_completion_tokens += (
             usage.get("completion_tokens") or usage.get("output_tokens") or 0
         )
+        total_usage_cost += _cost_from_usage(usage) or 0.0
+
+    if total_cost_usd <= 0 and total_usage_cost > 0:
+        total_cost_usd = total_usage_cost
 
     # Process messages
     for i, message in enumerate(messages):
@@ -335,6 +360,7 @@ def convert_mini_swe_agent_to_atif(
         text_tokens = completion_tokens_details.get("text_tokens")
         if text_tokens is None and completion_tokens > 0 and reasoning_tokens > 0:
             text_tokens = max(0, completion_tokens - reasoning_tokens)
+        step_cost_usd = _cost_from_usage(usage)
 
         total_prompt_tokens += prompt_tokens
         total_cached_tokens += cached_tokens
@@ -383,6 +409,7 @@ def convert_mini_swe_agent_to_atif(
                 completion_tokens_details=completion_tokens_details,
                 total_cost_usd=total_cost_usd,
                 total_completion_tokens=total_completion_tokens,
+                step_cost_usd=step_cost_usd,
             )
 
             steps.append(
@@ -415,6 +442,7 @@ def convert_mini_swe_agent_to_atif(
                 completion_tokens_details=completion_tokens_details,
                 total_cost_usd=total_cost_usd,
                 total_completion_tokens=total_completion_tokens,
+                step_cost_usd=step_cost_usd,
             )
 
             steps.append(
@@ -550,6 +578,7 @@ class MiniSweAgent(BaseInstalledAgent):
         reasoning_effort: str | None = None,
         model_class: str | None = "auto",
         model_kwargs: dict[str, Any] | None = None,
+        set_cache_control: str | None = None,
         config_yaml: str | None = None,
         config_file: str | None = None,
         *args,
@@ -560,6 +589,7 @@ class MiniSweAgent(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._model_class = model_class
         self._model_kwargs = model_kwargs or {}
+        self._set_cache_control = set_cache_control
         self._config_yaml = config_yaml
         if config_file:
             self._config_yaml = Path(config_file).read_text()
@@ -731,6 +761,12 @@ mini-swe-agent --help
             config_flags += (
                 f"-c model.model_kwargs.reasoning_effort="
                 f"{shlex.quote(self._reasoning_effort)} "
+            )
+
+        if self._set_cache_control:
+            config_flags += (
+                f"-c model.set_cache_control="
+                f"{shlex.quote(self._set_cache_control)} "
             )
 
         config_flags += self._model_kwargs_config_flags()
