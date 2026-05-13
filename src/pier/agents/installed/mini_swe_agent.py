@@ -578,6 +578,7 @@ class MiniSweAgent(BaseInstalledAgent):
         reasoning_effort: str | None = None,
         model_class: str | None = "auto",
         model_kwargs: dict[str, Any] | None = None,
+        extra_python_packages: list[str] | None = None,
         set_cache_control: str | None = None,
         config_yaml: str | None = None,
         config_file: str | None = None,
@@ -589,6 +590,7 @@ class MiniSweAgent(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._model_class = model_class
         self._model_kwargs = model_kwargs or {}
+        self._extra_python_packages = extra_python_packages or []
         self._set_cache_control = set_cache_control
         self._config_yaml = config_yaml
         if config_file:
@@ -610,8 +612,21 @@ class MiniSweAgent(BaseInstalledAgent):
         match = re.search(r"(\d+\.\d+\S*)", stdout)
         return match.group(1) if match else stdout.strip()
 
+    @property
+    def _install_python_packages(self) -> list[str]:
+        packages = list(self._extra_python_packages)
+        if self.model_name and self.model_name.startswith("vertex_ai/"):
+            packages.append("google-auth")
+        return list(dict.fromkeys(packages))
+
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"=={self._version}" if self._version else ""
+        install_extra_packages = ""
+        if self._install_python_packages:
+            packages = " ".join(shlex.quote(pkg) for pkg in self._install_python_packages)
+            install_extra_packages = (
+                f'uv pip install --python "$python_bin" {packages}\n'
+            )
         root_run = (
             "if command -v apt-get &>/dev/null; then"
             "  apt-get update && apt-get install -y curl build-essential git;"
@@ -635,6 +650,7 @@ source "$HOME/.local/bin/env"
 uv tool install mini-swe-agent{version_spec}
 
 python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
+{install_extra_packages}
 "$python_bin" <<'PY'
 import json
 import sys
