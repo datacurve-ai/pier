@@ -56,64 +56,46 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
 
-## Agent runtime configuration
+## Job configs
 
-Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes.
+`pier run` and `pier critique run` can load a job config with `--config`:
 
-A few things we've learned plumbing this through Respan and OpenRouter:
-
-**Claude Code** routes through the Anthropic face from Respan. Plan mode is disabled by default (`--disallowedTools EnterPlanMode`).
-
-```yaml
-- name: claude-code
-  model_name: claude-opus-4-7
-  env:
-    ANTHROPIC_AUTH_TOKEN: ${RESPAN_API_KEY}
-    ANTHROPIC_BASE_URL: https://endpoint.respan.ai/api/anthropic
-    ANTHROPIC_CUSTOM_HEADERS: "X-Respan-Route-Provider: vertex_ai"
-  kwargs:
-    reasoning_effort: max
+```bash
+export RESPAN_API_KEY=...
+uv run pier run --config configs/respan-dual-agent-local-task.yaml --yes
 ```
 
-**Codex** needs a `[model_providers.<name>]` block with `wire_api = "responses"` (not WebSockets, which Codex defaults to and Respan doesn't speak).
+Config files can live anywhere you can pass to `--config`. Supported extensions are `.yaml` and `.json`; `.yml` is not supported today.
+
+A job config implements `pier.models.job.config.JobConfig`. The common top-level shape is:
 
 ```yaml
-- name: codex
-  model_name: openai/gpt-5.5
-  env: { RESPAN_API_KEY: ${RESPAN_API_KEY} }
-  kwargs:
-    config_toml: |
-      model_provider = "respan"
-      [model_providers.respan]
-      name = "Respan Gateway"
-      base_url = "https://endpoint.respan.ai/api/"
-      wire_api = "responses"
-      env_key = "RESPAN_API_KEY"
-    reasoning_effort: xhigh
+job_name: my-job
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 1
+environment:
+  type: docker        # or modal
+agents:
+  - name: claude-code
+    model_name: claude-opus-4-7
+    env:
+      ANTHROPIC_AUTH_TOKEN: ${RESPAN_API_KEY}
+    kwargs:
+      reasoning_effort: max
+tasks:
+  - path: path/to/one-task
+# Or, for a directory containing many task directories:
+# datasets:
+#   - path: path/to/local-dataset
+#     n_tasks: 10
+#     sample_seed: 0
 ```
 
-**Gemini CLI**:
+For local Harbor directories, `tasks:` entries point at individual task directories containing `task.toml`, `instruction.md`, `environment/`, and `tests/`. `datasets:` entries point at directories of task directories; dataset configs can filter with `task_names` / `exclude_task_names` and sample with `n_tasks` / `sample_seed`.
 
-```yaml
-- name: gemini-cli
-  model_name: gemini/gemini-3.1-pro-preview
-  env:
-    GEMINI_API_KEY: ${RESPAN_API_KEY}
-    GOOGLE_GENERATIVE_AI_API_KEY: ${RESPAN_API_KEY}
-    GEMINI_API_BASE: https://endpoint.respan.ai/api/google/vertexai/v1beta
-    GOOGLE_GEMINI_BASE_URL: https://endpoint.respan.ai/api/google/vertexai/
-```
+Runtime secrets should not be committed. Put `${VAR_NAME}` placeholders in config files, then provide the real values in your shell or with `--env-file`. Pier resolves those placeholders when constructing the agent or environment, and serializes known sensitive env values back as templates so job artifacts do not leak real keys.
 
-**OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
+Agent entries use `model_name` for trial metadata, `env` for runtime environment variables, and agent-specific `kwargs` for tool configuration.
 
-**mini-swe-agent** picks a native adapter from the model-name prefix: `openai/...` → `litellm_response` (OpenAI Responses end-to-end), `openrouter/...` → `openrouter` (BYOK costs from `cost_details.upstream_inference_cost`), everything else → LiteLLM auto.
-
-For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Gemini API default high/dynamic thinking level, but it does not request readable thought summaries. Set `kwargs.reasoning_effort: high` explicitly when you want LiteLLM to send `includeThoughts` and preserve returned summaries as reasoning content.
-
-```yaml
-- name: mini-swe-agent
-  model_name: openrouter/qwen/qwen3.6-plus
-  env: { OPENROUTER_API_KEY: ${OPENROUTER_API_KEY} }
-  kwargs:
-    set_cache_control: default_end
-```
+See `configs/README.md` and `configs/respan-dual-agent-local-task.yaml` for a runnable Respan-backed Claude Code + Codex config example.

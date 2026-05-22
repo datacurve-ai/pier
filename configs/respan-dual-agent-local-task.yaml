@@ -1,0 +1,49 @@
+# Example Pier job config for running the same local Harbor task with two
+# Respan-backed agents. Run from the repository root:
+#
+#   export RESPAN_API_KEY=...
+#   uv run pier run --config configs/respan-dual-agent-local-task.yaml --yes
+#
+# This uses Pier's checked-in hello-world task so the config is portable.
+
+job_name: respan-dual-agent-local-task
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 1
+quiet: false
+debug: false
+
+environment:
+  type: docker
+
+agents:
+  - name: claude-code
+    model_name: claude-opus-4-7
+    env:
+      # Pier resolves ${RESPAN_API_KEY} from your shell or --env-file at runtime.
+      # Do not put real secrets in committed config files.
+      ANTHROPIC_AUTH_TOKEN: ${RESPAN_API_KEY}
+      ANTHROPIC_BASE_URL: https://endpoint.respan.ai/api/anthropic
+      ANTHROPIC_CUSTOM_HEADERS: "X-Respan-Route-Provider: vertex_ai"
+    kwargs:
+      reasoning_effort: max
+
+  - name: codex
+    model_name: openai/gpt-5.5
+    env:
+      RESPAN_API_KEY: ${RESPAN_API_KEY}
+    kwargs:
+      # Respan's Codex path uses OpenAI Responses, not Codex's websocket default.
+      config_toml: |
+        model_provider = "respan"
+        [model_providers.respan]
+        name = "Respan Gateway"
+        base_url = "https://endpoint.respan.ai/api/"
+        wire_api = "responses"
+        env_key = "RESPAN_API_KEY"
+      reasoning_effort: high
+
+# Use tasks for one Harbor-format task directory containing task.toml,
+# instruction.md, environment/, and tests/.
+tasks:
+  - path: examples/tasks/hello-world
