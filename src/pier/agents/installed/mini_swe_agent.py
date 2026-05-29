@@ -554,8 +554,13 @@ class MiniSweAgent(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
 
     CLI_FLAGS: ClassVar[list[CliFlag]] = []
+    _PATCHED_LITELLM_PACKAGE = (
+        "litellm @ git+https://github.com/oss-agent-shin/litellm.git"
+        "@lit3410-claude-opus-4-8"
+    )
     _LITELLM_MODEL_COST_MAP_URL = (
-        "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+        "https://raw.githubusercontent.com/oss-agent-shin/litellm/"
+        "lit3410-claude-opus-4-8/"
         "model_prices_and_context_window.json"
     )
     _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = {
@@ -575,7 +580,7 @@ class MiniSweAgent(BaseInstalledAgent):
     def __init__(
         self,
         cost_limit: str | int | float | None = 0,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | None = "max",
         model_class: str | None = "auto",
         model_kwargs: dict[str, Any] | None = None,
         extra_python_packages: list[str] | None = None,
@@ -621,6 +626,7 @@ class MiniSweAgent(BaseInstalledAgent):
 
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"=={self._version}" if self._version else ""
+        patched_litellm_package = shlex.quote(self._PATCHED_LITELLM_PACKAGE)
         install_extra_packages = ""
         if self._install_python_packages:
             packages = " ".join(shlex.quote(pkg) for pkg in self._install_python_packages)
@@ -647,10 +653,24 @@ if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null;
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 fi
 source "$HOME/.local/bin/env"
-uv tool install mini-swe-agent{version_spec}
+uv tool install --with {patched_litellm_package} mini-swe-agent{version_spec}
 
 python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
+
 {install_extra_packages}
+uv pip install --python "$python_bin" --reinstall-package litellm {patched_litellm_package}
+"$python_bin" - <<'PY'
+import importlib.metadata as md
+import litellm
+
+direct_url = md.distribution("litellm").read_text("direct_url.json") or ""
+print("LiteLLM file:", litellm.__file__)
+print("LiteLLM version:", md.version("litellm"))
+print("LiteLLM direct_url:", direct_url)
+if "oss-agent-shin/litellm" not in direct_url:
+    raise SystemExit("patched LiteLLM fork is not installed in mini-swe-agent environment")
+PY
+
 "$python_bin" <<'PY'
 import json
 import sys
@@ -674,6 +694,14 @@ except Exception as exc:
     print(
         f"Warning: failed to refresh LiteLLM model cost map backup: {{exc}}",
         file=sys.stderr,
+    )
+
+data = json.loads(path.read_text(encoding="utf-8"))
+opus_48 = data.get("claude-opus-4-8")
+if not isinstance(opus_48, dict) or opus_48.get("supports_max_reasoning_effort") is not True:
+    raise SystemExit(
+        "patched LiteLLM model map is missing claude-opus-4-8 "
+        "supports_max_reasoning_effort=true"
     )
 PY
 

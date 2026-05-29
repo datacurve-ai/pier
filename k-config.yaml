@@ -1,0 +1,28 @@
+n_attempts: 1
+n_concurrent_trials: 1
+
+environment:
+  type: docker
+  force_build: true
+
+tasks:
+  - path: examples/tasks/hello-world
+
+agents:
+  - name: mini-swe-agent
+    model_name: anthropic/claude-opus-4-8
+    env:
+      ANTHROPIC_API_KEY: ${RESPAN_API_KEY}
+      ANTHROPIC_BASE_URL: https://endpoint.respan.ai/api/anthropic
+      ANTHROPIC_CUSTOM_HEADERS: "X-Respan-Route-Provider: vertex_ai"
+    kwargs:
+      model_class: litellm_textbased
+      # extra_python_packages:
+      #   - "litellm @ git+https://github.com/oss-agent-shin/litellm.git@lit3410-claude-opus-4-8"
+      # config_file: configs/mini-swe-agent-textbased.yaml
+      model_kwargs:
+        thinking:
+          type: adaptive
+          display: summarized
+        # output_config:
+        #   effort: max

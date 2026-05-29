@@ -30,6 +30,7 @@ export const FAMILY_CONFIG: Record<string, FamilyConfig> = {
 export const FAMILY_RANK: Record<string, string[]> = {
   openai: ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
   anthropic: [
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -60,7 +61,7 @@ export function bareModelName(model: string): string {
 
 export function getFamily(
   provider: string | null,
-  model: string | null
+  model: string | null,
 ): string {
   if (!model) return "other";
   const m = model.toLowerCase();
@@ -86,7 +87,7 @@ export function getFamily(
 export function familyColor(
   family: string,
   rankIndex: number,
-  rankCount: number
+  rankCount: number,
 ): string {
   const cfg = FAMILY_CONFIG[family] ?? FAMILY_CONFIG.other;
   const t = rankCount > 1 ? rankIndex / (rankCount - 1) : 0;
@@ -102,7 +103,7 @@ export function familyColor(
 export function sortByFamilyRank<T>(
   items: T[],
   family: string,
-  labelOf: (item: T) => string
+  labelOf: (item: T) => string,
 ): T[] {
   const ranking = FAMILY_RANK[family];
   return [...items].sort((a, b) => {

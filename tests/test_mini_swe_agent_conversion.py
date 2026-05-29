@@ -6,14 +6,19 @@ from pier.agents.installed.mini_swe_agent import (
 )
 
 
-def test_mini_swe_install_refreshes_litellm_cost_map_backup(tmp_path: Path):
+def test_mini_swe_install_uses_patched_litellm(tmp_path: Path):
     agent = MiniSweAgent(logs_dir=tmp_path, model_name="openai/gpt-5.5")
 
     spec = agent.install_spec()
+    run = spec.steps[-1].run
 
     assert spec.steps[-1].env == {"LITELLM_LOCAL_MODEL_COST_MAP": "true"}
-    assert MiniSweAgent._LITELLM_MODEL_COST_MAP_URL in spec.steps[-1].run
-    assert "model_prices_and_context_window_backup.json" in spec.steps[-1].run
+    assert MiniSweAgent._PATCHED_LITELLM_PACKAGE in run
+    assert "--reinstall-package litellm" in run
+    assert MiniSweAgent._LITELLM_MODEL_COST_MAP_URL in run
+    assert "BerriAI/litellm/main" not in run
+    assert "model_prices_and_context_window_backup.json" in run
+    assert "claude-opus-4-8" in run
 
 
 def test_mini_swe_cost_limit_zero_is_config_override(tmp_path: Path):
