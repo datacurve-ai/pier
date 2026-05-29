@@ -462,6 +462,13 @@ class DockerEnvironment(BaseEnvironment):
                 "not found. Please ensure at least one of these files exist."
             )
 
+    @staticmethod
+    def _build_command(*, force_build: bool) -> list[str]:
+        command = ["build"]
+        if force_build:
+            command.append("--no-cache")
+        return command
+
     async def _run_docker_compose_command(
         self, command: list[str], check: bool = True, timeout_sec: int | None = None
     ) -> ExecResult:
@@ -627,7 +634,9 @@ class DockerEnvironment(BaseEnvironment):
                 self.environment_name, asyncio.Lock()
             )
             async with lock:
-                await self._run_docker_compose_command(["build"])
+                await self._run_docker_compose_command(
+                    self._build_command(force_build=force_build)
+                )
 
         # Validate image OS after build/pull but before container start.
         image_to_check = (

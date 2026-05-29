@@ -379,11 +379,15 @@ def start(
         bool | None,
         Option(
             "--force-build/--no-force-build",
-            help=f"Whether to force rebuild the environment (default: {
-                '--force-build'
-                if EnvironmentConfig.model_fields['force_build'].default
-                else '--no-force-build'
-            })",
+            help=(
+                "Whether to force rebuild the environment; local Docker builds "
+                "use --no-cache when enabled (default: %s)"
+                % (
+                    "--force-build"
+                    if EnvironmentConfig.model_fields["force_build"].default
+                    else "--no-force-build"
+                )
+            ),
             rich_help_panel="Environment",
             show_default=False,
         ),

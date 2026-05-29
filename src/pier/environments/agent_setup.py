@@ -61,6 +61,16 @@ def write_agent_dockerfile(
         source = source_environment_dir / "Dockerfile"
         dockerfile = [source.read_text()]
 
+    fingerprint = install.fingerprint()
+    dockerfile.extend(
+        [
+            f"ARG PIER_AGENT_INSTALL_FINGERPRINT={fingerprint}",
+            docker_run_command(
+                'printf "Pier agent install fingerprint: %s\\n" '
+                '"$PIER_AGENT_INSTALL_FINGERPRINT"'
+            ),
+        ]
+    )
     dockerfile.extend(dockerfile_install_commands(install, user=user))
     dockerfile.append("")
     dockerfile_path.write_text("\n".join(dockerfile))
