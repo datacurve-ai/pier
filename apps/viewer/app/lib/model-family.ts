@@ -30,6 +30,7 @@ export const FAMILY_CONFIG: Record<string, FamilyConfig> = {
 export const FAMILY_RANK: Record<string, string[]> = {
   openai: ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
   anthropic: [
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",

@@ -17,6 +17,7 @@ import { Button } from "~/components/ui/button";
 import { Combobox, type ComboboxOption } from "~/components/ui/combobox";
 import { Kbd } from "~/components/ui/kbd";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
+import { JobEfficiencyChart } from "~/components/job-efficiency-chart";
 import { JobScatterChart } from "~/components/job-scatter-chart";
 import { JobSlopeChart } from "~/components/job-slope-chart";
 import { fetchComparisonHeatmap, type JobHeatmapTrialsFilter } from "~/lib/api";
@@ -251,7 +252,11 @@ export default function ComparePage() {
   useHotkeys("escape", () => navigate("/"));
 
   const activeTab =
-    tabParam === "cross-bench" || tabParam === "scatter" ? tabParam : "heatmap";
+    tabParam === "cross-bench" ||
+    tabParam === "scatter" ||
+    tabParam === "efficiency"
+      ? tabParam
+      : "heatmap";
 
   const heatmapRowValue: JobHeatmapRowBy =
     heatmapRowBy === "agent" || heatmapRowBy === "model" ? heatmapRowBy : "config";
@@ -308,7 +313,9 @@ export default function ComparePage() {
       }),
     enabled:
       jobNames.length >= 1 &&
-      (activeTab === "cross-bench" || activeTab === "scatter"),
+      (activeTab === "cross-bench" ||
+        activeTab === "scatter" ||
+        activeTab === "efficiency"),
     placeholderData: keepPreviousData,
   });
 
@@ -468,6 +475,7 @@ export default function ComparePage() {
               <TabsTrigger value="heatmap">Heat Map</TabsTrigger>
               <TabsTrigger value="cross-bench">Cross-Bench</TabsTrigger>
               <TabsTrigger value="scatter">Scatter</TabsTrigger>
+              <TabsTrigger value="efficiency">Efficiency</TabsTrigger>
             </TabsList>
           </div>
           <TabsContent value="heatmap" className="mt-0 p-4">
@@ -507,6 +515,17 @@ export default function ComparePage() {
               <CompareError message={`Error loading scatter comparison: ${slopeError.message}`} />
             ) : (
               <JobScatterChart
+                data={filteredSlopeData}
+                isLoading={slopeLoading}
+                isFetching={slopeIsPlaceholder}
+              />
+            )}
+          </TabsContent>
+          <TabsContent value="efficiency" className="mt-0 p-4">
+            {slopeError ? (
+              <CompareError message={`Error loading efficiency comparison: ${slopeError.message}`} />
+            ) : (
+              <JobEfficiencyChart
                 data={filteredSlopeData}
                 isLoading={slopeLoading}
                 isFetching={slopeIsPlaceholder}

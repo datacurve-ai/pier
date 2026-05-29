@@ -29,7 +29,7 @@ import { cn } from "~/lib/utils";
 // Marker shapes
 // ---------------------------------------------------------------------------
 
-const SHAPE_KEYS = [
+export const SHAPE_KEYS = [
   "circle",
   "square",
   "triangle",
@@ -37,7 +37,7 @@ const SHAPE_KEYS = [
   "plus",
   "cross",
 ] as const;
-type ShapeKey = (typeof SHAPE_KEYS)[number];
+export type ShapeKey = (typeof SHAPE_KEYS)[number];
 
 interface ShapeProps {
   cx: number;
@@ -49,7 +49,7 @@ interface ShapeProps {
   opacity?: number;
 }
 
-function MarkerShape({
+export function MarkerShape({
   shape,
   cx,
   cy,
@@ -167,7 +167,7 @@ function MarkerShape({
 }
 
 /** Stable mapping from agent name to a shape. */
-function buildAgentShapeMap(agents: string[]): Map<string, ShapeKey> {
+export function buildAgentShapeMap(agents: string[]): Map<string, ShapeKey> {
   const sorted = [...new Set(agents)].sort((a, b) => a.localeCompare(b));
   const map = new Map<string, ShapeKey>();
   sorted.forEach((agent, i) => {
@@ -327,8 +327,8 @@ function buildScatter(
 // Label collision avoidance (inline labels next to points)
 // ---------------------------------------------------------------------------
 
-interface LabelPlacement {
-  point: ScatterPoint;
+export interface LabelPlacement<T> {
+  point: T;
   cx: number;
   cy: number;
   /** Final label position; may be nudged off the anchor. */
@@ -338,21 +338,34 @@ interface LabelPlacement {
   side: "left" | "right";
 }
 
+/** Minimal shape a point needs to be labelled. */
+interface LabelablePoint {
+  x: number;
+  y: number;
+  label: string;
+  rowKey: string;
+}
+
 /**
- * Place text labels next to scatter points. Greedy: sort by score desc,
+ * Place text labels next to chart points. Greedy: sort by score desc,
  * try to place each label without overlapping an existing one's bounding
  * box. If no slot fits within `maxNudge` px of the anchor, drop it.
+ *
+ * `scoreOf` controls placement priority when labels compete for space;
+ * it defaults to x + y (favours the top-right) but charts with an
+ * inverted axis can pass a custom ranking.
  */
-function placeLabels(
-  points: ScatterPoint[],
+export function placeLabels<T extends LabelablePoint>(
+  points: T[],
   xForValue: (v: number) => number,
   yForValue: (v: number) => number,
   estimateWidth: (label: string) => number,
   textHeight: number,
-  plot: { left: number; right: number; top: number; bottom: number }
-): LabelPlacement[] {
-  const sorted = [...points].sort((a, b) => b.x + b.y - (a.x + a.y));
-  const placements: LabelPlacement[] = [];
+  plot: { left: number; right: number; top: number; bottom: number },
+  scoreOf: (p: T) => number = (p) => p.x + p.y
+): LabelPlacement<T>[] {
+  const sorted = [...points].sort((a, b) => scoreOf(b) - scoreOf(a));
+  const placements: LabelPlacement<T>[] = [];
   const occupied: { x1: number; y1: number; x2: number; y2: number }[] = [];
 
   const overlaps = (a: typeof occupied[number], b: typeof occupied[number]) =>
@@ -374,7 +387,7 @@ function placeLabels(
       candidates.push({ dx: -baseOffset, dy: nudge, side: "left" });
     }
 
-    let placed: LabelPlacement | null = null;
+    let placed: LabelPlacement<T> | null = null;
     for (const c of candidates) {
       const lx =
         c.side === "right" ? cx + c.dx : cx + c.dx; // anchor x

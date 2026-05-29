@@ -112,6 +112,7 @@ import {
   ChartToolbarAction,
   ChartToolbarSelect,
 } from "~/components/ui/chart-toolbar";
+import { JobEfficiencyChart } from "~/components/job-efficiency-chart";
 import { JobScalingChart } from "~/components/job-scaling-chart";
 import { JobScatterChart } from "~/components/job-scatter-chart";
 import { JobSlopeChart } from "~/components/job-slope-chart";
@@ -1596,7 +1597,10 @@ export default function Job() {
         trialsFilter: "non_errored",
       }),
     enabled:
-      !!jobName && (activeTab === "cross-bench" || activeTab === "scatter"),
+      !!jobName &&
+      (activeTab === "cross-bench" ||
+        activeTab === "scatter" ||
+        activeTab === "efficiency"),
     refetchInterval: job?.finished_at ? false : 5000,
     placeholderData: keepPreviousData,
   });
@@ -1841,6 +1845,7 @@ export default function Job() {
             <TabsTrigger value="heatmap">Heat Map</TabsTrigger>
             <TabsTrigger value="cross-bench">Cross-Bench</TabsTrigger>
             <TabsTrigger value="scatter">Scatter</TabsTrigger>
+            <TabsTrigger value="efficiency">Efficiency</TabsTrigger>
             <TabsTrigger value="scaling">Scaling</TabsTrigger>
             <TabsTrigger value="summary">Analysis</TabsTrigger>
           </TabsList>
@@ -2148,6 +2153,34 @@ export default function Job() {
             />
           </div>
           <JobScatterChart
+            data={slopeData}
+            isLoading={slopeLoading}
+            isFetching={slopeIsPlaceholder}
+          />
+        </TabsContent>
+        <TabsContent value="efficiency">
+          <div className="grid grid-cols-7 -mb-px">
+            <HeatmapControls
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              agentOptions={agentOptions}
+              agentFilter={agentFilter}
+              setAgentFilter={setAgentFilter}
+              providerOptions={providerOptions}
+              providerFilter={providerFilter}
+              setProviderFilter={setProviderFilter}
+              modelOptions={modelOptions}
+              modelFilter={modelFilter}
+              setModelFilter={setModelFilter}
+              sourceOptions={sourceOptions}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
+              taskOptions={taskOptions}
+              taskFilter={taskFilter}
+              setTaskFilter={setTaskFilter}
+            />
+          </div>
+          <JobEfficiencyChart
             data={slopeData}
             isLoading={slopeLoading}
             isFetching={slopeIsPlaceholder}
