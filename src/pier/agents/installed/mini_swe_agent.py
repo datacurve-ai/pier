@@ -30,6 +30,7 @@ from pier.models.trajectories import (
     Trajectory,
 )
 from pier.models.trial.paths import EnvironmentPaths
+from pier.utils.pricing import compute_cost
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
@@ -158,9 +159,7 @@ def _build_step_metrics(
     )
 
 
-def _parse_tool_calls(
-    message: dict[str, Any], step_id: int
-) -> list[ToolCall] | None:
+def _parse_tool_calls(message: dict[str, Any], step_id: int) -> list[ToolCall] | None:
     """Parse tool calls from an assistant message into ATIF ToolCall objects."""
     message_tool_calls = message.get("tool_calls")
     if not message_tool_calls:
@@ -340,7 +339,9 @@ def convert_mini_swe_agent_to_atif(
             usage.get("completion_tokens") or usage.get("output_tokens") or 0
         )
         prompt_tokens_details = (
-            usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+            usage.get("prompt_tokens_details")
+            or usage.get("input_tokens_details")
+            or {}
         )
         if not isinstance(prompt_tokens_details, dict):
             prompt_tokens_details = {}
@@ -623,7 +624,9 @@ class MiniSweAgent(BaseInstalledAgent):
         version_spec = f"=={self._version}" if self._version else ""
         install_extra_packages = ""
         if self._install_python_packages:
-            packages = " ".join(shlex.quote(pkg) for pkg in self._install_python_packages)
+            packages = " ".join(
+                shlex.quote(pkg) for pkg in self._install_python_packages
+            )
             install_extra_packages = (
                 f'uv pip install --python "$python_bin" {packages}\n'
             )
@@ -781,13 +784,32 @@ mini-swe-agent --help
 
         if self._set_cache_control:
             config_flags += (
-                f"-c model.set_cache_control="
-                f"{shlex.quote(self._set_cache_control)} "
+                f"-c model.set_cache_control={shlex.quote(self._set_cache_control)} "
             )
 
         config_flags += self._model_kwargs_config_flags()
 
         return config_flags
+
+    def _compute_cost_from_pricing(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cached_tokens: int | None,
+    ) -> float | None:
+        """Cache-aware cost from token counts via the shared pricing helper.
+
+        Returns ``None`` when the model can't be priced safely (e.g. cached
+        tokens were used but no cache-read rate is known); callers keep the
+        reported cost in that case.
+        """
+        return compute_cost(
+            self.model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            logger=self.logger,
+        )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Read the mini-swe-agent trajectory
@@ -812,6 +834,20 @@ mini-swe-agent --help
                 populate_context_from_final_metrics(
                     context, atif_trajectory.final_metrics
                 )
+                # Recompute with cache-aware pricing. mini-swe-agent's reported
+                # cost bills every prompt token at the input rate when a model
+                # lacks a cache-read price, overstating cache-heavy runs (see
+                # datacurve-ai/deep-swe#21). When we can price the model
+                # completely, that cache-aware figure is authoritative; when we
+                # can't (compute_cost returns None / fail-loud), the reported
+                # cost is left untouched.
+                cache_aware_cost = self._compute_cost_from_pricing(
+                    prompt_tokens=context.n_input_tokens,
+                    completion_tokens=context.n_output_tokens,
+                    cached_tokens=context.n_cache_tokens,
+                )
+                if cache_aware_cost is not None:
+                    context.cost_usd = cache_aware_cost
         except Exception as e:
             self.logger.debug(f"Failed to convert trajectory to ATIF format: {e}")
 

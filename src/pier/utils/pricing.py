@@ -67,7 +67,27 @@ class ModelPricing:
     output_cost_per_token: float
     cache_read_input_token_cost: float | None
     cache_creation_input_token_cost: float | None
-    source: str  # "override" or "litellm"
+    source: str  # "override", "litellm", or "supplementary"
+
+
+# Curated rates for models LiteLLM's registry is missing or lags on. This is a
+# stopgap so cost is correct out of the box for known gaps -- the long-term fix
+# is upstreaming these to litellm (model_prices_and_context_window.json). It is
+# consulted only after the user overrides file and litellm, and anything here can
+# be overridden or extended via PIER_PRICING_FILE. Rates are USD per token.
+# deepseek-v4-* rates from datacurve-ai/deep-swe#21 and PR #4 (thanks @dephnor).
+SUPPLEMENTARY_PRICING: dict[str, dict[str, float]] = {
+    "deepseek-v4-pro": {
+        "input_cost_per_token": 0.435 / 1_000_000,
+        "output_cost_per_token": 0.87 / 1_000_000,
+        "cache_read_input_token_cost": 0.003625 / 1_000_000,
+    },
+    "deepseek-v4-flash": {
+        "input_cost_per_token": 0.14 / 1_000_000,
+        "output_cost_per_token": 0.28 / 1_000_000,
+        "cache_read_input_token_cost": 0.0028 / 1_000_000,
+    },
+}
 
 
 # Simple mtime-keyed cache so an edited overrides file is picked up without a
@@ -134,21 +154,25 @@ def resolve_model_pricing(
     if not model_name:
         return None
 
+    # Resolution order: user overrides -> litellm -> shipped supplementary gaps.
     entry = _lookup(load_pricing_overrides(), model_name)
     source = "override"
     if entry is None:
         try:
             import litellm
+
+            entry = _lookup(litellm.model_cost, model_name)
+            source = "litellm"
         except ImportError:
-            logger.error(
-                "litellm is not installed and no %s entry exists for %r; "
-                "cannot compute cost",
+            logger.warning(
+                "litellm is not installed; relying on %s and built-in "
+                "supplementary pricing for %r",
                 PRICING_FILE_ENV,
                 model_name,
             )
-            return None
-        entry = _lookup(litellm.model_cost, model_name)
-        source = "litellm"
+    if entry is None:
+        entry = _lookup(SUPPLEMENTARY_PRICING, model_name)
+        source = "supplementary"
 
     if entry is None:
         return None

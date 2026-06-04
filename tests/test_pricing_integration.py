@@ -13,6 +13,7 @@ import pytest
 from pier.agents.installed.codex import Codex
 from pier.agents.installed.cursor_cli import CursorCli
 from pier.agents.installed.gemini_cli import GeminiCli
+from pier.agents.installed.mini_swe_agent import MiniSweAgent
 from pier.utils.pricing import (
     PRICING_FALLBACK_ENV,
     PRICING_FILE_ENV,
@@ -113,6 +114,29 @@ def test_cursor_resolve_pricing_rates_fails_loud(tmp_path, monkeypatch, caplog):
         result = agent._resolve_pricing_rates()
 
     assert result is None  # unpriced rather than silently billing cache at input
+    assert any("cache-read price" in r.message for r in caplog.records)
+
+
+def test_mini_swe_agent_prices_deepseek_via_supplementary(tmp_path):
+    """mini-swe path: deepseek-v4-pro (absent from litellm) priced cache-aware
+    out of the box via the shipped supplementary table -- no override needed."""
+    agent = MiniSweAgent(logs_dir=tmp_path, model_name="openrouter/deepseek-v4-pro")
+
+    cost = agent._compute_cost_from_pricing(PROMPT, OUTPUT, CACHED)
+
+    # uncached 1.908M @ 4.35e-7 + cache 7.078M @ 3.625e-9 + out 43.11k @ 8.7e-7
+    assert cost == pytest.approx(EXPECTED_DISCOUNTED, abs=1e-3)
+
+
+def test_mini_swe_agent_fails_loud_on_missing_cache_rate(tmp_path, monkeypatch, caplog):
+    # Override strips the cache rate -> mini-swe leaves cost unpriced (keeps reported).
+    _overrides(tmp_path, {"deepseek-v4-pro": RATES_NO_CACHE}, monkeypatch)
+    agent = MiniSweAgent(logs_dir=tmp_path, model_name="openrouter/deepseek-v4-pro")
+
+    with caplog.at_level("ERROR"):
+        cost = agent._compute_cost_from_pricing(PROMPT, OUTPUT, CACHED)
+
+    assert cost is None
     assert any("cache-read price" in r.message for r in caplog.records)
 
 

@@ -145,6 +145,30 @@ def test_unknown_model_returns_none(caplog):
     assert cost is None
 
 
+def test_supplementary_prices_model_absent_from_litellm():
+    """deepseek-v4-pro isn't in litellm; the shipped supplementary table covers it."""
+    pricing = resolve_model_pricing("deepseek-v4-pro")
+    assert pricing is not None
+    assert pricing.source == "supplementary"
+    assert pricing.cache_read_input_token_cost == pytest.approx(0.003625 / 1_000_000)
+
+
+def test_supplementary_strips_provider_prefix():
+    pricing = resolve_model_pricing("openrouter/deepseek-v4-pro")
+    assert pricing is not None and pricing.source == "supplementary"
+
+
+def test_override_beats_supplementary(tmp_path, monkeypatch):
+    path = _write_overrides(
+        tmp_path,
+        {"deepseek-v4-pro": {**DEEPSEEK_RATES, "input_cost_per_token": 9.9e-7}},
+    )
+    monkeypatch.setenv(PRICING_FILE_ENV, str(path))
+    pricing = resolve_model_pricing("deepseek-v4-pro")
+    assert pricing.source == "override"
+    assert pricing.input_cost_per_token == pytest.approx(9.9e-7)
+
+
 def test_bad_overrides_file_raises(tmp_path, monkeypatch):
     path = tmp_path / "pricing.json"
     path.write_text("not json", encoding="utf-8")

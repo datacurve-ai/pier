@@ -132,11 +132,15 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
 
 ### Cost computation & pricing overrides
 
-When an adapter computes `cost_usd` from token counts, it resolves per-token
-rates through `pier.utils.pricing`: a user-supplied overrides file first, then
-LiteLLM's `model_cost` table. Cache **reads** are billed at the model's
-discounted `cache_read_input_token_cost`, and the uncached remainder at the full
-input rate.
+When an adapter computes `cost_usd` from token counts (codex, gemini-cli,
+cursor-cli, and mini-swe-agent), it resolves per-token rates through
+`pier.utils.pricing`, in order: a user-supplied **overrides file**, then
+LiteLLM's `model_cost` table, then a small **built-in supplementary table** for
+models LiteLLM doesn't yet ship (e.g. `deepseek-v4-pro`). Cache **reads** are
+billed at the model's discounted `cache_read_input_token_cost`, and the uncached
+remainder at the full input rate. (For mini-swe-agent this cache-aware figure
+replaces the reported cost only when the model can be priced completely;
+otherwise the reported cost is kept.)
 
 If a model has no known cache-read rate but the run *used* cached tokens, cost is
 left **unpriced** (`cost_usd = null`) with an error log, rather than silently
