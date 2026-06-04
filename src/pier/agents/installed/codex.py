@@ -28,6 +28,7 @@ from pier.models.trajectories import (
 )
 from pier.models.trial.paths import EnvironmentPaths
 from pier.utils.env import parse_bool_env_value
+from pier.utils.pricing import compute_cost
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     populate_context_from_final_metrics,
@@ -560,45 +561,18 @@ class Codex(BaseInstalledAgent):
         completion_tokens: int | None,
         cached_tokens: int | None,
     ) -> float | None:
-        """Compute total cost in USD from token counts via LiteLLM pricing."""
-        if not self.model_name:
-            return None
+        """Compute total cost in USD from token counts via resolved pricing.
 
-        try:
-            import litellm
-        except ImportError:
-            self.logger.warning("litellm not available; leaving codex cost_usd as None")
-            return None
-
-        pricing: dict[str, Any] | None = None
-        for key in (self.model_name, self.model_name.split("/", 1)[-1]):
-            entry = litellm.model_cost.get(key)
-            if entry:
-                pricing = entry
-                break
-
-        if pricing is None:
-            self.logger.warning(
-                "No LiteLLM pricing entry for model '%s'; leaving codex "
-                "cost_usd as None",
-                self.model_name,
-            )
-            return None
-
-        input_rate = pricing.get("input_cost_per_token") or 0.0
-        output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
-        if cache_read_rate is None:
-            cache_read_rate = input_rate
-
-        uncached_input = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
-        cached = cached_tokens or 0
-        output = completion_tokens or 0
-
-        return (
-            uncached_input * input_rate
-            + cached * cache_read_rate
-            + output * output_rate
+        Delegates to :func:`pier.utils.pricing.compute_cost`, which prices cache
+        reads at their discounted rate and refuses to silently bill them at the
+        full input rate when that rate is unknown (see the module docstring).
+        """
+        return compute_cost(
+            self.model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            logger=self.logger,
         )
 
     def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
