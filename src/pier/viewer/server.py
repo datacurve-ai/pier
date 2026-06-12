@@ -23,6 +23,7 @@ from pier.models.job.config import (
 )
 from pier.models.job.result import JobStats
 from pier.models.trial.result import TrialResult
+from pier.utils.pricing import resolve_model_pricing
 from pier.viewer.models import (
     CritiqueHeatmapCell,
     CritiqueHeatmapColumn,
@@ -237,40 +238,25 @@ def create_app(
             ..., description="Model name, e.g. 'gpt-4' or 'openai/gpt-4'"
         ),
     ) -> ModelPricing:
-        """Look up per-token pricing for a model from LiteLLM's pricing table.
+        """Look up per-token pricing for a model.
 
-        Falls back to the bare model name when the provider-prefixed form is
-        not in the table (e.g. ``openai/gpt-4`` -> ``gpt-4``). Cache read
-        rate falls back to the input rate when not separately listed.
+        Resolved from the ``PIER_PRICING_FILE`` overrides then LiteLLM, falling
+        back to the bare model name when the provider-prefixed form is not in the
+        table (e.g. ``openai/gpt-4`` -> ``gpt-4``). The cache-read rate is
+        reported as ``null`` when not separately listed, rather than mirroring
+        the input rate (which would misrepresent the true cost of cache hits).
         """
-        try:
-            import litellm
-        except ImportError as e:
-            raise HTTPException(status_code=503, detail="LiteLLM not available") from e
-
-        pricing: dict[str, Any] | None = None
-        for key in (model, model.split("/", 1)[-1]):
-            entry = litellm.model_cost.get(key)
-            if entry:
-                pricing = entry
-                break
-
+        pricing = resolve_model_pricing(model)
         if pricing is None:
             raise HTTPException(
                 status_code=404, detail=f"No pricing entry for model '{model}'"
             )
 
-        input_rate = pricing.get("input_cost_per_token")
-        output_rate = pricing.get("output_cost_per_token")
-        cache_read_rate = pricing.get("cache_read_input_token_cost")
-        if cache_read_rate is None:
-            cache_read_rate = input_rate
-
         return ModelPricing(
             model_name=model,
-            input_cost_per_token=input_rate,
-            cache_read_input_token_cost=cache_read_rate,
-            output_cost_per_token=output_rate,
+            input_cost_per_token=pricing.input_cost_per_token,
+            cache_read_input_token_cost=pricing.cache_read_input_token_cost,
+            output_cost_per_token=pricing.output_cost_per_token,
         )
 
     if mode == "tasks":

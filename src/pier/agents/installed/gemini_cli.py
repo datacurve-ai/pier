@@ -27,6 +27,7 @@ from pier.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from pier.utils.pricing import compute_cost
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
@@ -544,38 +545,19 @@ class GeminiCli(BaseInstalledAgent):
         completion_tokens: int | None,
         cached_tokens: int | None,
     ) -> float | None:
-        if not self.model_name:
-            return None
+        """Compute total cost in USD from token counts via resolved pricing.
 
-        try:
-            import litellm
-        except ImportError:
-            self.logger.warning("litellm not available; cost_usd left as None")
-            return None
-
-        pricing: dict[str, Any] | None = None
-        for key in (self.model_name, self.model_name.split("/", 1)[-1]):
-            entry = litellm.model_cost.get(key)
-            if entry:
-                pricing = entry
-                break
-
-        if pricing is None:
-            self.logger.warning(
-                "No LiteLLM pricing for '%s'; cost_usd left as None",
-                self.model_name,
-            )
-            return None
-
-        input_rate = pricing.get("input_cost_per_token") or 0.0
-        output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost") or input_rate
-
-        uncached = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
-        cached = cached_tokens or 0
-        output = completion_tokens or 0
-
-        return uncached * input_rate + cached * cache_read_rate + output * output_rate
+        Delegates to :func:`pier.utils.pricing.compute_cost`, which prices cache
+        reads at their discounted rate and refuses to silently bill them at the
+        full input rate when that rate is unknown (see the module docstring).
+        """
+        return compute_cost(
+            self.model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            logger=self.logger,
+        )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         gemini_path: Path | None = None

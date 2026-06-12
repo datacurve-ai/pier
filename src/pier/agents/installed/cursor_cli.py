@@ -25,6 +25,7 @@ from pier.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from pier.utils.pricing import resolve_cache_read_rate, resolve_model_pricing
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
@@ -304,22 +305,7 @@ class CursorCli(BaseInstalledAgent):
         if builtin is not None:
             return builtin, "cursor_pricing"
 
-        try:
-            import litellm
-        except ImportError:
-            self.logger.warning(
-                "litellm not available and no built-in pricing for model '%s'; "
-                "leaving cursor-cli cost_usd as None",
-                self.model_name,
-            )
-            return None
-
-        pricing: dict[str, Any] | None = None
-        for key in (self.model_name, self.model_name.split("/", 1)[-1]):
-            entry = litellm.model_cost.get(key)
-            if entry:
-                pricing = entry
-                break
+        pricing = resolve_model_pricing(self.model_name, logger=self.logger)
         if pricing is None:
             self.logger.warning(
                 "No pricing entry for model '%s'; leaving cursor-cli cost_usd as None",
@@ -327,23 +313,27 @@ class CursorCli(BaseInstalledAgent):
             )
             return None
 
-        input_rate = pricing.get("input_cost_per_token") or 0.0
-        output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
+        # Cursor trajectories use prompt caching; refuse to silently bill cache
+        # reads at the full input rate when the discounted rate is unknown.
+        cache_read_rate = resolve_cache_read_rate(
+            pricing, used_cached_tokens=True, logger=self.logger
+        )
         if cache_read_rate is None:
-            cache_read_rate = input_rate
-        cache_write_rate = pricing.get("cache_creation_input_token_cost", input_rate)
-        if cache_write_rate is None:
-            cache_write_rate = input_rate
+            return None  # left unpriced; resolve_cache_read_rate logged why
+        cache_write_rate = (
+            pricing.cache_creation_input_token_cost
+            if pricing.cache_creation_input_token_cost is not None
+            else pricing.input_cost_per_token
+        )
 
         return (
             {
-                "input": input_rate,
-                "output": output_rate,
+                "input": pricing.input_cost_per_token,
+                "output": pricing.output_cost_per_token,
                 "cache_read": cache_read_rate,
                 "cache_write": cache_write_rate,
             },
-            "litellm",
+            pricing.source,
         )
 
     def _compute_cost_from_usage_totals(
