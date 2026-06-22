@@ -51,10 +51,17 @@ module-name = "pier"
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
 
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+pythonpath = ["src"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pier"]
 
 
 [dependency-groups]
-dev = ["ruff>=0.5"]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.5",
+]
