@@ -38,6 +38,23 @@ from pier.utils.trajectory_metrics import (
 )
 
 
+# Supplementary pricing for models not in litellm's registry.
+# Keys: model names as used by mini-swe-agent (without "openrouter/" prefix).
+# All rates are per-token USD.
+_SUPPLEMENTARY_PRICING: dict[str, dict[str, float]] = {
+    "deepseek-v4-pro": {
+        "input_cost_per_token": 0.435 / 1_000_000,
+        "output_cost_per_token": 0.87 / 1_000_000,
+        "cache_read_input_token_cost": 0.003625 / 1_000_000,
+    },
+    "deepseek-v4-flash": {
+        "input_cost_per_token": 0.14 / 1_000_000,
+        "output_cost_per_token": 0.28 / 1_000_000,
+        "cache_read_input_token_cost": 0.0028 / 1_000_000,
+    },
+}
+
+
 def _normalize_content(raw_content: Any) -> str:
     """Normalize message content which may be a string, list of parts, or None."""
     if raw_content is None:
@@ -791,6 +808,61 @@ mini-swe-agent --help
 
         return config_flags
 
+    def _compute_cost_from_pricing(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cached_tokens: int | None,
+    ) -> float | None:
+        """Compute cost from token counts using known model pricing.
+
+        Checks litellm first, then falls back to _SUPPLEMENTARY_PRICING
+        for models not in litellm's registry (e.g. deepseek-v4-pro).
+        """
+        if not self.model_name:
+            return None
+
+        pricing: dict[str, Any] | None = None
+
+        # Strip provider prefix (openrouter/deepseek-v4-pro -> deepseek-v4-pro)
+        bare_name = self.model_name.split("/", 1)[-1] if "/" in self.model_name else self.model_name
+
+        # Try litellm first
+        try:
+            import litellm
+        except ImportError:
+            litellm = None
+
+        if litellm is not None:
+            for key in (self.model_name, bare_name):
+                entry = litellm.model_cost.get(key)
+                if entry:
+                    pricing = entry
+                    break
+
+        # Fall back to supplementary pricing
+        if pricing is None:
+            pricing = _SUPPLEMENTARY_PRICING.get(bare_name)
+            if pricing is None:
+                # Try stripped of provider prefix for fully qualified names
+                for model_key, model_pricing in _SUPPLEMENTARY_PRICING.items():
+                    if bare_name.endswith(model_key) or model_key in bare_name:
+                        pricing = model_pricing
+                        break
+
+        if pricing is None:
+            return None
+
+        input_rate = pricing.get("input_cost_per_token") or 0.0
+        output_rate = pricing.get("output_cost_per_token") or 0.0
+        cache_read_rate = pricing.get("cache_read_input_token_cost") or input_rate
+
+        uncached = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
+        cached = cached_tokens or 0
+        output = completion_tokens or 0
+
+        return uncached * input_rate + cached * cache_read_rate + output * output_rate
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Read the mini-swe-agent trajectory
         mini_trajectory_path = self.logs_dir / "mini-swe-agent.trajectory.json"
@@ -814,6 +886,18 @@ mini-swe-agent --help
                 populate_context_from_final_metrics(
                     context, atif_trajectory.final_metrics
                 )
+                # Recompute cost using proper cache-aware pricing.
+                # The API-reported cost from mini-swe-agent may not apply
+                # provider-specific cache-hit discounts (e.g. DeepSeek's
+                # 99.2% cache discount). We have the token breakdowns,
+                # so we compute the correct cost ourselves.
+                computed_cost = self._compute_cost_from_pricing(
+                    prompt_tokens=context.n_input_tokens,
+                    completion_tokens=context.n_output_tokens,
+                    cached_tokens=context.n_cache_tokens,
+                )
+                if computed_cost is not None:
+                    context.cost_usd = computed_cost
         except Exception as e:
             self.logger.debug(f"Failed to convert trajectory to ATIF format: {e}")
 
