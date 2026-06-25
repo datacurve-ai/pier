@@ -2,6 +2,7 @@ import copy
 import json
 import shlex
 from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pier.agents.installed.base import (
@@ -26,6 +27,7 @@ from pier.models.trajectories import (
     ToolCall,
     Trajectory,
 )
+from pier.utils.env import parse_bool_env_value
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
@@ -53,6 +55,7 @@ class OpenCode(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
 
     _OUTPUT_FILENAME = "opencode.txt"
+    _REMOTE_XDG_DATA_HOME = PurePosixPath("/tmp/opencode-data")
     CLI_FLAGS = [
         CliFlag("variant", cli="--variant", type="str"),
     ]
@@ -70,7 +73,9 @@ class OpenCode(BaseInstalledAgent):
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],
         "mistral": ["api.mistral.ai"],
-        "openai": ["api.openai.com"],
+        # api.openai.com = API-key auth; chatgpt.com + auth.openai.com = the
+        # ChatGPT-subscription OAuth backend + token refresh (OPENCODE_FORCE_AUTH_JSON).
+        "openai": ["api.openai.com", "chatgpt.com", "auth.openai.com"],
         "openrouter": ["openrouter.ai"],
         "xai": ["api.x.ai"],
     }
@@ -452,6 +457,38 @@ class OpenCode(BaseInstalledAgent):
             default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider, []),
         )
 
+    def _resolve_auth_json_path(self) -> Path | None:
+        """Resolve which opencode auth.json to inject, if any.
+
+        Defaults to None (env-var API-key auth). Opt into uploading the host's
+        opencode credentials -- which covers OAuth/subscription providers that
+        have no env-var key (e.g. ChatGPT-subscription openai for gpt-5.5) -- via:
+          - OPENCODE_AUTH_JSON_PATH=<path>  -> use that specific file
+          - OPENCODE_FORCE_AUTH_JSON=<truthy> -> use ~/.local/share/opencode/auth.json
+        """
+        explicit = self._get_env("OPENCODE_AUTH_JSON_PATH")
+        if explicit:
+            p = Path(explicit)
+            if not p.is_file():
+                raise ValueError(
+                    f"OPENCODE_AUTH_JSON_PATH points to non-existent file: {explicit}"
+                )
+            return p
+
+        if parse_bool_env_value(
+            self._get_env("OPENCODE_FORCE_AUTH_JSON"),
+            name="OPENCODE_FORCE_AUTH_JSON",
+            default=False,
+        ):
+            default = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+            if not default.is_file():
+                raise ValueError(
+                    f"OPENCODE_FORCE_AUTH_JSON is set but {default} does not exist"
+                )
+            return default
+
+        return None
+
     @with_prompt_template
     async def run(
         self,
@@ -466,7 +503,34 @@ class OpenCode(BaseInstalledAgent):
 
         provider, _ = self.model_name.split("/", 1)
 
-        env = self.build_process_env()
+        # opencode reads credentials from $XDG_DATA_HOME/opencode/auth.json. Pin a
+        # fixed in-container data dir so we can optionally inject the host's
+        # auth.json for subscription/OAuth providers that have no env-var key.
+        remote_data_home = self._REMOTE_XDG_DATA_HOME.as_posix()
+        remote_auth_path = (
+            self._REMOTE_XDG_DATA_HOME / "opencode" / "auth.json"
+        ).as_posix()
+        env = self.build_process_env({"XDG_DATA_HOME": remote_data_home})
+
+        auth_json_path = self._resolve_auth_json_path()
+        if auth_json_path:
+            await self.exec_as_agent(
+                environment,
+                command="mkdir -p "
+                + shlex.quote((self._REMOTE_XDG_DATA_HOME / "opencode").as_posix()),
+                env=env,
+            )
+            await environment.upload_file(auth_json_path, remote_auth_path)
+            # docker cp lands the file root-owned; hand it to a non-root agent so
+            # it can read it. No-op on podman (cp already sets the container user)
+            # and skipped for root agents. cp preserves the host file's 0600 mode.
+            if environment.default_user is not None:
+                await self.exec_as_root(
+                    environment,
+                    command=f"chown {environment.default_user} "
+                    + shlex.quote(remote_auth_path),
+                )
+
         keys = []
 
         # Get provider environment variables

@@ -19,6 +19,7 @@ from tenacity import (
 
 from pier.agents.installed.base import BaseInstalledAgent, NonZeroAgentExitCodeError
 from pier.environments.base import HealthcheckError
+from pier.environments.docker.docker import _is_podman
 from pier.environments.factory import EnvironmentFactory
 from pier.models.agent.context import AgentContext
 from pier.models.task.config import (
@@ -446,13 +447,20 @@ class Trial:
         env_config: TaskEnvironmentConfig,
     ) -> list[ServiceVolumeConfig]:
         env_paths = self._environment.env_paths.for_os(env_config.os)
-        return [
-            {
-                "type": "bind",
-                "source": self._trial_paths.verifier_dir.resolve().as_posix(),
-                "target": str(env_paths.verifier_dir),
-            }
-        ]
+        mount: ServiceVolumeConfig = {
+            "type": "bind",
+            "source": self._trial_paths.verifier_dir.resolve().as_posix(),
+            "target": str(env_paths.verifier_dir),
+        }
+        # podman + SELinux: relabel this Pier-managed bind mount (:Z = private) so
+        # the separate verifier container can write to it. The agent env already
+        # does this via DockerEnvironment._default_log_mounts(); this path passes
+        # mounts_json explicitly, which bypasses that helper, so the relabel must
+        # be applied here too. Without it the host dir keeps the agent container's
+        # MCS category and the verifier container is denied access. No-op on docker.
+        if _is_podman():
+            mount["bind"] = {"selinux": "Z"}
+        return [mount]
 
     def _verifier_env_build_context(self, step_cfg: StepConfig | None) -> Path:
         if step_cfg is not None:
