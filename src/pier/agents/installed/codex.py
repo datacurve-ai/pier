@@ -110,7 +110,13 @@ class Codex(BaseInstalledAgent):
                 parsed = {}
             urls.extend(collect_url_values(parsed))
 
-        return allowlist_from_urls(urls, default_domains=["api.openai.com"])
+        # api.openai.com serves OPENAI_API_KEY auth; chatgpt.com (the ChatGPT
+        # backend) and auth.openai.com (token refresh) serve ChatGPT-subscription
+        # auth via auth.json (CODEX_FORCE_AUTH_JSON / CODEX_AUTH_JSON_PATH).
+        return allowlist_from_urls(
+            urls,
+            default_domains=["api.openai.com", "chatgpt.com", "auth.openai.com"],
+        )
 
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"@{self._version}" if self._version else "@latest"
