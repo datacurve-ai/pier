@@ -650,7 +650,7 @@ if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null;
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 fi
 source "$HOME/.local/bin/env"
-uv tool install mini-swe-agent{version_spec}
+uv tool install mini-swe-agent{version_spec} --with 'litellm[proxy]'
 
 python_bin="$(head -n 1 "$(command -v mini-swe-agent)" | sed 's/^#!//')"
 {install_extra_packages}
