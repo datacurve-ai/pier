@@ -76,6 +76,7 @@ class CopilotCli(BaseInstalledAgent):
         CliFlag("agent", cli="--agent", type="str", env_fallback="COPILOT_CLI_AGENT"),
         CliFlag("allow_all_tools", cli="--allow-all-tools", type="bool", default=True),
         CliFlag("no_ask_user", cli="--no-ask-user", type="bool", default=True),
+        CliFlag("no_auto_update", cli="--no-auto-update", type="bool", default=True),
     ]
 
     def __init__(
