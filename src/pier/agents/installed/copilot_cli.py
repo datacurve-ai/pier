@@ -47,6 +47,7 @@ class CopilotCli(BaseInstalledAgent):
 
     _JSONL_FILENAME = "copilot-cli.jsonl"
     _OUTPUT_FILENAME = "copilot-cli.txt"
+    _COMMAND_LOG_PATH = EnvironmentPaths.agent_dir / "command-0" / "stdout.txt"
     _COPILOT_HOME = EnvironmentPaths.agent_dir / "copilot-home"
     _LOG_ROOT = EnvironmentPaths.agent_dir / "copilot-logs"
     _RE_VERSION = re.compile(r"(\d+\.\d+(?:\.\d+)?(?:-\d+)?)")
@@ -234,6 +235,7 @@ class CopilotCli(BaseInstalledAgent):
         setup_commands = [
             (
                 f"mkdir -p {shlex.quote(agent_dir)} "
+                f"{shlex.quote(self._COMMAND_LOG_PATH.parent.as_posix())} "
                 f"{shlex.quote(self._COPILOT_HOME.as_posix())} "
                 f"{shlex.quote(self._LOG_ROOT.as_posix())}"
             ),
@@ -265,7 +267,8 @@ class CopilotCli(BaseInstalledAgent):
             "set -o pipefail; "
             f"copilot -p {shlex.quote(instruction)} --output-format json --no-color "
             f"{flag_text} 2>&1 | tee {shlex.quote(jsonl_path)} | "
-            f"tee {shlex.quote(output_path)}; "
+            f"tee {shlex.quote(output_path)} | "
+            f"tee {shlex.quote(self._COMMAND_LOG_PATH.as_posix())}; "
             "exit ${PIPESTATUS[0]}"
         )
         return f"{setup} && bash -lc {shlex.quote(run_script)}"

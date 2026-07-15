@@ -75,6 +75,7 @@ def test_copilot_cli_run_command_preserves_pipeline_status(tmp_path: Path):
 
     assert "bash -lc" in command
     assert "--output-format json" in command
+    assert "tee /logs/agent/command-0/stdout.txt" in command
     assert "exit ${PIPESTATUS[0]}" in command
     assert "cp -a" not in command
 
