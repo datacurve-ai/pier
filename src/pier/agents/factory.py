@@ -4,6 +4,7 @@ from pathlib import Path
 from pier.agents.base import BaseAgent
 from pier.agents.installed.claude_code import ClaudeCode
 from pier.agents.installed.codex import Codex
+from pier.agents.installed.copilot_cli import CopilotCli
 from pier.agents.installed.cursor_cli import CursorCli
 from pier.agents.installed.gemini_cli import GeminiCli
 from pier.agents.installed.mini_swe_agent import MiniSweAgent
@@ -21,6 +22,7 @@ class AgentFactory:
         OracleAgent,
         ClaudeCode,
         Codex,
+        CopilotCli,
         CursorCli,
         GeminiCli,
         MiniSweAgent,
