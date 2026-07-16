@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -276,11 +277,16 @@ class CopilotCli(BaseInstalledAgent):
     def populate_context_post_run(self, context: AgentContext) -> None:
         events_path = find_copilot_session_events(self.logs_dir)
         jsonl_path = self.logs_dir / self._JSONL_FILENAME
-        events = _read_jsonl(events_path or jsonl_path)
+        persisted_events = _read_jsonl(events_path) if events_path is not None else []
+        captured_events = _read_jsonl(jsonl_path)
+        events = persisted_events or captured_events
         if not events:
             return
 
-        trajectory = self._convert_events_to_trajectory(events)
+        metrics_events = _combine_event_streams(persisted_events, captured_events)
+        trajectory = self._convert_events_to_trajectory(
+            events, metrics_events=metrics_events
+        )
         if trajectory is None:
             return
 
@@ -294,7 +300,7 @@ class CopilotCli(BaseInstalledAgent):
             populate_context_from_final_metrics(context, trajectory.final_metrics)
         context.n_agent_steps = sum(step.source == "agent" for step in trajectory.steps)
 
-        session_metrics = _parse_session_metrics(events)
+        session_metrics = _parse_session_metrics(metrics_events)
         metadata = dict(context.metadata or {})
         if events_path is not None:
             metadata["copilot_session_events"] = str(
@@ -305,18 +311,27 @@ class CopilotCli(BaseInstalledAgent):
         context.metadata = metadata or None
 
     def _convert_events_to_trajectory(
-        self, events: list[dict[str, Any]]
+        self,
+        events: list[dict[str, Any]],
+        *,
+        metrics_events: list[dict[str, Any]] | None = None,
     ) -> Trajectory | None:
         steps: list[Step] = []
         call_owners: dict[str, Step] = {}
-        assistant_steps_by_call: dict[str, Step] = {}
+        assistant_steps_by_id: dict[str, Step] = {}
         session_id: str | None = None
+        pending_reasoning = ""
+        pending_reasoning_timestamp: str | None = None
+        last_assistant_step: Step | None = None
 
         def append_step(step: Step) -> None:
             step.step_id = len(steps) + 1
             steps.append(step)
 
         for event in events:
+            if _is_subagent_event(event):
+                continue
+
             event_type = event.get("type")
             data = event.get("data") or {}
             timestamp = event.get("timestamp")
@@ -327,7 +342,12 @@ class CopilotCli(BaseInstalledAgent):
                 )
                 continue
 
+            if event_type == "assistant.turn_start":
+                last_assistant_step = None
+                continue
+
             if event_type == "user.message":
+                last_assistant_step = None
                 if message := _flatten_content(data.get("content")):
                     append_step(
                         Step(
@@ -339,21 +359,44 @@ class CopilotCli(BaseInstalledAgent):
                     )
                 continue
 
+            if event_type == "assistant.reasoning":
+                reasoning = _flatten_content(data.get("content"))
+                if reasoning:
+                    if last_assistant_step is not None:
+                        last_assistant_step.reasoning_content = _merge_ordered_text(
+                            last_assistant_step.reasoning_content or "", reasoning
+                        )
+                    else:
+                        if not pending_reasoning:
+                            pending_reasoning_timestamp = timestamp
+                        pending_reasoning = _merge_ordered_text(
+                            pending_reasoning, reasoning
+                        )
+                continue
+
             if event_type == "assistant.message":
                 tool_calls = _tool_calls(data.get("toolRequests"))
                 prompt_tokens = _optional_int(data.get("inputTokens"))
                 completion_tokens = _optional_int(data.get("outputTokens"))
-                api_call_id = _string_or_none(
+                assistant_event_id = _string_or_none(
                     data.get("apiCallId")
                     or data.get("api_call_id")
                     or data.get("modelCallId")
+                    or data.get("messageId")
                 )
-                if api_call_id and (
-                    existing_step := assistant_steps_by_call.get(api_call_id)
+                reasoning_content = _merge_ordered_text(
+                    pending_reasoning,
+                    _flatten_content(data.get("reasoningText")),
+                )
+                pending_reasoning = ""
+                pending_reasoning_timestamp = None
+                if assistant_event_id and (
+                    existing_step := assistant_steps_by_id.get(assistant_event_id)
                 ):
                     _merge_assistant_event(
                         existing_step,
                         message=_flatten_content(data.get("content")),
+                        reasoning_content=reasoning_content,
                         tool_calls=tool_calls,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
@@ -361,6 +404,7 @@ class CopilotCli(BaseInstalledAgent):
                     for tool_call in tool_calls:
                         if tool_call.tool_call_id:
                             call_owners[tool_call.tool_call_id] = existing_step
+                    last_assistant_step = existing_step
                     continue
 
                 metrics = (
@@ -380,13 +424,15 @@ class CopilotCli(BaseInstalledAgent):
                         _flatten_content(data.get("content"))
                         or ("Tool call" if tool_calls else "")
                     ),
+                    reasoning_content=reasoning_content or None,
                     tool_calls=tool_calls or None,
                     metrics=metrics,
                     llm_call_count=1,
                 )
                 append_step(step)
-                if api_call_id:
-                    assistant_steps_by_call[api_call_id] = step
+                if assistant_event_id:
+                    assistant_steps_by_id[assistant_event_id] = step
+                last_assistant_step = step
                 for tool_call in tool_calls:
                     if tool_call.tool_call_id:
                         call_owners[tool_call.tool_call_id] = step
@@ -404,6 +450,7 @@ class CopilotCli(BaseInstalledAgent):
                     content,
                     timestamp,
                 )
+                last_assistant_step = None
                 continue
 
             if event_type == "message":
@@ -422,6 +469,7 @@ class CopilotCli(BaseInstalledAgent):
                         llm_call_count=1 if source == "agent" else None,
                     )
                 )
+                last_assistant_step = steps[-1] if source == "agent" else None
                 continue
 
             if event_type == "tool_use":
@@ -444,6 +492,7 @@ class CopilotCli(BaseInstalledAgent):
                 append_step(step)
                 if call_id:
                     call_owners[call_id] = step
+                last_assistant_step = None
                 continue
 
             if event_type == "tool_result":
@@ -454,11 +503,25 @@ class CopilotCli(BaseInstalledAgent):
                     _flatten_content(event.get("content")),
                     timestamp,
                 )
+                last_assistant_step = None
+
+        if pending_reasoning:
+            append_step(
+                Step(
+                    step_id=1,
+                    timestamp=pending_reasoning_timestamp,
+                    source="agent",
+                    model_name=self.model_name,
+                    message="",
+                    reasoning_content=pending_reasoning,
+                    llm_call_count=1,
+                )
+            )
 
         if not steps:
             return None
 
-        session_metrics = _parse_session_metrics(events)
+        session_metrics = _parse_session_metrics(metrics_events or events)
         extra: dict[str, Any] = {}
         if session_metrics.aiu is not None:
             extra["copilot_aiu"] = session_metrics.aiu
@@ -495,19 +558,21 @@ def find_copilot_session_events(agent_logs_dir: Path) -> Path | None:
 
 def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     shutdowns: list[dict[str, Any]] = []
+    seen_shutdowns: set[str] = set()
     n_turns = 0
     summarization_count = 0
     peak_context_tokens = 0
-    fallback_input = 0
-    fallback_output = 0
-    has_fallback_input = False
-    has_fallback_output = False
-    fallback_by_call: dict[str, tuple[int | None, int | None]] = {}
+    usage_by_call: dict[str, tuple[int | None, int | None, int | None, int | None]] = {}
+    message_by_id: dict[str, tuple[int | None, int | None]] = {}
 
     for event in events:
         event_type = event.get("type")
         data = event.get("data") or {}
         if event_type == "session.shutdown":
+            shutdown_fingerprint = _json_fingerprint(data)
+            if shutdown_fingerprint in seen_shutdowns:
+                continue
+            seen_shutdowns.add(shutdown_fingerprint)
             shutdowns.append(data)
             peak_context_tokens = max(
                 peak_context_tokens, _optional_int(data.get("currentTokens")) or 0
@@ -525,53 +590,112 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
                 peak_context_tokens,
                 _optional_int(data.get("preTruncationTokensInMessages")) or 0,
             )
-        elif event_type == "assistant.message":
-            input_tokens = _optional_int(data.get("inputTokens"))
-            output_tokens = _optional_int(data.get("outputTokens"))
+        elif event_type == "assistant.usage":
+            usage = data.get("usage")
+            usage = usage if isinstance(usage, dict) else data
+            input_tokens = _optional_int(usage.get("inputTokens"))
+            cache_read_tokens = _optional_int(usage.get("cacheReadTokens"))
+            cache_write_tokens = _optional_int(usage.get("cacheWriteTokens"))
+            output_tokens = _optional_int(usage.get("outputTokens"))
             api_call_id = _string_or_none(
                 data.get("apiCallId")
                 or data.get("api_call_id")
-                or data.get("modelCallId")
+                or data.get("providerCallId")
+                or usage.get("apiCallId")
             )
-            if api_call_id:
-                previous_input, previous_output = fallback_by_call.get(
-                    api_call_id, (None, None)
-                )
-                fallback_by_call[api_call_id] = (
-                    _max_optional(previous_input, input_tokens),
-                    _max_optional(previous_output, output_tokens),
-                )
-            else:
-                if input_tokens is not None:
-                    fallback_input += input_tokens
-                    has_fallback_input = True
-                if output_tokens is not None:
-                    fallback_output += output_tokens
-                    has_fallback_output = True
-
-    for input_tokens, output_tokens in fallback_by_call.values():
-        if input_tokens is not None:
-            fallback_input += input_tokens
-            has_fallback_input = True
-        if output_tokens is not None:
-            fallback_output += output_tokens
-            has_fallback_output = True
+            usage_key = (
+                f"call:{api_call_id}"
+                if api_call_id
+                else _event_identity(event)
+            )
+            previous = usage_by_call.get(usage_key, (None, None, None, None))
+            usage_by_call[usage_key] = (
+                _max_optional(previous[0], input_tokens),
+                _max_optional(previous[1], cache_read_tokens),
+                _max_optional(previous[2], cache_write_tokens),
+                _max_optional(previous[3], output_tokens),
+            )
+        elif event_type == "assistant.message":
+            input_tokens = _optional_int(data.get("inputTokens"))
+            output_tokens = _optional_int(data.get("outputTokens"))
+            message_id = _string_or_none(
+                data.get("apiCallId")
+                or data.get("api_call_id")
+                or data.get("modelCallId")
+                or data.get("messageId")
+            )
+            message_key = (
+                f"message:{message_id}"
+                if message_id
+                else f"event:{_json_fingerprint(event)}"
+            )
+            previous_input, previous_output = message_by_id.get(
+                message_key, (None, None)
+            )
+            message_by_id[message_key] = (
+                _max_optional(previous_input, input_tokens),
+                _max_optional(previous_output, output_tokens),
+            )
 
     if not shutdowns:
+        usage_input, has_usage_input = _sum_optional(
+            usage[0] for usage in usage_by_call.values()
+        )
+        usage_cache_read, has_usage_cache_read = _sum_optional(
+            usage[1] for usage in usage_by_call.values()
+        )
+        usage_cache_write, has_usage_cache_write = _sum_optional(
+            usage[2] for usage in usage_by_call.values()
+        )
+        usage_output, has_usage_output = _sum_optional(
+            usage[3] for usage in usage_by_call.values()
+        )
+        message_input, has_message_input = _sum_optional(
+            usage[0] for usage in message_by_id.values()
+        )
+        message_output, has_message_output = _sum_optional(
+            usage[1] for usage in message_by_id.values()
+        )
+        has_usage_prompt = (
+            has_usage_input or has_usage_cache_read or has_usage_cache_write
+        )
+        prompt_tokens = (
+            usage_input + usage_cache_read + usage_cache_write
+            if has_usage_prompt
+            else message_input
+        )
+        output_tokens = _max_optional(
+            usage_output if has_usage_output else None,
+            message_output if has_message_output else None,
+        )
         return _SessionMetrics(
-            input_tokens=fallback_input if has_fallback_input else None,
-            cache_read_tokens=None,
-            output_tokens=fallback_output if has_fallback_output else None,
+            input_tokens=(
+                prompt_tokens if has_usage_prompt or has_message_input else None
+            ),
+            cache_read_tokens=(usage_cache_read if has_usage_cache_read else None),
+            output_tokens=output_tokens,
             peak_context_tokens=peak_context_tokens or None,
             summarization_count=summarization_count,
             n_turns=n_turns,
             aiu=None,
         )
 
-    noncached = sum(_token_count(shutdown, "input") for shutdown in shutdowns)
-    cache_read = sum(_token_count(shutdown, "cache_read") for shutdown in shutdowns)
-    cache_write = sum(_token_count(shutdown, "cache_write") for shutdown in shutdowns)
-    output = sum(_token_count(shutdown, "output") for shutdown in shutdowns)
+    noncached = 0
+    cache_read = 0
+    cache_write = 0
+    output = 0
+    for shutdown in shutdowns:
+        model_usage = _shutdown_model_usage(shutdown)
+        if model_usage is not None:
+            noncached += model_usage[0]
+            cache_read += model_usage[1]
+            cache_write += model_usage[2]
+            output += model_usage[3]
+        else:
+            noncached += _token_count(shutdown, "input")
+            cache_read += _token_count(shutdown, "cache_read")
+            cache_write += _token_count(shutdown, "cache_write")
+            output += _token_count(shutdown, "output")
     nano_aiu = sum(
         float(value)
         for shutdown in shutdowns
@@ -599,6 +723,39 @@ def _token_count(shutdown: dict[str, Any], token_type: str) -> int:
     return _optional_int(details.get("tokenCount")) or 0
 
 
+def _shutdown_model_usage(
+    shutdown: dict[str, Any],
+) -> tuple[int, int, int, int] | None:
+    model_metrics = shutdown.get("modelMetrics")
+    if isinstance(model_metrics, dict):
+        metrics = model_metrics.values()
+    elif isinstance(model_metrics, list):
+        metrics = model_metrics
+    else:
+        return None
+
+    totals = [0, 0, 0, 0]
+    has_usage = False
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        usage = metric.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        values = (
+            _optional_int(usage.get("inputTokens")),
+            _optional_int(usage.get("cacheReadTokens")),
+            _optional_int(usage.get("cacheWriteTokens")),
+            _optional_int(usage.get("outputTokens")),
+        )
+        if any(value is not None for value in values):
+            has_usage = True
+        for index, value in enumerate(values):
+            totals[index] += value or 0
+
+    return (totals[0], totals[1], totals[2], totals[3]) if has_usage else None
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -610,6 +767,21 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _combine_event_streams(
+    *event_streams: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event_stream in event_streams:
+        for event in event_stream:
+            identity = _event_identity(event)
+            if identity in seen:
+                continue
+            seen.add(identity)
             events.append(event)
     return events
 
@@ -707,6 +879,7 @@ def _merge_assistant_event(
     step: Step,
     *,
     message: str,
+    reasoning_content: str,
     tool_calls: list[ToolCall],
     prompt_tokens: int | None,
     completion_tokens: int | None,
@@ -719,6 +892,11 @@ def _merge_assistant_event(
             step.message = message
         elif not existing_message.startswith(message):
             step.message = f"{existing_message}\n{message}"
+
+    if reasoning_content:
+        step.reasoning_content = _merge_ordered_text(
+            step.reasoning_content or "", reasoning_content
+        )
 
     if tool_calls:
         existing_ids = {call.tool_call_id for call in step.tool_calls or []}
@@ -749,6 +927,49 @@ def _optional_int(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _sum_optional(values: Iterable[int | None]) -> tuple[int, bool]:
+    total = 0
+    found = False
+    for value in values:
+        if value is not None:
+            total += value
+            found = True
+    return total, found
+
+
+def _merge_ordered_text(existing: str, new: str) -> str:
+    existing = existing.strip()
+    new = new.strip()
+    if not existing:
+        return new
+    if not new or new == existing or existing.startswith(new):
+        return existing
+    if new.startswith(existing):
+        return new
+
+    max_overlap = min(len(existing), len(new))
+    for overlap in range(max_overlap, 0, -1):
+        if existing.endswith(new[:overlap]):
+            return existing + new[overlap:]
+    return f"{existing}\n\n{new}"
+
+
+def _is_subagent_event(event: dict[str, Any]) -> bool:
+    agent_id = event.get("agentId")
+    return isinstance(agent_id, str) and bool(agent_id)
+
+
+def _json_fingerprint(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _event_identity(event: dict[str, Any]) -> str:
+    event_id = event.get("id")
+    if isinstance(event_id, str) and event_id:
+        return f"id:{event_id}"
+    return f"event:{_json_fingerprint(event)}"
 
 
 def _max_optional(left: int | None, right: int | None) -> int | None:

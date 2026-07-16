@@ -120,25 +120,46 @@ def test_copilot_cli_converts_native_events_to_atif(tmp_path: Path):
     }
 
 
-def test_copilot_cli_timeout_metrics_deduplicate_api_calls(tmp_path: Path):
+def test_copilot_cli_shutdown_metrics_aggregate_models_without_token_details(
+    tmp_path: Path,
+):
     agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
     events = [
         {
+            "id": "00000000-0000-4000-8000-000000000001",
             "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": None,
             "data": {
-                "apiCallId": "api-1",
-                "content": "Working",
-                "inputTokens": 100,
-                "outputTokens": 5,
+                "messageId": "message-1",
+                "content": "Done",
+                "outputTokens": 9,
             },
         },
         {
-            "type": "assistant.message",
+            "id": "00000000-0000-4000-8000-000000000002",
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000001",
             "data": {
-                "apiCallId": "api-1",
-                "content": "",
-                "inputTokens": 100,
-                "outputTokens": 5,
+                "modelMetrics": {
+                    "gpt-5.4": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 5,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 10,
+                        }
+                    },
+                    "gpt-5-mini": {
+                        "usage": {
+                            "inputTokens": 7,
+                            "outputTokens": 4,
+                            "cacheReadTokens": 3,
+                            "cacheWriteTokens": 2,
+                        }
+                    },
+                },
             },
         },
     ]
@@ -148,8 +169,275 @@ def test_copilot_cli_timeout_metrics_deduplicate_api_calls(tmp_path: Path):
     assert trajectory is not None
     assert len(trajectory.steps) == 1
     assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 100
+    assert trajectory.final_metrics.total_prompt_tokens == 142
+    assert trajectory.final_metrics.total_cached_tokens == 23
+    assert trajectory.final_metrics.total_completion_tokens == 9
+
+
+def test_copilot_cli_shutdown_metrics_keep_token_details_fallback(tmp_path: Path):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "data": {"messageId": "message-1", "content": "Done"},
+        },
+        {
+            "type": "session.shutdown",
+            "data": {
+                "tokenDetails": {
+                    "input": {"tokenCount": 100},
+                    "cache_read": {"tokenCount": 20},
+                    "cache_write": {"tokenCount": 10},
+                    "output": {"tokenCount": 5},
+                }
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 130
+    assert trajectory.final_metrics.total_cached_tokens == 20
     assert trajectory.final_metrics.total_completion_tokens == 5
+
+
+def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "data": {"messageId": "message-1", "content": "Done"},
+        },
+        {
+            "type": "session.shutdown",
+            "data": {
+                "modelMetrics": {
+                    "gpt-5.4": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 10,
+                            "outputTokens": 5,
+                        }
+                    }
+                },
+                "tokenDetails": {
+                    "input": {"tokenCount": 1000},
+                    "cache_read": {"tokenCount": 200},
+                    "cache_write": {"tokenCount": 100},
+                    "output": {"tokenCount": 50},
+                },
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 130
+    assert trajectory.final_metrics.total_cached_tokens == 20
+    assert trajectory.final_metrics.total_completion_tokens == 5
+
+
+def test_copilot_cli_timeout_metrics_combine_and_deduplicate_usage(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    persisted_events = [
+        {
+            "id": "00000000-0000-4000-8000-000000000011",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": None,
+            "data": {
+                "messageId": "message-1",
+                "content": "Working",
+                "outputTokens": 5,
+            },
+        }
+    ]
+    usage_event = {
+        "id": "00000000-0000-4000-8000-000000000010",
+        "type": "assistant.usage",
+        "timestamp": "2026-01-01T00:00:00.900Z",
+        "parentId": None,
+        "ephemeral": True,
+        "data": {
+            "model": "gpt-5.4",
+            "inputTokens": 100,
+            "outputTokens": 5,
+            "cacheReadTokens": 20,
+            "cacheWriteTokens": 10,
+            "apiCallId": "api-1",
+        },
+    }
+    events_path = (
+        tmp_path / "copilot-home" / "session-state" / "session-timeout" / "events.jsonl"
+    )
+    events_path.parent.mkdir(parents=True)
+    events_path.write_text(
+        "\n".join(json.dumps(event) for event in persisted_events) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / CopilotCli._JSONL_FILENAME).write_text(
+        "\n".join(json.dumps(usage_event) for _ in range(2)) + "\n",
+        encoding="utf-8",
+    )
+    context = AgentContext()
+
+    agent.populate_context_post_run(context)
+
+    assert context.n_input_tokens == 130
+    assert context.n_cache_tokens == 20
+    assert context.n_output_tokens == 5
+    assert context.n_agent_steps == 1
+
+
+def test_copilot_cli_excludes_tagged_subagent_events_from_root_trajectory(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "id": "00000000-0000-4000-8000-000000000020",
+            "type": "user.message",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "parentId": None,
+            "data": {"content": "Fix the bug"},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000021",
+            "type": "user.message",
+            "timestamp": "2026-01-01T00:00:00.500Z",
+            "parentId": "00000000-0000-4000-8000-000000000020",
+            "agentId": "subagent-1",
+            "data": {"content": "Inspect the parser"},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000022",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000021",
+            "agentId": "subagent-1",
+            "data": {
+                "messageId": "subagent-message-1",
+                "content": "I found the issue",
+                "toolRequests": [
+                    {
+                        "toolCallId": "subagent-tool-1",
+                        "name": "view",
+                        "arguments": {"path": "parser.py"},
+                    }
+                ],
+            },
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000023",
+            "type": "tool.execution_complete",
+            "timestamp": "2026-01-01T00:00:01.500Z",
+            "parentId": "00000000-0000-4000-8000-000000000022",
+            "agentId": "subagent-1",
+            "data": {
+                "toolCallId": "subagent-tool-1",
+                "success": True,
+                "result": {"content": "subagent output"},
+            },
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000024",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000023",
+            "data": {
+                "messageId": "root-message-1",
+                "content": "Fixed the bug",
+                "outputTokens": 3,
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert [step.message for step in trajectory.steps] == [
+        "Fix the bug",
+        "Fixed the bug",
+    ]
+    assert sum(step.source == "agent" for step in trajectory.steps) == 1
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_steps == 2
+
+
+def test_copilot_cli_preserves_ordered_native_reasoning_without_duplicates(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "id": "00000000-0000-4000-8000-000000000030",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:00.500Z",
+            "parentId": None,
+            "ephemeral": True,
+            "data": {"reasoningId": "reasoning-1", "content": "Inspect first."},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000031",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:00.600Z",
+            "parentId": "00000000-0000-4000-8000-000000000030",
+            "ephemeral": True,
+            "data": {"reasoningId": "reasoning-1", "content": "Inspect first."},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000032",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:00.700Z",
+            "parentId": "00000000-0000-4000-8000-000000000031",
+            "ephemeral": True,
+            "data": {
+                "reasoningId": "reasoning-2",
+                "content": "Then patch.",
+            },
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000033",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000032",
+            "data": {
+                "messageId": "message-1",
+                "content": "Done",
+                "reasoningText": "Inspect first.\n\nThen patch.",
+                "outputTokens": 3,
+            },
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000034",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:01.100Z",
+            "parentId": "00000000-0000-4000-8000-000000000033",
+            "ephemeral": True,
+            "data": {
+                "reasoningId": "reasoning-3",
+                "content": "Then patch.\n\nFinally verify.",
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert len(trajectory.steps) == 1
+    assert (
+        trajectory.steps[0].reasoning_content
+        == "Inspect first.\n\nThen patch.\n\nFinally verify."
+    )
 
 
 def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
@@ -252,11 +540,15 @@ def _session_events() -> list[dict]:
             "data": {
                 "totalNanoAiu": 250_000_000,
                 "currentTokens": 1500,
-                "tokenDetails": {
-                    "input": {"tokenCount": 100},
-                    "cache_read": {"tokenCount": 20},
-                    "cache_write": {"tokenCount": 10},
-                    "output": {"tokenCount": 5},
+                "modelMetrics": {
+                    "gpt-5.4": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 10,
+                            "outputTokens": 5,
+                        }
+                    }
                 },
             },
         },
