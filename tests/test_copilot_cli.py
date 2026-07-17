@@ -110,7 +110,7 @@ def test_copilot_cli_converts_native_events_to_atif(tmp_path: Path):
     assert trajectory.steps[1].observation is not None
     assert trajectory.steps[1].observation.results[0].content == "# Pier"
     assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 130
+    assert trajectory.final_metrics.total_prompt_tokens == 100
     assert trajectory.final_metrics.total_cached_tokens == 20
     assert trajectory.final_metrics.total_completion_tokens == 5
     assert trajectory.final_metrics.extra == {
@@ -169,7 +169,8 @@ def test_copilot_cli_shutdown_metrics_aggregate_models_without_token_details(
     assert trajectory is not None
     assert len(trajectory.steps) == 1
     assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 142
+    # inputTokens per model is cache-inclusive: gpt-5.4 100 + gpt-5-mini 7 = 107.
+    assert trajectory.final_metrics.total_prompt_tokens == 107
     assert trajectory.final_metrics.total_cached_tokens == 23
     assert trajectory.final_metrics.total_completion_tokens == 9
 
@@ -239,7 +240,9 @@ def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
 
     assert trajectory is not None
     assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 130
+    # modelMetrics usage wins over the legacy tokenDetails compatibility shape,
+    # and its cache-inclusive inputTokens (100) is not double-counted.
+    assert trajectory.final_metrics.total_prompt_tokens == 100
     assert trajectory.final_metrics.total_cached_tokens == 20
     assert trajectory.final_metrics.total_completion_tokens == 5
 
@@ -340,7 +343,7 @@ def test_copilot_cli_timeout_metrics_combine_and_deduplicate_usage(
 
     agent.populate_context_post_run(context)
 
-    assert context.n_input_tokens == 212
+    assert context.n_input_tokens == 175
     assert context.n_cache_tokens == 25
     assert context.n_output_tokens == 23
     assert context.n_agent_steps == 2
@@ -525,7 +528,7 @@ def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
     agent.populate_context_post_run(context)
 
     assert (tmp_path / "trajectory.json").exists()
-    assert context.n_input_tokens == 130
+    assert context.n_input_tokens == 100
     assert context.n_cache_tokens == 20
     assert context.n_output_tokens == 5
     assert context.peak_context_tokens == 2000
@@ -646,12 +649,125 @@ def test_copilot_cli_timeout_uses_message_input_for_calls_missing_from_usage_str
 
     assert trajectory is not None
     assert trajectory.final_metrics is not None
-    # total_prompt_tokens includes all input + cache tokens (cache is part of the prompt context).
+    # inputTokens is the cache-inclusive prompt total, so cached reads are not
+    # added again. Missing api-2 usage input falls back to the message input.
     # input: 100 (api-1 usage) + 80 (api-2 message fallback) = 180
-    # cache: 10 (api-1 cache_read) + 5 (api-2 cache_read) = 15
-    # total: 180 + 15 = 195
-    assert trajectory.final_metrics.total_prompt_tokens == 195
+    # cache: 10 (api-1 cache_read) + 5 (api-2 cache_read) = 15 (subset of input)
+    assert trajectory.final_metrics.total_prompt_tokens == 180
     assert trajectory.final_metrics.total_cached_tokens == 15
+
+
+def test_copilot_cli_shutdown_input_tokens_are_cache_inclusive(tmp_path: Path):
+    # In Copilot CLI 1.0.71, modelMetrics[*].usage.inputTokens is the
+    # OpenAI-style prompt_tokens value, which already includes cacheReadTokens
+    # and cacheWriteTokens. Adding the cache breakdowns on top double-counts.
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "id": "00000000-0000-4000-8000-000000000041",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": None,
+            "data": {"messageId": "message-1", "content": "Done", "outputTokens": 5},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000042",
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000041",
+            "data": {
+                "modelMetrics": {
+                    "gpt-5.4": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 5,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 10,
+                        }
+                    }
+                },
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    # inputTokens (100) already accounts for the 20 cached + 10 cache-write
+    # tokens, so the prompt total is 100 and the cached subset is 20.
+    assert trajectory.final_metrics.total_prompt_tokens == 100
+    assert trajectory.final_metrics.total_cached_tokens == 20
+    assert trajectory.final_metrics.total_completion_tokens == 5
+
+
+def test_copilot_cli_failed_compaction_is_not_counted_as_summarization(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+
+    def _events(success: bool) -> list[dict]:
+        return [
+            {
+                "type": "assistant.message",
+                "data": {"messageId": "m", "content": "Working", "outputTokens": 1},
+            },
+            {
+                "type": "session.compaction_complete",
+                "data": {"success": success, "preCompactionTokens": 2000},
+            },
+        ]
+
+    failed = agent._convert_events_to_trajectory(_events(success=False))
+    assert failed is not None
+    assert failed.final_metrics is not None
+    assert failed.final_metrics.extra["summarization_count"] == 0
+
+    succeeded = agent._convert_events_to_trajectory(_events(success=True))
+    assert succeeded is not None
+    assert succeeded.final_metrics is not None
+    assert succeeded.final_metrics.extra["summarization_count"] == 1
+
+
+def test_copilot_cli_distinct_reasoning_blocks_are_not_merged_on_partial_overlap(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "id": "00000000-0000-4000-8000-000000000051",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:00.500Z",
+            "parentId": None,
+            "ephemeral": True,
+            "data": {"reasoningId": "reasoning-1", "content": "Use cat"},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000052",
+            "type": "assistant.reasoning",
+            "timestamp": "2026-01-01T00:00:00.600Z",
+            "parentId": "00000000-0000-4000-8000-000000000051",
+            "ephemeral": True,
+            "data": {"reasoningId": "reasoning-2", "content": "category names matter"},
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000053",
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "parentId": "00000000-0000-4000-8000-000000000052",
+            "data": {"messageId": "message-1", "content": "Done", "outputTokens": 1},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert len(trajectory.steps) == 1
+    # "Use cat" ends with "cat", which is a prefix of "category"; these are two
+    # distinct reasoning blocks and must not be stitched into "Use category".
+    assert (
+        trajectory.steps[0].reasoning_content == "Use cat\n\ncategory names matter"
+    )
 
 
 def _session_events() -> list[dict]:
@@ -710,7 +826,7 @@ def _session_events() -> list[dict]:
         {
             "type": "session.compaction_complete",
             "timestamp": "2026-01-01T00:00:02.000Z",
-            "data": {"preCompactionTokens": 2000},
+            "data": {"success": True, "preCompactionTokens": 2000},
         },
         {
             "type": "session.shutdown",

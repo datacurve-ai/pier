@@ -597,7 +597,11 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             )
             peak_context_tokens = max(peak_context_tokens, total)
         elif event_type == "session.compaction_complete":
-            summarization_count += 1
+            # `success` is a required field on this event; only completed
+            # compactions are summarizations. A failed attempt must not count,
+            # but its pre-compaction context size is still a real peak.
+            if data.get("success") is not False:
+                summarization_count += 1
             peak_context_tokens = max(
                 peak_context_tokens,
                 _optional_int(data.get("preCompactionTokens")) or 0,
@@ -677,15 +681,20 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             has_usage_input or has_usage_cache_read or has_usage_cache_write
         )
         if has_usage_prompt:
-            # Per call: prefer usage input; fall back to message input for any
-            # call whose usage event arrived without inputTokens (e.g. a
-            # partially captured stream after a timeout or cancellation).
-            input_by_call = {call_id: usage[0] for call_id, usage in usage_by_call.items()}
+            # Per call: prefer the usage event's inputTokens; fall back to the
+            # message input for any call whose usage event arrived without it
+            # (e.g. a partially captured stream after a timeout). inputTokens is
+            # the cache-inclusive prompt total (OpenAI-style prompt_tokens), so
+            # cached reads/writes are already counted within it and must not be
+            # added again.
+            input_by_call = {
+                call_id: usage[0] for call_id, usage in usage_by_call.items()
+            }
             for call_id, (msg_input, _) in message_usage_by_call.items():
                 if input_by_call.get(call_id) is None:
                     input_by_call[call_id] = msg_input
             merged_input, _ = _sum_optional(input_by_call.values())
-            prompt_tokens = merged_input + usage_cache_read + usage_cache_write
+            prompt_tokens = merged_input
         else:
             prompt_tokens = message_input
         return _SessionMetrics(
@@ -700,21 +709,30 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             aiu=None,
         )
 
-    noncached = 0
+    prompt_total = 0
     cache_read = 0
-    cache_write = 0
     output = 0
     for shutdown in shutdowns:
         model_usage = _shutdown_model_usage(shutdown)
         if model_usage is not None:
-            noncached += model_usage[0]
+            # modelMetrics[*].usage.inputTokens is the cache-inclusive prompt
+            # total (OpenAI-style prompt_tokens); cacheReadTokens and
+            # cacheWriteTokens are breakdowns already included in it, so they
+            # are not re-added to the prompt total.
+            prompt_total += model_usage[0]
             cache_read += model_usage[1]
-            cache_write += model_usage[2]
             output += model_usage[3]
         else:
-            noncached += _token_count(shutdown, "input")
-            cache_read += _token_count(shutdown, "cache_read")
-            cache_write += _token_count(shutdown, "cache_write")
+            # Legacy tokenDetails billing categories are disjoint: the "input"
+            # bucket excludes cached reads/writes, so the prompt total is the
+            # sum of the three input-side categories.
+            legacy_cache_read = _token_count(shutdown, "cache_read")
+            prompt_total += (
+                _token_count(shutdown, "input")
+                + legacy_cache_read
+                + _token_count(shutdown, "cache_write")
+            )
+            cache_read += legacy_cache_read
             output += _token_count(shutdown, "output")
     nano_aiu = sum(
         float(value)
@@ -723,7 +741,7 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     )
 
     return _SessionMetrics(
-        input_tokens=noncached + cache_read + cache_write,
+        input_tokens=prompt_total,
         cache_read_tokens=cache_read,
         output_tokens=output,
         peak_context_tokens=peak_context_tokens or None,
@@ -971,9 +989,22 @@ def _merge_ordered_text(existing: str, new: str) -> str:
 
     max_overlap = min(len(existing), len(new))
     for overlap in range(max_overlap, 0, -1):
-        if existing.endswith(new[:overlap]):
+        if existing.endswith(new[:overlap]) and _overlap_on_boundaries(
+            existing, new, overlap
+        ):
             return existing + new[overlap:]
     return f"{existing}\n\n{new}"
+
+
+def _overlap_on_boundaries(existing: str, new: str, overlap: int) -> bool:
+    # Only treat a shared substring as a genuine continuation (rather than a
+    # coincidental mid-word collision such as "Use cat" + "category") when the
+    # overlap aligns to whitespace boundaries on both sides.
+    trailing = new[overlap:]
+    if trailing and not trailing[0].isspace():
+        return False
+    leading_index = len(existing) - overlap - 1
+    return leading_index < 0 or existing[leading_index].isspace()
 
 
 def _is_subagent_event(event: dict[str, Any]) -> bool:
