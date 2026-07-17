@@ -91,9 +91,10 @@ class CopilotCli(BaseInstalledAgent):
         self._command_model_name = command_model_name
         self._extra_args = extra_args
         super().__init__(*args, **kwargs)
-        # COPILOT_HOME is always controlled by the agent itself; allowing
-        # _extra_env to override it would redirect session state away from
-        # the mounted log directory.
+        # COPILOT_HOME is always controlled by the agent itself; _exec()
+        # re-applies _extra_env on top of the constructed env dict, so a
+        # caller-supplied value would redirect session state away from the
+        # mounted log directory.
         self._extra_env.pop("COPILOT_HOME", None)
         # An empty COPILOT_GITHUB_TOKEN in _extra_env would mask a valid
         # token resolved by _copilot_auth_env() after _exec() re-applies

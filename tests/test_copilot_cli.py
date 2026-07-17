@@ -574,6 +574,7 @@ def test_copilot_cli_timeout_after_compaction_start_reports_peak_context_tokens(
 
     assert trajectory is not None
     assert trajectory.final_metrics is not None
+    # peak_context_tokens = systemTokens(500) + conversationTokens(1200) + toolDefinitionsTokens(300)
     assert trajectory.final_metrics.extra["peak_context_tokens"] == 2000
 
 
@@ -645,7 +646,10 @@ def test_copilot_cli_timeout_uses_message_input_for_calls_missing_from_usage_str
 
     assert trajectory is not None
     assert trajectory.final_metrics is not None
-    # input: 100 (api-1 usage) + 80 (api-2 message fallback) + 10 (cache_read api-1) + 5 (cache_read api-2) = 195
+    # total_prompt_tokens includes all input + cache tokens (cache is part of the prompt context).
+    # input: 100 (api-1 usage) + 80 (api-2 message fallback) = 180
+    # cache: 10 (api-1 cache_read) + 5 (api-2 cache_read) = 15
+    # total: 180 + 15 = 195
     assert trajectory.final_metrics.total_prompt_tokens == 195
     assert trajectory.final_metrics.total_cached_tokens == 15
 
