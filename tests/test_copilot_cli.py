@@ -542,6 +542,114 @@ def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
     }
 
 
+def test_copilot_cli_timeout_after_compaction_start_reports_peak_context_tokens(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "user.message",
+            "data": {"content": "Fix the bug"},
+        },
+        {
+            "type": "assistant.message",
+            "data": {"messageId": "message-1", "content": "Working on it", "outputTokens": 5},
+        },
+        {
+            "type": "session.compaction_start",
+            "data": {
+                "systemTokens": 500,
+                "conversationTokens": 1200,
+                "toolDefinitionsTokens": 300,
+            },
+        },
+        # No session.compaction_complete — timed out before compaction finished
+        {
+            "type": "assistant.usage",
+            "data": {"inputTokens": 100, "outputTokens": 5, "apiCallId": "api-1"},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.extra["peak_context_tokens"] == 2000
+
+
+def test_copilot_cli_extra_env_reserved_keys_are_normalized(tmp_path: Path):
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_HOME": "/custom/home",
+            "COPILOT_GITHUB_TOKEN": "",
+            "SOME_OTHER_VAR": "value",
+        },
+    )
+
+    assert "COPILOT_HOME" not in agent._extra_env
+    assert "COPILOT_GITHUB_TOKEN" not in agent._extra_env
+    assert agent._extra_env.get("SOME_OTHER_VAR") == "value"
+
+
+def test_copilot_cli_timeout_uses_message_input_for_calls_missing_from_usage_stream(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "user.message",
+            "data": {"content": "Fix the bug"},
+        },
+        # Call api-1: usage event has input tokens
+        {
+            "type": "assistant.usage",
+            "data": {
+                "inputTokens": 100,
+                "cacheReadTokens": 10,
+                "outputTokens": 5,
+                "apiCallId": "api-1",
+            },
+        },
+        {
+            "type": "assistant.message",
+            "data": {
+                "apiCallId": "api-1",
+                "content": "Working",
+                "inputTokens": 95,
+                "outputTokens": 5,
+            },
+        },
+        # Call api-2: usage event has no inputTokens (timeout cut it short),
+        # but assistant.message carries inputTokens
+        {
+            "type": "assistant.usage",
+            "data": {
+                "cacheReadTokens": 5,
+                "outputTokens": 3,
+                "apiCallId": "api-2",
+            },
+        },
+        {
+            "type": "assistant.message",
+            "data": {
+                "apiCallId": "api-2",
+                "content": "Still working",
+                "inputTokens": 80,
+                "outputTokens": 3,
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    # input: 100 (api-1 usage) + 80 (api-2 message fallback) + 10 (cache_read api-1) + 5 (cache_read api-2) = 195
+    assert trajectory.final_metrics.total_prompt_tokens == 195
+    assert trajectory.final_metrics.total_cached_tokens == 15
+
+
 def _session_events() -> list[dict]:
     return [
         {

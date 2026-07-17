@@ -91,6 +91,15 @@ class CopilotCli(BaseInstalledAgent):
         self._command_model_name = command_model_name
         self._extra_args = extra_args
         super().__init__(*args, **kwargs)
+        # COPILOT_HOME is always controlled by the agent itself; allowing
+        # _extra_env to override it would redirect session state away from
+        # the mounted log directory.
+        self._extra_env.pop("COPILOT_HOME", None)
+        # An empty COPILOT_GITHUB_TOKEN in _extra_env would mask a valid
+        # token resolved by _copilot_auth_env() after _exec() re-applies
+        # _extra_env on top of the constructed env dict.
+        if not self._extra_env.get("COPILOT_GITHUB_TOKEN"):
+            self._extra_env.pop("COPILOT_GITHUB_TOKEN", None)
 
     @staticmethod
     def name() -> str:
@@ -579,6 +588,13 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             )
         elif event_type == "assistant.turn_start":
             n_turns += 1
+        elif event_type == "session.compaction_start":
+            total = (
+                (_optional_int(data.get("systemTokens")) or 0)
+                + (_optional_int(data.get("conversationTokens")) or 0)
+                + (_optional_int(data.get("toolDefinitionsTokens")) or 0)
+            )
+            peak_context_tokens = max(peak_context_tokens, total)
         elif event_type == "session.compaction_complete":
             summarization_count += 1
             peak_context_tokens = max(
@@ -659,11 +675,18 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         has_usage_prompt = (
             has_usage_input or has_usage_cache_read or has_usage_cache_write
         )
-        prompt_tokens = (
-            usage_input + usage_cache_read + usage_cache_write
-            if has_usage_prompt
-            else message_input
-        )
+        if has_usage_prompt:
+            # Per call: prefer usage input; fall back to message input for any
+            # call whose usage event arrived without inputTokens (e.g. a
+            # partially captured stream after a timeout or cancellation).
+            input_by_call = {call_id: usage[0] for call_id, usage in usage_by_call.items()}
+            for call_id, (msg_input, _) in message_usage_by_call.items():
+                if input_by_call.get(call_id) is None:
+                    input_by_call[call_id] = msg_input
+            merged_input, _ = _sum_optional(input_by_call.values())
+            prompt_tokens = merged_input + usage_cache_read + usage_cache_write
+        else:
+            prompt_tokens = message_input
         return _SessionMetrics(
             input_tokens=(
                 prompt_tokens if has_usage_prompt or has_message_input else None
