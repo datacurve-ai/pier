@@ -563,7 +563,7 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     summarization_count = 0
     peak_context_tokens = 0
     usage_by_call: dict[str, tuple[int | None, int | None, int | None, int | None]] = {}
-    message_by_id: dict[str, tuple[int | None, int | None]] = {}
+    message_usage_by_call: dict[str, tuple[int | None, int | None]] = {}
 
     for event in events:
         event_type = event.get("type")
@@ -603,11 +603,7 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
                 or data.get("providerCallId")
                 or usage.get("apiCallId")
             )
-            usage_key = (
-                f"call:{api_call_id}"
-                if api_call_id
-                else _event_identity(event)
-            )
+            usage_key = f"call:{api_call_id}" if api_call_id else _event_identity(event)
             previous = usage_by_call.get(usage_key, (None, None, None, None))
             usage_by_call[usage_key] = (
                 _max_optional(previous[0], input_tokens),
@@ -618,21 +614,25 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         elif event_type == "assistant.message":
             input_tokens = _optional_int(data.get("inputTokens"))
             output_tokens = _optional_int(data.get("outputTokens"))
+            api_call_id = _string_or_none(
+                data.get("apiCallId") or data.get("api_call_id")
+            )
             message_id = _string_or_none(
-                data.get("apiCallId")
-                or data.get("api_call_id")
-                or data.get("modelCallId")
-                or data.get("messageId")
+                data.get("modelCallId") or data.get("messageId")
             )
             message_key = (
-                f"message:{message_id}"
-                if message_id
-                else f"event:{_json_fingerprint(event)}"
+                f"call:{api_call_id}"
+                if api_call_id
+                else (
+                    f"message:{message_id}"
+                    if message_id
+                    else f"event:{_json_fingerprint(event)}"
+                )
             )
-            previous_input, previous_output = message_by_id.get(
+            previous_input, previous_output = message_usage_by_call.get(
                 message_key, (None, None)
             )
-            message_by_id[message_key] = (
+            message_usage_by_call[message_key] = (
                 _max_optional(previous_input, input_tokens),
                 _max_optional(previous_output, output_tokens),
             )
@@ -647,15 +647,15 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         usage_cache_write, has_usage_cache_write = _sum_optional(
             usage[2] for usage in usage_by_call.values()
         )
-        usage_output, has_usage_output = _sum_optional(
-            usage[3] for usage in usage_by_call.values()
-        )
         message_input, has_message_input = _sum_optional(
-            usage[0] for usage in message_by_id.values()
+            usage[0] for usage in message_usage_by_call.values()
         )
-        message_output, has_message_output = _sum_optional(
-            usage[1] for usage in message_by_id.values()
-        )
+        output_by_call = {call_id: usage[3] for call_id, usage in usage_by_call.items()}
+        for call_id, (_, output_tokens) in message_usage_by_call.items():
+            output_by_call[call_id] = _max_optional(
+                output_by_call.get(call_id), output_tokens
+            )
+        output_tokens, has_output = _sum_optional(output_by_call.values())
         has_usage_prompt = (
             has_usage_input or has_usage_cache_read or has_usage_cache_write
         )
@@ -664,16 +664,12 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             if has_usage_prompt
             else message_input
         )
-        output_tokens = _max_optional(
-            usage_output if has_usage_output else None,
-            message_output if has_message_output else None,
-        )
         return _SessionMetrics(
             input_tokens=(
                 prompt_tokens if has_usage_prompt or has_message_input else None
             ),
             cache_read_tokens=(usage_cache_read if has_usage_cache_read else None),
-            output_tokens=output_tokens,
+            output_tokens=output_tokens if has_output else None,
             peak_context_tokens=peak_context_tokens or None,
             summarization_count=summarization_count,
             n_turns=n_turns,
