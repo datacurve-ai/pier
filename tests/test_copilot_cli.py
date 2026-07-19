@@ -1,5 +1,8 @@
 import json
+import shlex
 from pathlib import Path
+
+import pytest
 
 from pier.agents.factory import AgentFactory
 from pier.agents.installed.copilot_cli import CopilotCli
@@ -78,6 +81,44 @@ def test_copilot_cli_run_command_preserves_pipeline_status(tmp_path: Path):
     assert "tee /logs/agent/command-0/stdout.txt" in command
     assert "exit ${PIPESTATUS[0]}" in command
     assert "cp -a" not in command
+
+
+def test_copilot_cli_extra_args_string_round_trips_quoted_values(tmp_path: Path):
+    agent = CopilotCli(logs_dir=tmp_path, extra_args='--foo "a b"')
+
+    extra_args = agent._extra_args_string()
+
+    assert extra_args == "--foo 'a b'"
+    assert shlex.split(extra_args) == ["--foo", "a b"]
+
+
+def test_copilot_cli_extra_args_string_quotes_shell_metacharacters(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, extra_args="; touch pwned")
+    extra_args = agent._extra_args_string()
+    command = agent._build_run_command(
+        setup="mkdir -p /logs/agent",
+        instruction="fix it",
+        flag_text=extra_args,
+        jsonl_path="/logs/agent/copilot-cli.jsonl",
+        output_path="/logs/agent/copilot-cli.txt",
+    )
+
+    run_script = shlex.split(command)[-1]
+
+    assert shlex.split(extra_args) == [";", "touch", "pwned"]
+    assert " ; touch pwned" not in run_script
+    assert "';' touch pwned" in run_script
+
+
+def test_copilot_cli_extra_args_string_rejects_malformed_shell_syntax(
+    tmp_path: Path,
+):
+    agent = CopilotCli(logs_dir=tmp_path, extra_args='--foo "unterminated')
+
+    with pytest.raises(ValueError, match="Invalid extra_args string"):
+        agent._extra_args_string()
 
 
 def test_copilot_cli_native_session_root_is_mounted():

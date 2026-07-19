@@ -135,7 +135,8 @@ class CopilotCli(BaseInstalledAgent):
                     user="root",
                     env={"DEBIAN_FRONTEND": "noninteractive"},
                     run=(
-                        "if command -v apk >/dev/null 2>&1; then "
+                        "if ldd --version 2>&1 | grep -qi musl || "
+                        "[ -f /etc/alpine-release ]; then "
                         "echo 'Copilot CLI official installer does not support "
                         "musl-based images' >&2; exit 1; "
                         "elif command -v apt-get >/dev/null 2>&1; then "
@@ -163,7 +164,13 @@ class CopilotCli(BaseInstalledAgent):
         if self._extra_args is None:
             return ""
         if isinstance(self._extra_args, str):
-            return self._extra_args.strip()
+            try:
+                extra_args = shlex.split(self._extra_args)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid extra_args string: {self._extra_args!r}"
+                ) from exc
+            return shlex.join(extra_args)
         return shlex.join([str(arg) for arg in self._extra_args])
 
     def _build_mcp_config_flag(self) -> str:
