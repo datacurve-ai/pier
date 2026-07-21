@@ -1,6 +1,7 @@
+import asyncio
+import json
 import logging
 import socket
-import asyncio
 
 from pier.environments.daytona import (
     DAYTONA_MAX_NETWORK_ALLOWLIST_CIDRS,
@@ -42,6 +43,122 @@ def test_daytona_collapses_resolved_cidrs_to_daytona_limit(monkeypatch):
 
     assert len(cidrs) <= DAYTONA_MAX_NETWORK_ALLOWLIST_CIDRS
     assert all(cidr.endswith(("/32", "/31", "/30", "/29", "/28")) for cidr in cidrs)
+
+
+def test_daytona_drops_split_horizon_answers_but_keeps_public_ones(monkeypatch):
+    # A corporate/VPN resolver can return the INTERNAL view of a domain alongside
+    # (or instead of) the public one. Internal addresses gate nothing the sandbox
+    # can reach, so they must not consume allowlist entries.
+    def fake_getaddrinfo(_host, *_args, **_kwargs):
+        return [_addr("10.1.2.3"), _addr("203.0.113.10"), _addr("192.168.7.7")]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    resolution, cidrs = resolve_network_allowlist_to_daytona_cidrs(
+        ["api.openai.com"]
+    )
+
+    assert resolution == {"api.openai.com": ["203.0.113.10"]}
+    assert cidrs == ["203.0.113.10/32"]
+
+
+def test_daytona_falls_back_to_public_doh_when_local_view_is_internal_only(
+    monkeypatch,
+):
+    # Split-horizon DNS (e.g. a corp devserver) resolves the model-API domain to
+    # internal VIPs only. The sandbox connects to the PUBLIC address, so the
+    # allowlist must come from a public resolver or every request is blocked.
+    def fake_getaddrinfo(_host, *_args, **_kwargs):
+        return [_addr("10.1.2.3")]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(
+        "pier.environments.daytona._resolve_domain_via_public_doh",
+        lambda domain: ["203.0.113.10"],
+    )
+
+    resolution, cidrs = resolve_network_allowlist_to_daytona_cidrs(
+        ["api.openai.com"]
+    )
+
+    assert resolution == {"api.openai.com": ["203.0.113.10"]}
+    assert cidrs == ["203.0.113.10/32"]
+
+
+def test_daytona_falls_back_to_public_doh_on_local_resolution_failure(monkeypatch):
+    def fake_getaddrinfo(_host, *_args, **_kwargs):
+        raise socket.gaierror("no such host in the local view")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(
+        "pier.environments.daytona._resolve_domain_via_public_doh",
+        lambda domain: ["203.0.113.10"],
+    )
+
+    resolution, cidrs = resolve_network_allowlist_to_daytona_cidrs(
+        ["api.openai.com"]
+    )
+
+    assert resolution == {"api.openai.com": ["203.0.113.10"]}
+    assert cidrs == ["203.0.113.10/32"]
+
+
+def test_daytona_resolution_empty_when_local_and_doh_both_fail(monkeypatch):
+    def fake_getaddrinfo(_host, *_args, **_kwargs):
+        raise socket.gaierror("no such host in the local view")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(
+        "pier.environments.daytona._resolve_domain_via_public_doh",
+        lambda domain: [],
+    )
+
+    resolution, cidrs = resolve_network_allowlist_to_daytona_cidrs(
+        ["api.openai.com"]
+    )
+
+    assert resolution == {"api.openai.com": []}
+    assert cidrs == []
+
+
+def test_doh_parses_a_records_and_skips_unreachable_or_non_a(monkeypatch):
+    import io
+
+    from pier.environments.daytona import _resolve_domain_via_public_doh
+
+    payload = {
+        "Answer": [
+            {"type": 1, "data": "203.0.113.10"},
+            {"type": 1, "data": "10.9.9.9"},  # internal — must be skipped
+            {"type": 5, "data": "edge.example.net."},  # CNAME — must be skipped
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        assert request.get_header("Accept") == "application/dns-json"
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert _resolve_domain_via_public_doh("api.openai.com") == ["203.0.113.10"]
+
+
+def test_doh_returns_empty_when_all_resolvers_fail(monkeypatch):
+    from pier.environments.daytona import _resolve_domain_via_public_doh
+
+    def fake_urlopen(_request, timeout=None):
+        raise OSError("blocked")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert _resolve_domain_via_public_doh("api.openai.com") == []
 
 
 def test_daytona_network_params_use_resolved_allowlist(monkeypatch):

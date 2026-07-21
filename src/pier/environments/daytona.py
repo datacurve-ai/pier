@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import atexit
 import ipaddress
+import json
 import os
 import shlex
 import socket
 import tempfile
+import urllib.parse
+import urllib.request
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
@@ -112,6 +115,79 @@ def _cidrs_from_domain_resolution(
     )
 
 
+# Address space a cloud sandbox can never reach: answers in these ranges come from a
+# split-horizon (corporate/VPN) resolver's internal view of the domain, not the public
+# endpoint the sandbox will connect to. Shipping them in the allowlist silently blocks
+# every real connection.
+_SANDBOX_UNREACHABLE_NETS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",  # "this network"
+        "10.0.0.0/8",  # RFC1918
+        "100.64.0.0/10",  # CGNAT
+        "127.0.0.0/8",  # loopback
+        "169.254.0.0/16",  # link-local
+        "172.16.0.0/12",  # RFC1918
+        "192.168.0.0/16",  # RFC1918
+        "224.0.0.0/4",  # multicast
+        "240.0.0.0/4",  # reserved
+    )
+)
+
+# Public DNS-over-HTTPS resolvers used as a fallback when the local resolver returns no
+# sandbox-reachable answer for an allowlist domain (split-horizon DNS, or no A record in
+# the local view). Queried over plain HTTPS with the JSON API; no extra dependencies.
+_DOH_RESOLVER_URLS = (
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+)
+_DOH_TIMEOUT_SECONDS = 5.0
+_DNS_TYPE_A = 1
+
+
+def _is_sandbox_reachable_ipv4(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version != 4:
+        return False
+    return not any(ip in net for net in _SANDBOX_UNREACHABLE_NETS)
+
+
+def _resolve_domain_via_public_doh(domain: str) -> list[str]:
+    """Best-effort A-record lookup through public DNS-over-HTTPS resolvers.
+
+    Used only when the local resolver produced no sandbox-reachable answer, so a
+    launcher behind split-horizon DNS still allowlists the public addresses the
+    sandbox will actually connect to. Returns [] when every resolver fails.
+    """
+    for resolver_url in _DOH_RESOLVER_URLS:
+        query = urllib.parse.urlencode({"name": domain, "type": "A"})
+        request = urllib.request.Request(
+            f"{resolver_url}?{query}",
+            headers={"accept": "application/dns-json"},
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=_DOH_TIMEOUT_SECONDS
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        addrs = sorted(
+            {
+                answer.get("data", "")
+                for answer in payload.get("Answer") or []
+                if answer.get("type") == _DNS_TYPE_A
+                and _is_sandbox_reachable_ipv4(answer.get("data", ""))
+            }
+        )
+        if addrs:
+            return addrs
+    return []
+
+
 def resolve_network_allowlist_to_daytona_cidrs(
     domains: list[str],
 ) -> tuple[dict[str, list[str]], list[str]]:
@@ -119,13 +195,20 @@ def resolve_network_allowlist_to_daytona_cidrs(
 
     Daytona network limits accept IPv4 CIDR blocks only. Leading-dot suffix
     domains cannot be resolved deterministically, so they are ignored here.
+
+    Resolution runs on the LAUNCHER, but the allowlist gates the SANDBOX's
+    egress, so answers only the launcher's network can reach (split-horizon
+    corporate/VPN DNS returning private or CGNAT addresses) are dropped, and a
+    domain with no sandbox-reachable answer falls back to public DNS-over-HTTPS.
+    Without this, a launcher behind split-horizon DNS ships an allowlist of
+    internal addresses and the sandbox's every connection is silently blocked.
     """
     domain_resolution: dict[str, list[str]] = {}
     for domain in sorted(set(domains)):
         if domain.startswith("."):
             continue
         try:
-            addrs = sorted(
+            local_addrs = sorted(
                 {
                     info[4][0]
                     for info in socket.getaddrinfo(
@@ -137,7 +220,33 @@ def resolve_network_allowlist_to_daytona_cidrs(
                 }
             )
         except socket.gaierror:
-            addrs = []
+            local_addrs = []
+        addrs = [addr for addr in local_addrs if _is_sandbox_reachable_ipv4(addr)]
+        dropped = sorted(set(local_addrs) - set(addrs))
+        if dropped:
+            logger.warning(
+                "Ignoring local resolver answers for %s that a Daytona sandbox "
+                "cannot reach (split-horizon/corporate DNS?): %s",
+                domain,
+                ", ".join(dropped),
+            )
+        if not addrs:
+            addrs = _resolve_domain_via_public_doh(domain)
+            if addrs:
+                logger.warning(
+                    "Local resolver returned no sandbox-reachable IPv4 answer "
+                    "for %s; using public DNS-over-HTTPS answer instead: %s",
+                    domain,
+                    ", ".join(addrs),
+                )
+            else:
+                logger.warning(
+                    "Could not resolve any sandbox-reachable IPv4 address for "
+                    "allowlist domain %s (local resolver and public "
+                    "DNS-over-HTTPS both failed); connections to it from the "
+                    "sandbox will be blocked.",
+                    domain,
+                )
         domain_resolution[domain] = addrs
 
     return domain_resolution, _cidrs_from_domain_resolution(domain_resolution)
