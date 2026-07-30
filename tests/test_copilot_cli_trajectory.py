@@ -3928,3 +3928,189 @@ def test_copilot_cli_message_without_a_call_id_matches_its_turn(tmp_path: Path):
     assert trajectory.final_metrics is not None
     assert trajectory.final_metrics.total_prompt_tokens == 100
     assert trajectory.final_metrics.total_completion_tokens == 5
+
+
+def test_copilot_cli_shutdown_reports_premium_requests(tmp_path: Path):
+    """Premium requests are the unit GitHub actually bills and rate-limits on.
+
+    `copilot_aiu` measures spend but not quota, so a run cannot be reconciled
+    against a Copilot plan without this.
+    """
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {
+                "totalNanoAiu": 251_067_600_000,
+                "totalPremiumRequests": 14,
+                "tokenDetails": {"output": {"tokenCount": 2}},
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.extra["copilot_premium_requests"] == 14
+
+
+def test_copilot_cli_resumed_session_sums_premium_requests(tmp_path: Path):
+    """Each shutdown bills only its own run, so a resumed session adds them."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {"totalPremiumRequests": 3, "tokenDetails": {}},
+        },
+        {
+            "type": "session.resume",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "data": {},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:04.000Z",
+            "data": {"totalPremiumRequests": 5, "tokenDetails": {}},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.extra["copilot_premium_requests"] == 8
+
+
+def test_copilot_cli_usage_checkpoint_supplies_premium_requests(tmp_path: Path):
+    """A killed session never shuts down, but checkpoints survive it."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "session.usage_checkpoint",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {"totalPremiumRequests": 2},
+        },
+        {
+            "type": "session.usage_checkpoint",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "data": {"totalPremiumRequests": 6},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    # Checkpoints report a running cumulative total, so the latest wins.
+    assert trajectory.final_metrics.extra["copilot_premium_requests"] == 6
+
+
+def test_copilot_cli_result_event_supplies_premium_requests(tmp_path: Path):
+    """The stdout stream closes with `result`, which the persisted stream lacks.
+
+    It also carries its payload at the event root rather than under `data`.
+    """
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "result",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "sessionId": "session-1",
+            "exitCode": 0,
+            "usage": {"premiumRequests": 14, "totalApiDurationMs": 476261},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.extra["copilot_premium_requests"] == 14
+    # A summary event is not a turn and must not become a step.
+    assert [step.source for step in trajectory.steps] == ["agent"]
+
+
+def test_copilot_cli_result_event_does_not_double_count_premium_requests(
+    tmp_path: Path,
+):
+    """Both streams report the same session total, so they must not add up.
+
+    `_combine_event_streams` merges the tee'd stdout with the persisted events,
+    and both describe the same run.
+    """
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {"totalPremiumRequests": 14, "tokenDetails": {}},
+        },
+        {
+            "type": "result",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "exitCode": 0,
+            "usage": {"premiumRequests": 14},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.extra["copilot_premium_requests"] == 14
+
+
+def test_copilot_cli_omits_premium_requests_when_unreported(tmp_path: Path):
+    """Older CLI versions never report it; the key must then be absent."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"apiCallId": "api-1", "content": "Working", "outputTokens": 2},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {"tokenDetails": {}},
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    assert "copilot_premium_requests" not in trajectory.final_metrics.extra

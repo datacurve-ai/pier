@@ -41,6 +41,7 @@ class _SessionMetrics:
     peak_context_tokens: int | None
     summarization_count: int
     aiu: float | None
+    premium_requests: int | None
 
 
 @dataclass
@@ -411,6 +412,8 @@ class CopilotCli(BaseInstalledAgent):
             )
         if session_metrics.aiu is not None:
             metadata["copilot_aiu"] = session_metrics.aiu
+        if session_metrics.premium_requests is not None:
+            metadata["copilot_premium_requests"] = session_metrics.premium_requests
         context.metadata = metadata or None
 
     def _convert_events_to_trajectory(
@@ -462,6 +465,8 @@ class CopilotCli(BaseInstalledAgent):
         extra: dict[str, Any] = {}
         if session_metrics.aiu is not None:
             extra["copilot_aiu"] = session_metrics.aiu
+        if session_metrics.premium_requests is not None:
+            extra["copilot_premium_requests"] = session_metrics.premium_requests
         if session_metrics.peak_context_tokens is not None:
             extra["peak_context_tokens"] = session_metrics.peak_context_tokens
         extra["summarization_count"] = session_metrics.summarization_count
@@ -1037,6 +1042,7 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     summarization_count = 0
     peak_context_tokens = 0
     checkpoint_nano_aiu: float | None = None
+    reported_premium_requests: int | None = None
     usage_by_call: dict[
         tuple[str | None, int, str],
         tuple[int | None, int | None, int | None, int | None],
@@ -1075,6 +1081,22 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             nano_aiu = data.get("totalNanoAiu")
             if isinstance(nano_aiu, (int, float)) and not isinstance(nano_aiu, bool):
                 checkpoint_nano_aiu = max(checkpoint_nano_aiu or 0.0, float(nano_aiu))
+            reported_premium_requests = _max_optional(
+                reported_premium_requests,
+                _optional_int(data.get("totalPremiumRequests")),
+            )
+        elif event_type == "result":
+            # The stdout stream closes with a `result` summary that the
+            # persisted stream never contains, and it carries its payload at the
+            # event root rather than under `data`. Its premium request count is
+            # the same session total `session.shutdown` reports, so it is a
+            # fallback for a killed session rather than something to add on top.
+            usage = data.get("usage") or event.get("usage")
+            usage = usage if isinstance(usage, dict) else {}
+            reported_premium_requests = _max_optional(
+                reported_premium_requests,
+                _optional_int(usage.get("premiumRequests")),
+            )
         elif event_type == "session.compaction_start":
             total = (
                 (_optional_int(data.get("systemTokens")) or 0)
@@ -1200,6 +1222,7 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
             peak_context_tokens=peak_context_tokens or None,
             summarization_count=summarization_count,
             aiu=_nano_aiu_to_aiu(checkpoint_nano_aiu),
+            premium_requests=reported_premium_requests,
         )
 
     prompt_total = 0
@@ -1232,6 +1255,11 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         for shutdown in shutdowns
         if isinstance(value := shutdown.get("totalNanoAiu"), (int, float))
     )
+    # A resumed session shuts down more than once, and each shutdown reports the
+    # requests billed for its own run, so these sum the way AIU does.
+    shutdown_premium_requests, has_premium_requests = _sum_optional(
+        _optional_int(shutdown.get("totalPremiumRequests")) for shutdown in shutdowns
+    )
 
     return _SessionMetrics(
         input_tokens=prompt_total,
@@ -1240,6 +1268,11 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         peak_context_tokens=peak_context_tokens or None,
         summarization_count=summarization_count,
         aiu=_nano_aiu_to_aiu(nano_aiu or checkpoint_nano_aiu),
+        premium_requests=(
+            shutdown_premium_requests
+            if has_premium_requests
+            else reported_premium_requests
+        ),
     )
 
 

@@ -1,0 +1,130 @@
+# DeepSWE × GitHub Copilot CLI
+#
+# Runs the 13 DeepSWE-leaderboard models that Copilot CLI can drive over a
+# fixed, language-proportional 20-task subset: 13 × 20 × 1 = 260 trials.
+#
+# Prerequisites
+#   - DeepSWE >= v1.1 checked out next to this repo (../deep-swe).
+#   - The air-gapped overlay built from it (../deep-swe-airgap/tasks); see the
+#     `datasets` note below for why.
+#   - COPILOT_GITHUB_TOKEN (or GH_TOKEN / GITHUB_TOKEN) exported. A `gh auth
+#     token` OAuth token works; so does a fine-grained PAT with the "Copilot
+#     Requests" permission.
+#
+#   export COPILOT_GITHUB_TOKEN="$(gh auth token)"
+#   uv run pier job start -c examples/jobs/deepswe-copilot.yaml
+#
+# Every DeepSWE task sets `agent.network_mode = "no-network"`, so the agent must
+# reach the Copilot API through the Squid egress proxy pier builds from
+# CopilotCli.network_allowlist(), and nothing else.
+#
+# `reasoning_effort` mirrors the effort each model's published leaderboard entry
+# used, so the configuration stays as close to the published methodology as a
+# different agent scaffold allows. Absolute scores are NOT comparable with the
+# leaderboard: those were produced by `mini-swe-agent` on Modal over all 113
+# tasks. Read the ranking and the failure modes, not the delta.
+
+job_name: deepswe-copilot
+jobs_dir: jobs
+
+n_attempts: 1 # Pass@1, the leaderboard metric
+n_concurrent_trials: 8 # 16 CPU / 64 GB peak at 2 CPU / 8 GB per task
+
+# pier defaults to no retries. A run this long will meet transient Copilot 429s
+# and 5xxs, and losing a trial to one would silently depress a model's score.
+# The default exclusions still apply, so agent/verifier timeouts and missing or
+# unparseable reward files are recorded as real failures rather than retried.
+retry:
+  max_retries: 2
+  max_wait_sec: 120.0
+
+environment:
+  type: docker
+
+datasets:
+  # Points at an air-gapped overlay of ../deep-swe/tasks, not at DeepSWE itself.
+  # DeepSWE declares `network_mode = "no-network"` under [agent] and [verifier],
+  # but pier 0.3.0 -- fork and upstream alike -- implements neither key. It reads
+  # only `[environment] allow_internet`, which defaults to true, so DeepSWE tasks
+  # silently run with unrestricted internet: the agent can read the upstream fix
+  # on GitHub, and the agent network allowlist never engages. The overlay is a
+  # byte-identical copy of the pinned tasks with the `allow_internet = false`
+  # that pier does understand injected into [environment]. Rebuild it with:
+  #
+  #   python build_airgap_overlay.py examples/jobs/deepswe-copilot.yaml \
+  #     ../deep-swe/tasks ../deep-swe-airgap/tasks
+  #
+  # Pinned rather than sampled: `n_tasks` + `sample_seed` shuffles the whole
+  # corpus, which cannot hold a language balance at this size. These 20 are the
+  # deterministic 6 typescript / 6 python / 6 go / 1 rust / 1 javascript draw,
+  # and pinning them guarantees all 13 models face an identical task set.
+  - path: ../deep-swe-airgap/tasks
+    task_names:
+      # typescript (6 of 35)
+      - arktype-json-schema-refs-dependencies
+      - dynamodb-toolbox-conditional-attribute-requirements
+      - koota-composite-trait-aspects
+      - optique-conditional-option-dependencies
+      - query-persist-restored-query-state
+      - sql-formatter-bigquery-pipe-formatting
+      # python (6 of 34)
+      - bandit-incremental-cache-control
+      - igel-persist-feature-schema
+      - mashumaro-flattened-dataclass-fields
+      - returns-validated-error-accumulation
+      - skrub-duration-encoding
+      - textual-kitty-key-phases
+      # go (6 of 34)
+      - anko-typed-variable-bindings
+      - expr-try-catch-errors
+      - go-critic-doc-link-checker
+      - helm-unified-manifest-stream
+      - task-task-graph-export
+      - yaegi-go-embed-directives
+      # rust (1 of 5)
+      - boa-hierarchical-evaluation-cancellation
+      # javascript (1 of 5)
+      - testem-per-launcher-reports
+
+agents:
+  - name: copilot-cli
+    model_name: claude-opus-5
+    kwargs: { reasoning_effort: max }
+  - name: copilot-cli
+    model_name: gpt-5.6-sol
+    kwargs: { reasoning_effort: max }
+  - name: copilot-cli
+    model_name: gpt-5.6-terra
+    kwargs: { reasoning_effort: max }
+  - name: copilot-cli
+    model_name: gpt-5.6-luna
+    kwargs: { reasoning_effort: max }
+  - name: copilot-cli
+    model_name: gpt-5.5
+    kwargs: { reasoning_effort: xhigh }
+  - name: copilot-cli
+    model_name: claude-opus-4.8
+    kwargs: { reasoning_effort: max }
+  - name: copilot-cli
+    model_name: claude-sonnet-5
+    kwargs: { reasoning_effort: max }
+  # grok and the gemini models support neither `xhigh` nor `max`; `high` and
+  # `medium` are what their leaderboard entries used.
+  - name: copilot-cli
+    model_name: grok-4.5
+    kwargs: { reasoning_effort: high }
+  - name: copilot-cli
+    model_name: gpt-5.4
+    kwargs: { reasoning_effort: xhigh }
+  - name: copilot-cli
+    model_name: gemini-3.6-flash
+    kwargs: { reasoning_effort: high }
+  - name: copilot-cli
+    model_name: gemini-3.5-flash
+    kwargs: { reasoning_effort: medium }
+  - name: copilot-cli
+    model_name: claude-sonnet-4.6
+    kwargs: { reasoning_effort: high }
+  - name: copilot-cli
+    model_name: gemini-3.1-pro-preview
+    kwargs: { reasoning_effort: high }
