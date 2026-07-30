@@ -134,9 +134,20 @@ def test_copilot_cli_shutdown_metrics_keep_token_details_fallback(tmp_path: Path
     assert trajectory.final_metrics.total_completion_tokens == 5
 
 
-def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
+def test_copilot_cli_shutdown_metrics_include_summarization_calls(
     tmp_path: Path,
 ):
+    """`tokenDetails` wins over `modelMetrics` because it is the billing record.
+
+    Observed across seven real DeepSWE sessions: whenever a session compacted,
+    `tokenDetails` exceeded `modelMetrics` by exactly the summarization calls,
+    and whenever it did not compact the two agreed to the token. `modelMetrics`
+    tracks only the calls attributed to a named model, so preferring it lost up
+    to a third of a long-horizon session's output tokens.
+
+    The numbers below are the shape of the observed `claude-opus-5` trial:
+    `modelMetrics` sees one compaction less than the billing record does.
+    """
     agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
     events = [
         {
@@ -156,6 +167,7 @@ def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
                         }
                     }
                 },
+                # Disjoint billing buckets: 1000 + 200 + 100 = 1300 prompt.
                 "tokenDetails": {
                     "input": {"tokenCount": 1000},
                     "cache_read": {"tokenCount": 200},
@@ -172,11 +184,9 @@ def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
     assert_valid_atif(trajectory)
     assert_one_step_per_api_call(trajectory)
     assert trajectory.final_metrics is not None
-    # modelMetrics usage wins over the legacy tokenDetails compatibility shape,
-    # and its cache-inclusive inputTokens (100) is not double-counted.
-    assert trajectory.final_metrics.total_prompt_tokens == 100
-    assert trajectory.final_metrics.total_cached_tokens == 20
-    assert trajectory.final_metrics.total_completion_tokens == 5
+    assert trajectory.final_metrics.total_prompt_tokens == 1300
+    assert trajectory.final_metrics.total_cached_tokens == 200
+    assert trajectory.final_metrics.total_completion_tokens == 50
 
 
 def test_copilot_cli_timeout_metrics_combine_and_deduplicate_usage(
@@ -4114,3 +4124,73 @@ def test_copilot_cli_omits_premium_requests_when_unreported(tmp_path: Path):
     assert trajectory is not None
     assert trajectory.final_metrics is not None
     assert "copilot_premium_requests" not in trajectory.final_metrics.extra
+
+
+def test_copilot_cli_empty_token_details_falls_back_to_model_metrics(
+    tmp_path: Path,
+):
+    """An empty `tokenDetails` must not zero out a session that did report usage."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"messageId": "message-1", "content": "Done"},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {
+                "tokenDetails": {},
+                "modelMetrics": {
+                    "gpt-5.4": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 10,
+                            "outputTokens": 5,
+                        }
+                    }
+                },
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 100
+    assert trajectory.final_metrics.total_cached_tokens == 20
+    assert trajectory.final_metrics.total_completion_tokens == 5
+
+
+def test_copilot_cli_partial_token_details_are_not_discarded(tmp_path: Path):
+    """A stream that reports only some buckets still bills the ones it reports."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events = [
+        {
+            "type": "assistant.message",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"messageId": "message-1", "content": "Done"},
+        },
+        {
+            "type": "session.shutdown",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {
+                "tokenDetails": {"output": {"tokenCount": 50}},
+                "modelMetrics": {
+                    "gpt-5.4": {"usage": {"inputTokens": 100, "outputTokens": 5}}
+                },
+            },
+        },
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert_valid_atif(trajectory)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_completion_tokens == 50
+    assert trajectory.final_metrics.total_prompt_tokens == 0

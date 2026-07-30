@@ -1229,27 +1229,21 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     cache_read = 0
     output = 0
     for shutdown in shutdowns:
-        model_usage = _shutdown_model_usage(shutdown)
-        if model_usage is not None:
-            # modelMetrics[*].usage.inputTokens is the cache-inclusive prompt
-            # total (OpenAI-style prompt_tokens); cacheReadTokens and
-            # cacheWriteTokens are breakdowns already included in it, so they
-            # are not re-added to the prompt total.
-            prompt_total += model_usage[0]
-            cache_read += model_usage[1]
-            output += model_usage[3]
-        else:
-            # Legacy tokenDetails billing categories are disjoint: the "input"
-            # bucket excludes cached reads/writes, so the prompt total is the
-            # sum of the three input-side categories.
-            legacy_cache_read = _token_count(shutdown, "cache_read")
-            prompt_total += (
-                _token_count(shutdown, "input")
-                + legacy_cache_read
-                + _token_count(shutdown, "cache_write")
-            )
-            cache_read += legacy_cache_read
-            output += _token_count(shutdown, "output")
+        # `tokenDetails` is the billing record -- it is what `totalNanoAiu` is
+        # derived from -- and it counts every call the session made, including
+        # the compaction/summarization calls that `modelMetrics` omits. Those
+        # calls are large and frequent in long-horizon runs, so preferring
+        # `modelMetrics` here under-reported a compacting session's tokens by
+        # as much as a third. `modelMetrics` remains the fallback for streams
+        # that carry no `tokenDetails` at all.
+        usage = _shutdown_token_details_usage(shutdown) or _shutdown_model_usage(
+            shutdown
+        )
+        if usage is None:
+            continue
+        prompt_total += usage[0]
+        cache_read += usage[1]
+        output += usage[3]
     nano_aiu = sum(
         float(value)
         for shutdown in shutdowns
@@ -1280,14 +1274,37 @@ def _nano_aiu_to_aiu(nano_aiu: float | None) -> float | None:
     return round(nano_aiu / 1_000_000_000, 6) if nano_aiu else None
 
 
-def _token_count(shutdown: dict[str, Any], token_type: str) -> int:
+def _shutdown_token_details_usage(
+    shutdown: dict[str, Any],
+) -> tuple[int, int, int, int] | None:
+    """Session totals from `tokenDetails`, or None if it reports nothing.
+
+    The `tokenDetails` billing categories are disjoint -- the "input" bucket
+    excludes cached reads and writes -- so the cache-inclusive prompt total is
+    the sum of the three input-side categories.
+    """
     token_details = shutdown.get("tokenDetails")
     if not isinstance(token_details, dict):
-        return 0
-    details = token_details.get(token_type)
-    if not isinstance(details, dict):
-        return 0
-    return _optional_int(details.get("tokenCount")) or 0
+        return None
+
+    def count(token_type: str) -> int | None:
+        details = token_details.get(token_type)
+        if not isinstance(details, dict):
+            return None
+        return _optional_int(details.get("tokenCount"))
+
+    buckets = {
+        name: count(name) for name in ("input", "cache_read", "cache_write", "output")
+    }
+    if all(value is None for value in buckets.values()):
+        return None
+    resolved = {name: value or 0 for name, value in buckets.items()}
+    return (
+        resolved["input"] + resolved["cache_read"] + resolved["cache_write"],
+        resolved["cache_read"],
+        resolved["cache_write"],
+        resolved["output"],
+    )
 
 
 def _shutdown_model_usage(
