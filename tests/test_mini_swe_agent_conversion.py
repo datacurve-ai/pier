@@ -194,9 +194,7 @@ def test_convert_chat_message_keeps_reasoning_separate_from_visible_content():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.01, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "anthropic/claude-opus-4-7"}
-                },
+                "config": {"model": {"model_name": "anthropic/claude-opus-4-7"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
@@ -241,9 +239,7 @@ def test_convert_openrouter_byok_uses_upstream_cost_details():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.0, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "moonshotai/kimi-k2.6"}
-                },
+                "config": {"model": {"model_name": "moonshotai/kimi-k2.6"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
