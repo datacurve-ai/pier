@@ -129,3 +129,34 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
   kwargs:
     set_cache_control: default_end
 ```
+
+**MiniMax Coding Plan** is supported on `mini-swe-agent`, `opencode`, `claude-code`, and `codex`. The canonical LiteLLM provider prefix is `minimax/` and the auth env var is `MINIMAX_API_KEY`. Coding Plan subscription keys must use the Anthropic-compatible endpoint `https://api.minimax.io/anthropic`; the OpenAI-compatible path returns 404 for those keys. Use `MINIMAX_BASE_URL` or `ANTHROPIC_BASE_URL` to override per agent (China region: `https://api.minimaxi.com/anthropic`).
+
+```yaml
+- name: mini-swe-agent
+  model_name: minimax/MiniMax-M3
+  env: { MINIMAX_API_KEY: ${MINIMAX_API_KEY} }
+- name: opencode
+  model_name: minimax/MiniMax-M3
+  env: { MINIMAX_API_KEY: ${MINIMAX_API_KEY} }
+  # Optional override for China region or custom endpoint:
+  # env: { MINIMAX_API_KEY: ${MINIMAX_API_KEY}, MINIMAX_BASE_URL: ${MINIMAX_BASE_URL} }
+- name: claude-code
+  model_name: minimax/MiniMax-M3
+  env:
+    ANTHROPIC_BASE_URL: https://api.minimax.io/anthropic
+    ANTHROPIC_AUTH_TOKEN: ${MINIMAX_API_KEY}
+- name: codex
+  model_name: minimax/MiniMax-M3
+  env: { OPENAI_BASE_URL: https://api.minimax.io/v1, OPENAI_API_KEY: ${MINIMAX_API_KEY} }
+  # Coding Plan subscription keys require `wire_api = "responses"` in config_toml:
+  # kwargs:
+  #   config_toml: |
+  #     [model_providers.minimax_coding_plan]
+  #     name = "MiniMax Coding Plan"
+  #     base_url = "https://api.minimax.io/anthropic"
+  #     wire_api = "responses"
+  #     env_key = "MINIMAX_API_KEY"
+```
+
+`gemini-cli` and `cursor-cli` are not supported — their SDKs do not accept a foreign provider URL.

@@ -80,6 +80,13 @@ def test_opencode_ignores_non_url_provider_api_values(tmp_path: Path):
     assert "openai-compatible" not in domains(agent)
 
 
+def test_mini_swe_minimax_uses_default_domains(tmp_path: Path):
+    """MiniMax Coding Plan default allowlist covers intl + China hostnames."""
+    agent = MiniSweAgent(logs_dir=tmp_path, model_name="minimax/MiniMax-M3")
+
+    assert {"api.minimax.io", "api.minimaxi.com"} <= domains(agent)
+
+
 def test_mini_swe_reports_provider_env_base_urls(tmp_path: Path):
     agent = MiniSweAgent(
         logs_dir=tmp_path,

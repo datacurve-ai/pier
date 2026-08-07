@@ -566,6 +566,7 @@ class MiniSweAgent(BaseInstalledAgent):
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],
         "mistral": ["api.mistral.ai"],
+        "minimax": ["api.minimax.io", "api.minimaxi.com"],
         "openai": ["api.openai.com"],
         "openrouter": ["openrouter.ai"],
         "vertex_ai": [".googleapis.com"],

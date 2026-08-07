@@ -34,6 +34,7 @@ PROVIDER_KEYS = {
     "codestral": "CODESTRAL_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "mistral": "MISTRAL_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "palm": "PALM_API_KEY",
     "perplexity": "PERPLEXITYAI_API_KEY",
     "voyage": "VOYAGE_API_KEY",
@@ -73,6 +74,7 @@ PROVIDER_MODEL_NAMES = [
     (litellm.nebius_models, "NEBIUS_API_KEY"),
     (litellm.dashscope_models, "DASHSCOPE_API_KEY"),
     (litellm.moonshot_models, "MOONSHOT_API_KEY"),
+    (litellm.minimax_models, "MINIMAX_API_KEY"),
     (litellm.zai_models, "ZAI_API_KEY"),
 ]
 
