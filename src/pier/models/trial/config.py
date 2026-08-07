@@ -22,6 +22,7 @@ from pier.utils.env import templatize_sensitive_env
 
 class ServiceVolumeBind(TypedDict):
     create_host_path: NotRequired[Literal[False]]
+    selinux: NotRequired[Literal["z", "Z"]]
 
 
 class ServiceVolumeVolume(TypedDict):

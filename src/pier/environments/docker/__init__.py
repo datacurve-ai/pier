@@ -14,6 +14,10 @@ RESOURCES_COMPOSE_NAME = "docker-compose-resources.json"
 
 
 def write_mounts_compose_file(path: Path, mounts: list[ServiceVolumeConfig]) -> Path:
+    # list(mounts) + json.dumps serializes every key in each mount dict verbatim,
+    # including an optional ``bind`` key ({"bind": {"selinux": "Z"}}) used for the
+    # podman :Z SELinux relabel on managed mounts. With no ``bind`` (the Docker
+    # path), output is byte-identical. No special-casing required.
     compose = {"services": {"main": {"volumes": list(mounts)}}}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(compose, indent=2))
