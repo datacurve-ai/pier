@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `grok-build`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -130,6 +130,17 @@ through your env file.
   model_name: cursor/composer-2.5
   env:
     CURSOR_API_KEY: ${CURSOR_API_KEY}
+```
+
+**Grok Build** (xAI's `grok` CLI) authenticates with `XAI_API_KEY` when set; otherwise it copies a Grok CLI session file (kwarg `auth_file`, default `~/.grok/auth.json` — create it with `grok login` on the host) into the container's `GROK_HOME`. Model ids accept an optional provider prefix (`xai/grok-4.6` ≡ `grok-4.6`); omit `model_name` to use the CLI's default. Available model ids can differ between credentials and auth modes — check `grok models` under the credential you plan to run with. Kwargs: `reasoning_effort` (`low`–`xhigh`), `max_turns`, `disable_web_search` (default on), `no_plan` (default on), `no_subagents`.
+
+```yaml
+- name: grok-build
+  model_name: grok-4.6
+  kwargs:
+    reasoning_effort: xhigh
+  env:
+    XAI_API_KEY: ${XAI_API_KEY}
 ```
 
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
