@@ -99,12 +99,20 @@ def squid_bootstrap_command() -> str:
     return r"""#!/usr/bin/env bash
 set -eu
 
+LOG_DIR=/var/log/pier-egress-proxy
+ALLOWED_DOMAINS_FILE="$LOG_DIR/allowed_domains.txt"
+
+mkdir -p "$LOG_DIR"
+touch "$LOG_DIR/squid_access.log" "$LOG_DIR/squid_cache.log"
+
 printf '%s' "$ALLOWLIST_DOMAINS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' \
-  > /tmp/allowed_domains.txt
+  > "$ALLOWED_DOMAINS_FILE"
+chown -R proxy:proxy "$LOG_DIR"
+
 
 htpasswd -bc /tmp/squid.passwd agent "$PROXY_TOKEN"
 
-cat > /tmp/squid.conf <<'EOF'
+cat > /tmp/squid.conf <<EOF
 http_port 0.0.0.0:8080
 pid_filename /tmp/squid.pid
 coredump_dir /tmp
@@ -116,16 +124,27 @@ acl authenticated proxy_auth REQUIRED
 acl SSL_ports port 443
 acl Safe_ports port 80 443
 acl CONNECT method CONNECT
-acl allowed_domains dstdomain "/tmp/allowed_domains.txt"
+acl allowed_domains dstdomain "$ALLOWED_DOMAINS_FILE"
 
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access allow authenticated allowed_domains
 http_access deny all
 
+# Keep restricted inference egress resilient during long agent runs. The Docker
+# embedded resolver and Squid's default negative caching can turn one transient
+# DNS/connect miss into a burst of immediate CONNECT 503s for an otherwise
+# allowed provider host.
+dns_nameservers 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4
+positive_dns_ttl 5 minutes
+negative_dns_ttl 5 seconds
+connect_timeout 60 seconds
+connect_retries 3
+forward_timeout 60 seconds
+
 cache deny all
-access_log stdio:/tmp/squid_access.log
-cache_log /tmp/squid_cache.log
+access_log stdio:$LOG_DIR/squid_access.log
+cache_log $LOG_DIR/squid_cache.log
 log_mime_hdrs off
 shutdown_lifetime 1 seconds
 EOF
@@ -149,6 +168,8 @@ def write_docker_proxy_compose(
     token: str,
 ) -> Path:
     proxy_dir.mkdir(parents=True, exist_ok=True)
+    proxy_logs_dir = proxy_dir / "logs"
+    proxy_logs_dir.mkdir(parents=True, exist_ok=True)
     (proxy_dir / "Dockerfile").write_text(
         "\n".join(
             [
@@ -179,11 +200,26 @@ def write_docker_proxy_compose(
                 "build": {"context": str(proxy_dir.resolve().absolute())},
                 "environment": proxy_policy_env(allowlist, token),
                 "healthcheck": {
-                    "test": ["CMD-SHELL", "bash -lc '</dev/tcp/127.0.0.1/8080'"],
-                    "interval": "1s",
-                    "timeout": "1s",
+                    "test": [
+                        "CMD-SHELL",
+                        "test -s /tmp/squid.pid && kill -0 $(cat /tmp/squid.pid)",
+                    ],
+                    "interval": "5s",
+                    "timeout": "2s",
                     "retries": 30,
                 },
+                "volumes": [
+                    (
+                        f"{proxy_logs_dir.resolve().absolute()}"
+                        ":/var/log/pier-egress-proxy"
+                    ),
+                ],
+                "dns": [
+                    "1.1.1.1",
+                    "1.0.0.1",
+                    "8.8.8.8",
+                    "8.8.4.4",
+                ],
                 "networks": ["pier-egress-internal", "default"],
             },
         },
