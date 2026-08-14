@@ -1,13 +1,142 @@
+import asyncio
+import functools
 import json
+import re
 import shlex
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
+from pier.environments.base import BaseEnvironment, ExecResult
+from pier.environments.capabilities import EnvironmentCapabilities
 from pier.agents.factory import AgentFactory
+from pier.agents.installed.base import CliFlag
 from pier.agents.installed.copilot_cli import CopilotCli
 from pier.models.agent.context import AgentContext
 from pier.models.agent.name import AgentName
+from pier.models.environment_type import EnvironmentType
+from pier.models.task.config import EnvironmentConfig, MCPServerConfig, TaskOS
+from pier.models.trial.paths import TrialPaths
+
+
+_CLI_ENV_VARS = (
+    "COPILOT_CLI_EFFORT",
+    "COPILOT_CLI_MODE",
+    "COPILOT_CLI_CONTEXT_TIER",
+    "COPILOT_CLI_AGENT",
+)
+_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
+
+def run_async(fn):
+    """Drive an async test with asyncio.run (pier has no pytest-asyncio)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(fn(*args, **kwargs))
+
+    return wrapper
+
+
+class _RecordingEnvironment(BaseEnvironment):
+    def __init__(
+        self,
+        tmp_path: Path,
+        exec_result: ExecResult | None = None,
+    ) -> None:
+        self.exec_result = exec_result or ExecResult(
+            return_code=0,
+            stdout="",
+            stderr="",
+        )
+        self.exec_calls: list[dict[str, object]] = []
+        self.agent_process_env_inputs: list[dict[str, str] | None] = []
+        trial_paths = TrialPaths(tmp_path / "trial")
+        trial_paths.mkdir()
+        super().__init__(
+            environment_dir=tmp_path,
+            environment_name="test",
+            session_id="session",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(os=TaskOS.LINUX),
+        )
+
+    @staticmethod
+    def type() -> EnvironmentType:
+        return EnvironmentType.DOCKER
+
+    @property
+    def capabilities(self) -> EnvironmentCapabilities:
+        return EnvironmentCapabilities()
+
+    def _validate_definition(self):
+        pass
+
+    async def start(self, force_build: bool) -> None:
+        pass
+
+    async def stop(self, delete: bool):
+        pass
+
+    async def upload_file(self, source_path, target_path):
+        pass
+
+    async def upload_dir(self, source_dir, target_dir):
+        pass
+
+    async def download_file(self, source_path, target_path):
+        pass
+
+    async def download_dir(self, source_dir, target_dir):
+        pass
+
+    def agent_process_env(
+        self,
+        env: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        self.agent_process_env_inputs.append(dict(env) if env is not None else None)
+        return env
+
+    async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
+        self.exec_calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_sec": timeout_sec,
+                "user": user,
+            }
+        )
+        return self.exec_result
+
+
+def _clear_env(monkeypatch: pytest.MonkeyPatch, names: tuple[str, ...]) -> None:
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+
+def _split_run_command(command: str) -> tuple[str, str]:
+    assert command.startswith("set -o pipefail; ")
+    command = command.removeprefix("set -o pipefail; ")
+    setup, quoted_script = command.rsplit(" && bash -lc ", 1)
+    run_script = shlex.split(f"bash -lc {quoted_script}")[-1]
+    return setup, run_script
+
+
+async def _run_agent(
+    agent: CopilotCli,
+    tmp_path: Path,
+    instruction: str = "fix it",
+) -> tuple[_RecordingEnvironment, str, str]:
+    environment = _RecordingEnvironment(tmp_path)
+
+    await agent.run(instruction, environment, AgentContext())
+
+    assert len(environment.exec_calls) == 1
+    call = environment.exec_calls[0]
+    setup, run_script = _split_run_command(str(call["command"]))
+    return environment, setup, run_script
 
 
 def test_copilot_cli_is_registered_with_current_flags(tmp_path: Path):
@@ -28,6 +157,247 @@ def test_copilot_cli_is_registered_with_current_flags(tmp_path: Path):
     assert "--context-tier" not in agent.build_cli_flags()
 
 
+def test_copilot_cli_factory_passes_installed_agent_kwargs(tmp_path: Path):
+    agent = AgentFactory.create_agent_from_name(
+        AgentName.COPILOT_CLI,
+        logs_dir=tmp_path,
+        model_name="github/gpt-5.4",
+        command_model_name="gpt-5.5",
+        extra_args=["--flag", "value with spaces"],
+        version="1.0.76",
+        extra_env={"GH_TOKEN": "gh", "CUSTOM_ENV": "value"},
+    )
+
+    assert isinstance(agent, CopilotCli)
+    assert agent.model_name == "github/gpt-5.4"
+    assert agent._command_model_name == "gpt-5.5"
+    assert shlex.split(agent._extra_args_string()) == ["--flag", "value with spaces"]
+    assert agent.version() == "1.0.76"
+    assert agent._extra_env["GH_TOKEN"] == "gh"
+    assert agent._extra_env["CUSTOM_ENV"] == "value"
+
+
+@run_async
+async def test_copilot_cli_run_builds_expected_command_and_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    prompt_template = tmp_path / "prompt.j2"
+    prompt_template.write_text(
+        "Template start\n{{ instruction }}\nTemplate end",
+        encoding="utf-8",
+    )
+    instruction = 'Fix "quotes"\nDo not expand $HOME or `cmd`; it\'s literal'
+    rendered_instruction = f"Template start\n{instruction}\nTemplate end"
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        model_name="github/gpt-5.4",
+        prompt_template_path=prompt_template,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "token",
+            "COPILOT_HOME": "/custom",
+            "CUSTOM_ENV": "value",
+        },
+    )
+
+    environment, setup, run_script = await _run_agent(
+        agent,
+        tmp_path,
+        instruction=instruction,
+    )
+
+    expected_setup = (
+        "mkdir -p /logs/agent /logs/agent/command-0 "
+        '/logs/agent/copilot-home /logs/agent/copilot-logs && '
+        'export PATH="$HOME/.local/bin:$PATH"'
+    )
+    assert setup == expected_setup
+    session_match = re.search(r"--session-id ([0-9a-f-]{36})", run_script)
+    assert session_match is not None
+    UUID(session_match.group(1))
+    normalized_script = run_script.replace(session_match.group(1), "<session-id>")
+    expected_script = (
+        'export PATH="$HOME/.local/bin:$PATH"; '
+        "set -o pipefail; "
+        f"copilot -p {shlex.quote(rendered_instruction)} "
+        "--output-format json --no-color "
+        "--allow-all-tools --no-ask-user --no-auto-update "
+        "--model gpt-5.4 --session-id <session-id> "
+        "--log-dir /logs/agent/copilot-logs "
+        "2>&1 | tee /logs/agent/copilot-cli.jsonl | "
+        "tee /logs/agent/copilot-cli.txt | "
+        "tee /logs/agent/command-0/stdout.txt; "
+        "exit ${PIPESTATUS[0]}"
+    )
+    assert normalized_script == expected_script
+    assert environment.agent_process_env_inputs == [
+        {
+            "COPILOT_GITHUB_TOKEN": "token",
+            "CUSTOM_ENV": "value",
+            "COPILOT_HOME": "/logs/agent/copilot-home",
+        }
+    ]
+    assert environment.exec_calls[0]["env"] == {
+        "COPILOT_GITHUB_TOKEN": "token",
+        "CUSTOM_ENV": "value",
+        "COPILOT_HOME": "/logs/agent/copilot-home",
+    }
+    assert environment.exec_calls[0]["user"] is None
+    assert environment.exec_calls[0]["cwd"] is None
+    assert environment.exec_calls[0]["timeout_sec"] is None
+
+
+@run_async
+async def test_copilot_cli_run_command_model_name_overrides_model_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        model_name="github/gpt-5.4",
+        command_model_name="gpt-5.5",
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
+
+    _, _, run_script = await _run_agent(agent, tmp_path)
+
+    assert "--model gpt-5.5" in run_script
+    assert "--model gpt-5.4" not in run_script
+
+
+@run_async
+async def test_copilot_cli_run_strips_single_provider_prefix_from_model_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        model_name="github/gpt-5.4",
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
+
+    _, _, run_script = await _run_agent(agent, tmp_path)
+
+    assert "--model gpt-5.4" in run_script
+    assert "--model github/gpt-5.4" not in run_script
+
+
+@run_async
+async def test_copilot_cli_run_omits_model_flag_without_configured_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
+
+    _, _, run_script = await _run_agent(agent, tmp_path)
+
+    assert " --model " not in run_script
+
+
+def test_copilot_cli_cli_flags_map_all_supported_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        reasoning_effort="HIGH",
+        mode="PLAN",
+        context_tier="LONG_CONTEXT",
+        agent="copilot",
+        allow_all_tools=True,
+        no_ask_user=True,
+        no_auto_update=True,
+    )
+
+    assert agent.build_cli_flags() == (
+        "--effort high --mode plan --context long_context --agent copilot "
+        "--allow-all-tools --no-ask-user --no-auto-update"
+    )
+
+
+def test_copilot_cli_cli_flags_omit_explicitly_disabled_booleans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        allow_all_tools=False,
+        no_ask_user=False,
+        no_auto_update=False,
+    )
+
+    assert agent.build_cli_flags() == ""
+
+
+@pytest.mark.parametrize(
+    ("kwarg", "value"),
+    [
+        ("reasoning_effort", "ultra"),
+        ("mode", "yolo"),
+        ("context_tier", "huge"),
+    ],
+)
+def test_copilot_cli_cli_flag_invalid_enums_raise_helpful_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kwarg: str,
+    value: str,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+
+    with pytest.raises(ValueError, match=rf"Invalid value for '{kwarg}'.*{value}"):
+        CopilotCli(logs_dir=tmp_path, **{kwarg: value})
+
+
+def test_copilot_cli_cli_flags_resolve_env_fallbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COPILOT_CLI_EFFORT", "MAX")
+    monkeypatch.setenv("COPILOT_CLI_MODE", "AUTOPILOT")
+    monkeypatch.setenv("COPILOT_CLI_CONTEXT_TIER", "LONG_CONTEXT")
+    monkeypatch.setenv("COPILOT_CLI_AGENT", "env-agent")
+
+    agent = CopilotCli(logs_dir=tmp_path)
+
+    assert agent.build_cli_flags() == (
+        "--effort max --mode autopilot --context long_context --agent env-agent "
+        "--allow-all-tools --no-ask-user --no-auto-update"
+    )
+
+
+def test_copilot_cli_cli_flags_explicit_kwargs_win_over_env_fallbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COPILOT_CLI_EFFORT", "MAX")
+    monkeypatch.setenv("COPILOT_CLI_MODE", "AUTOPILOT")
+    monkeypatch.setenv("COPILOT_CLI_CONTEXT_TIER", "LONG_CONTEXT")
+    monkeypatch.setenv("COPILOT_CLI_AGENT", "env-agent")
+
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        reasoning_effort="LOW",
+        mode="PLAN",
+        context_tier="DEFAULT",
+        agent="kwarg-agent",
+    )
+
+    assert agent.build_cli_flags() == (
+        "--effort low --mode plan --context default --agent kwarg-agent "
+        "--allow-all-tools --no-ask-user --no-auto-update"
+    )
+
+
 def test_copilot_cli_install_spec_and_allowlist(tmp_path: Path):
     agent = CopilotCli(logs_dir=tmp_path, version="1.0.71-2")
 
@@ -45,10 +415,52 @@ def test_copilot_cli_install_spec_and_allowlist(tmp_path: Path):
     assert not any(f".{domain}" in domains for domain in bare)
 
 
+def test_copilot_cli_install_spec_root_step_covers_supported_platforms(
+    tmp_path: Path,
+) -> None:
+    root_step = CopilotCli(logs_dir=tmp_path).install_spec().steps[0]
+
+    assert root_step.user == "root"
+    assert root_step.env == {"DEBIAN_FRONTEND": "noninteractive"}
+    assert "ldd --version" in root_step.run
+    assert "[ -f /etc/alpine-release ]" in root_step.run
+    assert "musl-based images" in root_step.run
+    assert "apt-get update" in root_step.run
+    assert "apt-get install -y bash ca-certificates curl git" in root_step.run
+    assert "yum install -y bash ca-certificates curl git" in root_step.run
+    assert "No supported package manager found" in root_step.run
+
+
+def test_copilot_cli_install_spec_quotes_configured_version_only(
+    tmp_path: Path,
+) -> None:
+    without_version = CopilotCli(logs_dir=tmp_path).install_spec().steps[1].run
+    version = "1.0.71-2 beta's"
+    with_version = CopilotCli(logs_dir=tmp_path, version=version).install_spec()
+
+    assert with_version.steps[1].user == "agent"
+    assert " VERSION=" not in without_version
+    assert "curl -fsSL https://gh.io/copilot-install | bash" in without_version
+    assert (
+        "curl -fsSL https://gh.io/copilot-install | "
+        f"VERSION={shlex.quote(version)} bash"
+    ) in with_version.steps[1].run
+    assert with_version.verification_command == (
+        'export PATH="$HOME/.local/bin:$PATH"; copilot --version'
+    )
+
+
 def test_copilot_cli_version_parser(tmp_path: Path):
     agent = CopilotCli(logs_dir=tmp_path)
 
+    assert agent.parse_version("GitHub Copilot CLI 1.0.76.\n") == "1.0.76"
     assert agent.parse_version("GitHub Copilot CLI 1.0.71-2.\n") == "1.0.71-2"
+    assert agent.parse_version("GitHub Copilot CLI 1.2.\n") == "1.2"
+    assert agent.parse_version("") == ""
+    assert (
+        agent.parse_version("first line\nGitHub Copilot CLI 2.3.4.\nlast line")
+        == "2.3.4"
+    )
     assert agent.parse_version("dev-build") == "dev-build"
 
 
@@ -63,6 +475,169 @@ def test_copilot_cli_auth_uses_official_precedence(tmp_path: Path):
     )
 
     assert agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "copilot"}
+
+
+def test_copilot_cli_auth_uses_process_env_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "copilot")
+    monkeypatch.setenv("GH_TOKEN", "gh")
+    monkeypatch.setenv("GITHUB_TOKEN", "github")
+    agent = CopilotCli(logs_dir=tmp_path)
+
+    assert agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "copilot"}
+
+
+def test_copilot_cli_auth_falls_back_through_process_env_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    monkeypatch.setenv("GH_TOKEN", "gh")
+    monkeypatch.setenv("GITHUB_TOKEN", "github")
+    gh_agent = CopilotCli(logs_dir=tmp_path)
+    gh_auth = gh_agent._copilot_auth_env()
+    monkeypatch.delenv("GH_TOKEN")
+    github_agent = CopilotCli(logs_dir=tmp_path)
+
+    assert gh_auth == {"COPILOT_GITHUB_TOKEN": "gh"}
+    assert github_agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "github"}
+
+
+def test_copilot_cli_auth_extra_env_wins_over_process_env_for_same_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "process-copilot")
+    monkeypatch.setenv("GH_TOKEN", "process-gh")
+    copilot_agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={"COPILOT_GITHUB_TOKEN": "extra-copilot"},
+    )
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN")
+    gh_agent = CopilotCli(logs_dir=tmp_path, extra_env={"GH_TOKEN": "extra-gh"})
+
+    assert copilot_agent._copilot_auth_env() == {
+        "COPILOT_GITHUB_TOKEN": "extra-copilot"
+    }
+    assert gh_agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "extra-gh"}
+
+
+def test_copilot_cli_auth_treats_empty_strings_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "")
+    monkeypatch.setenv("GH_TOKEN", "")
+    monkeypatch.setenv("GITHUB_TOKEN", "process-github")
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "",
+            "GH_TOKEN": "",
+            "GITHUB_TOKEN": "extra-github",
+        },
+    )
+
+    assert agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "extra-github"}
+
+
+def test_copilot_cli_auth_raises_clear_error_without_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    agent = CopilotCli(logs_dir=tmp_path)
+
+    with pytest.raises(ValueError, match="COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN"):
+        agent._copilot_auth_env()
+
+
+def test_copilot_cli_mcp_config_flag_is_empty_without_servers(tmp_path: Path) -> None:
+    agent = CopilotCli(logs_dir=tmp_path)
+
+    assert agent._build_mcp_config_flag() == ""
+
+
+def test_copilot_cli_mcp_config_flag_round_trips_supported_transports(
+    tmp_path: Path,
+) -> None:
+    servers = [
+        MCPServerConfig(
+            name="stdio-server",
+            transport="stdio",
+            command="python",
+            args=["-m", "server", "--name", "quoted value"],
+        ),
+        MCPServerConfig(
+            name="http server",
+            transport="streamable-http",
+            url="https://example.test/mcp?q=a b&x=';$(bad)",
+        ),
+        MCPServerConfig(
+            name="sse-server",
+            transport="sse",
+            url="https://example.test/sse",
+        ),
+    ]
+    agent = CopilotCli(logs_dir=tmp_path, mcp_servers=servers)
+    expected = {
+        "mcpServers": {
+            "stdio-server": {
+                "type": "stdio",
+                "command": "python",
+                "args": ["-m", "server", "--name", "quoted value"],
+            },
+            "http server": {
+                "type": "http",
+                "url": "https://example.test/mcp?q=a b&x=';$(bad)",
+            },
+            "sse-server": {
+                "type": "sse",
+                "url": "https://example.test/sse",
+            },
+        }
+    }
+
+    flag = agent._build_mcp_config_flag()
+    parts = shlex.split(flag)
+
+    assert parts == [
+        "--additional-mcp-config",
+        json.dumps(expected, separators=(",", ":")),
+    ]
+    assert flag == (
+        "--additional-mcp-config "
+        f"{shlex.quote(json.dumps(expected, separators=(',', ':')))}"
+    )
+    assert json.loads(parts[1]) == expected
+
+
+def test_copilot_cli_register_skills_command_handles_absent_dir(tmp_path: Path) -> None:
+    agent = CopilotCli(logs_dir=tmp_path)
+
+    assert agent._build_register_skills_command() == ""
+
+
+def test_copilot_cli_register_skills_command_quotes_shell_sensitive_dir(
+    tmp_path: Path,
+) -> None:
+    skills_dir = "/skills dir/with;$(bad)'quote"
+    quoted = shlex.quote(skills_dir)
+    agent = CopilotCli(logs_dir=tmp_path, skills_dir=skills_dir)
+
+    command = agent._build_register_skills_command()
+
+    assert command == (
+        f"if [ -d {quoted} ]; then "
+        'mkdir -p "$COPILOT_HOME/skills" && '
+        f'cp -r {quoted}/* "$COPILOT_HOME/skills/" 2>/dev/null || true; '
+        "fi"
+    )
 
 
 def test_copilot_cli_run_command_preserves_pipeline_status(tmp_path: Path):
@@ -81,6 +656,14 @@ def test_copilot_cli_run_command_preserves_pipeline_status(tmp_path: Path):
     assert "tee /logs/agent/command-0/stdout.txt" in command
     assert "exit ${PIPESTATUS[0]}" in command
     assert "cp -a" not in command
+
+
+def test_copilot_cli_extra_args_string_handles_none_and_empty_values(
+    tmp_path: Path,
+) -> None:
+    assert CopilotCli(logs_dir=tmp_path)._extra_args_string() == ""
+    assert CopilotCli(logs_dir=tmp_path, extra_args="")._extra_args_string() == ""
+    assert CopilotCli(logs_dir=tmp_path, extra_args=[])._extra_args_string() == ""
 
 
 def test_copilot_cli_extra_args_string_round_trips_quoted_values(tmp_path: Path):
@@ -112,6 +695,37 @@ def test_copilot_cli_extra_args_string_quotes_shell_metacharacters(
     assert "';' touch pwned" in run_script
 
 
+def test_copilot_cli_extra_args_list_coerces_and_quotes_values(
+    tmp_path: Path,
+) -> None:
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_args=["--foo", "a b", "quote'value", ";", "$(bad)", 7],
+    )
+
+    extra_args = agent._extra_args_string()
+    command = agent._build_run_command(
+        setup="mkdir -p /logs/agent",
+        instruction="fix it",
+        flag_text=extra_args,
+        jsonl_path="/logs/agent/copilot-cli.jsonl",
+        output_path="/logs/agent/copilot-cli.txt",
+    )
+    run_script = shlex.split(command)[-1]
+
+    assert shlex.split(extra_args) == [
+        "--foo",
+        "a b",
+        "quote'value",
+        ";",
+        "$(bad)",
+        "7",
+    ]
+    assert " ; " not in run_script
+    assert "';'" in run_script
+    assert "'$(bad)'" in run_script
+
+
 def test_copilot_cli_extra_args_string_rejects_malformed_shell_syntax(
     tmp_path: Path,
 ):
@@ -134,494 +748,6 @@ def test_copilot_cli_registers_skills_under_copilot_home(tmp_path: Path):
     assert "~/.copilot/skills" not in command
 
 
-def test_copilot_cli_converts_native_events_to_atif(tmp_path: Path):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-
-    trajectory = agent._convert_events_to_trajectory(_session_events())
-
-    assert trajectory is not None
-    assert trajectory.schema_version == "ATIF-v1.7"
-    assert trajectory.session_id == "session-1"
-    assert trajectory.agent.name == "copilot-cli"
-    assert trajectory.steps[0].source == "user"
-    assert trajectory.steps[1].source == "agent"
-    assert sum(step.source == "agent" for step in trajectory.steps) == 1
-    assert trajectory.steps[1].tool_calls is not None
-    assert trajectory.steps[1].tool_calls[0].function_name == "view"
-    assert trajectory.steps[1].observation is not None
-    assert trajectory.steps[1].observation.results[0].content == "# Pier"
-    assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 100
-    assert trajectory.final_metrics.total_cached_tokens == 20
-    assert trajectory.final_metrics.total_completion_tokens == 5
-    assert trajectory.final_metrics.extra == {
-        "copilot_aiu": 0.25,
-        "peak_context_tokens": 2000,
-        "summarization_count": 1,
-    }
-
-
-def test_copilot_cli_shutdown_metrics_aggregate_models_without_token_details(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000001",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": None,
-            "data": {
-                "messageId": "message-1",
-                "content": "Done",
-                "outputTokens": 9,
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000002",
-            "type": "session.shutdown",
-            "timestamp": "2026-01-01T00:00:02.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000001",
-            "data": {
-                "modelMetrics": {
-                    "gpt-5.4": {
-                        "usage": {
-                            "inputTokens": 100,
-                            "outputTokens": 5,
-                            "cacheReadTokens": 20,
-                            "cacheWriteTokens": 10,
-                        }
-                    },
-                    "gpt-5-mini": {
-                        "usage": {
-                            "inputTokens": 7,
-                            "outputTokens": 4,
-                            "cacheReadTokens": 3,
-                            "cacheWriteTokens": 2,
-                        }
-                    },
-                },
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert len(trajectory.steps) == 1
-    assert trajectory.final_metrics is not None
-    # inputTokens per model is cache-inclusive: gpt-5.4 100 + gpt-5-mini 7 = 107.
-    assert trajectory.final_metrics.total_prompt_tokens == 107
-    assert trajectory.final_metrics.total_cached_tokens == 23
-    assert trajectory.final_metrics.total_completion_tokens == 9
-
-
-def test_copilot_cli_shutdown_metrics_keep_token_details_fallback(tmp_path: Path):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "type": "assistant.message",
-            "data": {"messageId": "message-1", "content": "Done"},
-        },
-        {
-            "type": "session.shutdown",
-            "data": {
-                "tokenDetails": {
-                    "input": {"tokenCount": 100},
-                    "cache_read": {"tokenCount": 20},
-                    "cache_write": {"tokenCount": 10},
-                    "output": {"tokenCount": 5},
-                }
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_prompt_tokens == 130
-    assert trajectory.final_metrics.total_cached_tokens == 20
-    assert trajectory.final_metrics.total_completion_tokens == 5
-
-
-def test_copilot_cli_shutdown_metrics_do_not_double_count_compatibility_data(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "type": "assistant.message",
-            "data": {"messageId": "message-1", "content": "Done"},
-        },
-        {
-            "type": "session.shutdown",
-            "data": {
-                "modelMetrics": {
-                    "gpt-5.4": {
-                        "usage": {
-                            "inputTokens": 100,
-                            "cacheReadTokens": 20,
-                            "cacheWriteTokens": 10,
-                            "outputTokens": 5,
-                        }
-                    }
-                },
-                "tokenDetails": {
-                    "input": {"tokenCount": 1000},
-                    "cache_read": {"tokenCount": 200},
-                    "cache_write": {"tokenCount": 100},
-                    "output": {"tokenCount": 50},
-                },
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert trajectory.final_metrics is not None
-    # modelMetrics usage wins over the legacy tokenDetails compatibility shape,
-    # and its cache-inclusive inputTokens (100) is not double-counted.
-    assert trajectory.final_metrics.total_prompt_tokens == 100
-    assert trajectory.final_metrics.total_cached_tokens == 20
-    assert trajectory.final_metrics.total_completion_tokens == 5
-
-
-def test_copilot_cli_timeout_metrics_combine_and_deduplicate_usage(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    persisted_events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000011",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": None,
-            "data": {
-                "messageId": "message-1",
-                "apiCallId": "api-1",
-                "content": "Working",
-                "outputTokens": 5,
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000012",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:02.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000011",
-            "data": {
-                "messageId": "message-2",
-                "apiCallId": "api-2",
-                "content": "Still working",
-                "outputTokens": 7,
-            },
-        },
-    ]
-    captured_events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000010",
-            "type": "assistant.usage",
-            "timestamp": "2026-01-01T00:00:00.900Z",
-            "parentId": None,
-            "ephemeral": True,
-            "data": {
-                "model": "gpt-5.4",
-                "inputTokens": 100,
-                "outputTokens": 5,
-                "cacheReadTokens": 20,
-                "cacheWriteTokens": 10,
-                "apiCallId": "api-1",
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000013",
-            "type": "assistant.usage",
-            "timestamp": "2026-01-01T00:00:01.900Z",
-            "parentId": "00000000-0000-4000-8000-000000000011",
-            "ephemeral": True,
-            "data": {
-                "model": "gpt-5.4",
-                "inputTokens": 50,
-                "cacheReadTokens": 5,
-                "cacheWriteTokens": 2,
-                "apiCallId": "api-2",
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000014",
-            "type": "assistant.usage",
-            "timestamp": "2026-01-01T00:00:02.900Z",
-            "parentId": "00000000-0000-4000-8000-000000000012",
-            "ephemeral": True,
-            "data": {
-                "model": "gpt-5.4",
-                "inputTokens": 25,
-                "outputTokens": 11,
-                "cacheReadTokens": 0,
-                "cacheWriteTokens": 0,
-                "apiCallId": "api-3",
-            },
-        },
-    ]
-    events_path = (
-        tmp_path / "copilot-home" / "session-state" / "session-timeout" / "events.jsonl"
-    )
-    events_path.parent.mkdir(parents=True)
-    events_path.write_text(
-        "\n".join(json.dumps(event) for event in persisted_events) + "\n",
-        encoding="utf-8",
-    )
-    (tmp_path / CopilotCli._JSONL_FILENAME).write_text(
-        "\n".join(
-            json.dumps(event)
-            for event in [captured_events[0], *captured_events, persisted_events[0]]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    context = AgentContext()
-
-    agent.populate_context_post_run(context)
-
-    assert context.n_input_tokens == 175
-    assert context.n_cache_tokens == 25
-    assert context.n_output_tokens == 23
-    assert context.n_agent_steps == 2
-
-
-def test_copilot_cli_excludes_tagged_subagent_events_from_root_trajectory(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000020",
-            "type": "user.message",
-            "timestamp": "2026-01-01T00:00:00.000Z",
-            "parentId": None,
-            "data": {"content": "Fix the bug"},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000021",
-            "type": "user.message",
-            "timestamp": "2026-01-01T00:00:00.500Z",
-            "parentId": "00000000-0000-4000-8000-000000000020",
-            "agentId": "subagent-1",
-            "data": {"content": "Inspect the parser"},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000022",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000021",
-            "agentId": "subagent-1",
-            "data": {
-                "messageId": "subagent-message-1",
-                "content": "I found the issue",
-                "toolRequests": [
-                    {
-                        "toolCallId": "subagent-tool-1",
-                        "name": "view",
-                        "arguments": {"path": "parser.py"},
-                    }
-                ],
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000023",
-            "type": "tool.execution_complete",
-            "timestamp": "2026-01-01T00:00:01.500Z",
-            "parentId": "00000000-0000-4000-8000-000000000022",
-            "agentId": "subagent-1",
-            "data": {
-                "toolCallId": "subagent-tool-1",
-                "success": True,
-                "result": {"content": "subagent output"},
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000024",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:02.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000023",
-            "data": {
-                "messageId": "root-message-1",
-                "content": "Fixed the bug",
-                "outputTokens": 3,
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert [step.message for step in trajectory.steps] == [
-        "Fix the bug",
-        "Fixed the bug",
-    ]
-    assert sum(step.source == "agent" for step in trajectory.steps) == 1
-    assert trajectory.final_metrics is not None
-    assert trajectory.final_metrics.total_steps == 2
-
-    events_path = (
-        tmp_path
-        / "copilot-home"
-        / "session-state"
-        / "session-subagents"
-        / "events.jsonl"
-    )
-    events_path.parent.mkdir(parents=True)
-    events_path.write_text(
-        "\n".join(json.dumps(event) for event in events) + "\n",
-        encoding="utf-8",
-    )
-    context = AgentContext()
-
-    agent.populate_context_post_run(context)
-
-    assert context.n_agent_steps == 1
-
-
-def test_copilot_cli_preserves_ordered_native_reasoning_without_duplicates(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000030",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:00.500Z",
-            "parentId": None,
-            "ephemeral": True,
-            "data": {"reasoningId": "reasoning-1", "content": "Inspect first."},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000031",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:00.600Z",
-            "parentId": "00000000-0000-4000-8000-000000000030",
-            "ephemeral": True,
-            "data": {"reasoningId": "reasoning-1", "content": "Inspect first."},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000032",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:00.700Z",
-            "parentId": "00000000-0000-4000-8000-000000000031",
-            "ephemeral": True,
-            "data": {
-                "reasoningId": "reasoning-2",
-                "content": "Then patch.",
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000033",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000032",
-            "data": {
-                "messageId": "message-1",
-                "content": "Done",
-                "reasoningText": "Inspect first.\n\nThen patch.",
-                "outputTokens": 3,
-            },
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000034",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:01.100Z",
-            "parentId": "00000000-0000-4000-8000-000000000033",
-            "ephemeral": True,
-            "data": {
-                "reasoningId": "reasoning-3",
-                "content": "Then patch.\n\nFinally verify.",
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert len(trajectory.steps) == 1
-    assert (
-        trajectory.steps[0].reasoning_content
-        == "Inspect first.\n\nThen patch.\n\nFinally verify."
-    )
-
-
-def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events_path = (
-        tmp_path
-        / "copilot-home"
-        / "session-state"
-        / "session-1"
-        / "events.jsonl"
-    )
-    events_path.parent.mkdir(parents=True)
-    events_path.write_text(
-        "\n".join(json.dumps(event) for event in _session_events()) + "\n",
-        encoding="utf-8",
-    )
-    context = AgentContext()
-
-    agent.populate_context_post_run(context)
-
-    assert (tmp_path / "trajectory.json").exists()
-    assert context.n_input_tokens == 100
-    assert context.n_cache_tokens == 20
-    assert context.n_output_tokens == 5
-    assert context.peak_context_tokens == 2000
-    assert context.summarization_count == 1
-    assert context.n_agent_steps == 1
-    assert context.metadata == {
-        "copilot_session_events": str(
-            Path("copilot-home")
-            / "session-state"
-            / "session-1"
-            / "events.jsonl"
-        ),
-        "copilot_aiu": 0.25,
-    }
-
-
-def test_copilot_cli_timeout_after_compaction_start_reports_peak_context_tokens(
-    tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "type": "user.message",
-            "data": {"content": "Fix the bug"},
-        },
-        {
-            "type": "assistant.message",
-            "data": {"messageId": "message-1", "content": "Working on it", "outputTokens": 5},
-        },
-        {
-            "type": "session.compaction_start",
-            "data": {
-                "systemTokens": 500,
-                "conversationTokens": 1200,
-                "toolDefinitionsTokens": 300,
-            },
-        },
-        # No session.compaction_complete — timed out before compaction finished
-        {
-            "type": "assistant.usage",
-            "data": {"inputTokens": 100, "outputTokens": 5, "apiCallId": "api-1"},
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert trajectory.final_metrics is not None
-    # peak_context_tokens = systemTokens(500) + conversationTokens(1200) + toolDefinitionsTokens(300)
-    assert trajectory.final_metrics.extra["peak_context_tokens"] == 2000
-
-
 def test_copilot_cli_extra_env_reserved_keys_are_normalized(tmp_path: Path):
     agent = CopilotCli(
         logs_dir=tmp_path,
@@ -637,254 +763,101 @@ def test_copilot_cli_extra_env_reserved_keys_are_normalized(tmp_path: Path):
     assert agent._extra_env.get("SOME_OTHER_VAR") == "value"
 
 
-def test_copilot_cli_timeout_uses_message_input_for_calls_missing_from_usage_stream(
+@run_async
+async def test_copilot_cli_run_resolves_bare_model_id_from_nested_prefixes(
     tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "type": "user.message",
-            "data": {"content": "Fix the bug"},
-        },
-        # Call api-1: usage event has input tokens
-        {
-            "type": "assistant.usage",
-            "data": {
-                "inputTokens": 100,
-                "cacheReadTokens": 10,
-                "outputTokens": 5,
-                "apiCallId": "api-1",
-            },
-        },
-        {
-            "type": "assistant.message",
-            "data": {
-                "apiCallId": "api-1",
-                "content": "Working",
-                "inputTokens": 95,
-                "outputTokens": 5,
-            },
-        },
-        # Call api-2: usage event has no inputTokens (timeout cut it short),
-        # but assistant.message carries inputTokens
-        {
-            "type": "assistant.usage",
-            "data": {
-                "cacheReadTokens": 5,
-                "outputTokens": 3,
-                "apiCallId": "api-2",
-            },
-        },
-        {
-            "type": "assistant.message",
-            "data": {
-                "apiCallId": "api-2",
-                "content": "Still working",
-                "inputTokens": 80,
-                "outputTokens": 3,
-            },
-        },
-    ]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        model_name="litellm/github_copilot/gpt-5.4",
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
 
-    trajectory = agent._convert_events_to_trajectory(events)
+    _, _, run_script = await _run_agent(agent, tmp_path)
 
-    assert trajectory is not None
-    assert trajectory.final_metrics is not None
-    # inputTokens is the cache-inclusive prompt total, so cached reads are not
-    # added again. Missing api-2 usage input falls back to the message input.
-    # input: 100 (api-1 usage) + 80 (api-2 message fallback) = 180
-    # cache: 10 (api-1 cache_read) + 5 (api-2 cache_read) = 15 (subset of input)
-    assert trajectory.final_metrics.total_prompt_tokens == 180
-    assert trajectory.final_metrics.total_cached_tokens == 15
+    # Copilot CLI only accepts bare model ids, so every routing prefix goes.
+    assert "--model gpt-5.4" in run_script
+    assert "github_copilot" not in run_script
 
 
-def test_copilot_cli_shutdown_input_tokens_are_cache_inclusive(tmp_path: Path):
-    # In Copilot CLI 1.0.71, modelMetrics[*].usage.inputTokens is the
-    # OpenAI-style prompt_tokens value, which already includes cacheReadTokens
-    # and cacheWriteTokens. Adding the cache breakdowns on top double-counts.
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000041",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": None,
-            "data": {"messageId": "message-1", "content": "Done", "outputTokens": 5},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000042",
-            "type": "session.shutdown",
-            "timestamp": "2026-01-01T00:00:02.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000041",
-            "data": {
-                "modelMetrics": {
-                    "gpt-5.4": {
-                        "usage": {
-                            "inputTokens": 100,
-                            "outputTokens": 5,
-                            "cacheReadTokens": 20,
-                            "cacheWriteTokens": 10,
-                        }
-                    }
-                },
-            },
-        },
-    ]
-
-    trajectory = agent._convert_events_to_trajectory(events)
-
-    assert trajectory is not None
-    assert trajectory.final_metrics is not None
-    # inputTokens (100) already accounts for the 20 cached + 10 cache-write
-    # tokens, so the prompt total is 100 and the cached subset is 20.
-    assert trajectory.final_metrics.total_prompt_tokens == 100
-    assert trajectory.final_metrics.total_cached_tokens == 20
-    assert trajectory.final_metrics.total_completion_tokens == 5
-
-
-def test_copilot_cli_failed_compaction_is_not_counted_as_summarization(
+@run_async
+async def test_copilot_cli_run_records_the_generated_session_id(
     tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
 
-    def _events(success: bool) -> list[dict]:
-        return [
-            {
-                "type": "assistant.message",
-                "data": {"messageId": "m", "content": "Working", "outputTokens": 1},
-            },
-            {
-                "type": "session.compaction_complete",
-                "data": {"success": success, "preCompactionTokens": 2000},
-            },
-        ]
+    _, _, run_script = await _run_agent(agent, tmp_path)
 
-    failed = agent._convert_events_to_trajectory(_events(success=False))
-    assert failed is not None
-    assert failed.final_metrics is not None
-    assert failed.final_metrics.extra["summarization_count"] == 0
-
-    succeeded = agent._convert_events_to_trajectory(_events(success=True))
-    assert succeeded is not None
-    assert succeeded.final_metrics is not None
-    assert succeeded.final_metrics.extra["summarization_count"] == 1
+    assert agent._session_id is not None
+    UUID(agent._session_id)
+    assert f"--session-id {agent._session_id}" in run_script
 
 
-def test_copilot_cli_distinct_reasoning_blocks_are_not_merged_on_partial_overlap(
+def test_copilot_cli_auth_ignores_empty_agent_env_overrides(
     tmp_path: Path,
-):
-    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
-    events = [
-        {
-            "id": "00000000-0000-4000-8000-000000000051",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:00.500Z",
-            "parentId": None,
-            "ephemeral": True,
-            "data": {"reasoningId": "reasoning-1", "content": "Use cat"},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000052",
-            "type": "assistant.reasoning",
-            "timestamp": "2026-01-01T00:00:00.600Z",
-            "parentId": "00000000-0000-4000-8000-000000000051",
-            "ephemeral": True,
-            "data": {"reasoningId": "reasoning-2", "content": "category names matter"},
-        },
-        {
-            "id": "00000000-0000-4000-8000-000000000053",
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "parentId": "00000000-0000-4000-8000-000000000052",
-            "data": {"messageId": "message-1", "content": "Done", "outputTokens": 1},
-        },
-    ]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _TOKEN_ENV_VARS)
+    monkeypatch.setenv("GH_TOKEN", "process-token")
+    agent = CopilotCli(logs_dir=tmp_path, extra_env={"GH_TOKEN": ""})
 
-    trajectory = agent._convert_events_to_trajectory(events)
+    # An empty agent.env override must not mask a usable process token, since
+    # _exec() re-applies extra_env on top of the environment it builds.
+    assert agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "process-token"}
 
-    assert trajectory is not None
-    assert len(trajectory.steps) == 1
-    # "Use cat" ends with "cat", which is a prefix of "category"; these are two
-    # distinct reasoning blocks and must not be stitched into "Use category".
-    assert (
-        trajectory.steps[0].reasoning_content == "Use cat\n\ncategory names matter"
+
+def test_copilot_cli_empty_copilot_token_override_is_dropped(tmp_path: Path) -> None:
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={"COPILOT_GITHUB_TOKEN": "", "GITHUB_TOKEN": "github"},
+    )
+
+    assert "COPILOT_GITHUB_TOKEN" not in agent._extra_env
+    assert agent._copilot_auth_env() == {"COPILOT_GITHUB_TOKEN": "github"}
+
+
+@run_async
+async def test_copilot_cli_run_quotes_the_agent_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_env(monkeypatch, _CLI_ENV_VARS)
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        agent="my agent; touch /tmp/pwned",
+        extra_env={"COPILOT_GITHUB_TOKEN": "token"},
+    )
+
+    _, _, run_script = await _run_agent(agent, tmp_path)
+
+    assert "--agent 'my agent; touch /tmp/pwned'" in run_script
+    assert "; touch /tmp/pwned" not in run_script.replace(
+        "'my agent; touch /tmp/pwned'", ""
     )
 
 
-def _session_events() -> list[dict]:
-    return [
-        {
-            "type": "session.start",
-            "timestamp": "2026-01-01T00:00:00.000Z",
-            "data": {"sessionId": "session-1", "selectedModel": "gpt-5.4"},
-        },
-        {
-            "type": "user.message",
-            "timestamp": "2026-01-01T00:00:01.000Z",
-            "data": {"content": "Fix the bug"},
-        },
-        {
-            "type": "assistant.turn_start",
-            "timestamp": "2026-01-01T00:00:01.100Z",
-            "data": {"turnId": "0"},
-        },
-        {
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.500Z",
-            "data": {
-                "apiCallId": "api-1",
-                "model": "gpt-5.4",
-                "content": "I'll inspect the repository.",
-                "outputTokens": 5,
-                "toolRequests": [
-                    {
-                        "toolCallId": "tool-1",
-                        "name": "view",
-                        "arguments": {"path": "README.md"},
-                    }
-                ],
-            },
-        },
-        {
-            "type": "assistant.message",
-            "timestamp": "2026-01-01T00:00:01.600Z",
-            "data": {
-                "apiCallId": "api-1",
-                "model": "gpt-5.4",
-                "content": "",
-                "outputTokens": 5,
-            },
-        },
-        {
-            "type": "tool.execution_complete",
-            "timestamp": "2026-01-01T00:00:01.700Z",
-            "data": {
-                "toolCallId": "tool-1",
-                "success": True,
-                "result": {"content": "# Pier"},
-            },
-        },
-        {
-            "type": "session.compaction_complete",
-            "timestamp": "2026-01-01T00:00:02.000Z",
-            "data": {"success": True, "preCompactionTokens": 2000},
-        },
-        {
-            "type": "session.shutdown",
-            "timestamp": "2026-01-01T00:00:03.000Z",
-            "data": {
-                "totalNanoAiu": 250_000_000,
-                "currentTokens": 1500,
-                "modelMetrics": {
-                    "gpt-5.4": {
-                        "usage": {
-                            "inputTokens": 100,
-                            "cacheReadTokens": 20,
-                            "cacheWriteTokens": 10,
-                            "outputTokens": 5,
-                        }
-                    }
-                },
-            },
-        },
+def test_cli_flag_quoting_applies_inside_a_format_template(tmp_path: Path) -> None:
+    """`quote` must survive `format`, or a templated flag loses its escaping."""
+    agent = CopilotCli(logs_dir=tmp_path)
+    agent.CLI_FLAGS = [
+        CliFlag(
+            kwarg="templated",
+            cli="--templated",
+            format="--templated={value}",
+            quote=True,
+        ),
+        CliFlag(kwarg="plain", cli="--plain", format="--plain={value}"),
     ]
+    agent._resolved_flags = {"templated": "a b; rm -rf /", "plain": "safe"}
+
+    flags = agent.build_cli_flags()
+
+    assert "--templated='a b; rm -rf /'" in flags
+    assert "--plain=safe" in flags

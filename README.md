@@ -134,9 +134,15 @@ through your env file.
 
 **GitHub Copilot CLI** uses the official `copilot` binary in non-interactive
 mode and preserves its native session events alongside the ATIF trajectory.
-Provide a fine-grained personal access token with the **Copilot Requests**
-permission through `COPILOT_GITHUB_TOKEN` (preferred), `GH_TOKEN`, or
-`GITHUB_TOKEN`.
+Delegated `task` runs become embedded `subagent_trajectories` linked from the
+tool call that spawned them (nested delegations nest in turn), Copilot's own
+`system.message` events and context-compaction summaries become `system` steps,
+tools the user dispatched become `llm_call_count: 0` steps, and a failed tool
+result records `extra.is_error` (Copilot's own `success` flag reports the
+harness rather than the command, so it is kept verbatim as `copilot_success`
+instead). Provide a fine-grained personal access token with the **Copilot
+Requests** permission through `COPILOT_GITHUB_TOKEN` (preferred), `GH_TOKEN`,
+or `GITHUB_TOKEN`.
 
 ```yaml
 - name: copilot-cli
