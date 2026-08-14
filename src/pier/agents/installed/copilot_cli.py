@@ -279,11 +279,16 @@ class CopilotCli(BaseInstalledAgent):
         )
 
     def _copilot_auth_env(self) -> dict[str, str]:
-        token = (
-            self._resolve_token("COPILOT_GITHUB_TOKEN")
-            or self._resolve_token("GH_TOKEN")
-            or self._resolve_token("GITHUB_TOKEN")
+        token_keys = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+        token = next(
+            (self._extra_env[key] for key in token_keys if self._extra_env.get(key)),
+            None,
         )
+        if token is None:
+            token = next(
+                (os.environ.get(key) for key in token_keys if os.environ.get(key)),
+                None,
+            )
         if not token:
             raise ValueError(
                 "GitHub Copilot CLI authentication is required. Set "
@@ -291,15 +296,6 @@ class CopilotCli(BaseInstalledAgent):
                 "environment or pass --env-file."
             )
         return {"COPILOT_GITHUB_TOKEN": token}
-
-    def _resolve_token(self, key: str) -> str | None:
-        """Read a token, treating an empty ``agent.env`` value as unset.
-
-        ``_get_env()`` lets ``extra_env`` shadow the process environment, so an
-        empty override would otherwise hide a usable token instead of falling
-        back to it.
-        """
-        return self._extra_env.get(key) or os.environ.get(key)
 
     @with_prompt_template
     async def run(
@@ -407,9 +403,9 @@ class CopilotCli(BaseInstalledAgent):
         session_metrics = _parse_session_metrics(metrics_events)
         metadata = dict(context.metadata or {})
         if events_path is not None:
-            metadata["copilot_session_events"] = str(
-                events_path.relative_to(self.logs_dir)
-            )
+            metadata["copilot_session_events"] = events_path.relative_to(
+                self.logs_dir
+            ).as_posix()
         if session_metrics.aiu is not None:
             metadata["copilot_aiu"] = session_metrics.aiu
         if session_metrics.premium_requests is not None:

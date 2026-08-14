@@ -481,12 +481,9 @@ def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
     assert context.summarization_count == 1
     assert context.n_agent_steps == 1
     assert context.metadata == {
-        "copilot_session_events": str(
-            Path("copilot-home")
-            / "session-state"
-            / "session-1"
-            / "events.jsonl"
-        ),
+        "copilot_session_events": (
+            Path("copilot-home") / "session-state" / "session-1" / "events.jsonl"
+        ).as_posix(),
         "copilot_aiu": 0.25,
     }
 
