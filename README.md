@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `claude-code`, `codex`, `copilot-cli`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `copilot-cli`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -102,6 +102,22 @@ A few things we've learned plumbing this through Respan and OpenRouter:
     GOOGLE_GENERATIVE_AI_API_KEY: ${RESPAN_API_KEY}
     GEMINI_API_BASE: https://endpoint.respan.ai/api/google/vertexai/v1beta
     GOOGLE_GEMINI_BASE_URL: https://endpoint.respan.ai/api/google/vertexai/
+```
+
+**Antigravity SDK** runs Google's Python SDK with its platform-specific local
+harness in an isolated Python 3.12 environment with hash-verified, fully locked
+dependencies. It supports Pier skills, stdio and streamable-HTTP MCP servers,
+and live ATIF checkpoints. `reasoning_effort` accepts `minimal`, `low`, `medium`,
+or `high`; `None` uses `medium`. SSE MCP servers are not supported by
+google-antigravity 0.1.9.
+
+```yaml
+- name: antigravity-sdk
+  model_name: google/gemini-3.6-flash
+  env:
+    GEMINI_API_KEY: ${GEMINI_API_KEY}
+  kwargs:
+    reasoning_effort: high
 ```
 
 **Cursor CLI** uses the installed `cursor-agent` binary, so it fits the same

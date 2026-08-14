@@ -5,6 +5,7 @@ class AgentName(str, Enum):
     ORACLE = "oracle"
     NOP = "nop"
     CLAUDE_CODE = "claude-code"
+    ANTIGRAVITY_SDK = "antigravity-sdk"
     CODEX = "codex"
     COPILOT_CLI = "copilot-cli"
     CURSOR_CLI = "cursor-cli"

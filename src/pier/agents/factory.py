@@ -2,6 +2,7 @@ import importlib
 from pathlib import Path
 
 from pier.agents.base import BaseAgent
+from pier.agents.installed.antigravity_sdk import AntigravitySDK
 from pier.agents.installed.claude_code import ClaudeCode
 from pier.agents.installed.codex import Codex
 from pier.agents.installed.copilot_cli import CopilotCli
@@ -20,6 +21,7 @@ class AgentFactory:
     _AGENTS: list[type[BaseAgent]] = [
         NopAgent,
         OracleAgent,
+        AntigravitySDK,
         ClaudeCode,
         Codex,
         CopilotCli,

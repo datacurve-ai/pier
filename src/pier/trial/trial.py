@@ -25,6 +25,7 @@ from pier.models.task.config import (
     EnvironmentConfig as TaskEnvironmentConfig,
 )
 from pier.models.task.config import (
+    MAIN_SERVICE_NAME,
     MultiStepRewardStrategy,
     StepConfig,
     VerifierEnvironmentMode,
@@ -742,6 +743,7 @@ class Trial:
                 )
                 self._maybe_populate_agent_context(step_result.agent_result)
                 await self._run_pre_artifacts_script()
+                await self._run_collect_hooks(step_cfg)
                 await self._maybe_upload_agent_logs()
 
                 # Collect artifacts from the agent environment before
@@ -842,6 +844,52 @@ class Trial:
                 "pre_artifacts.sh failed to run; continuing without it",
                 exc_info=True,
             )
+
+    async def _run_collect_hooks(self, step_cfg: StepConfig | None = None) -> None:
+        """Run the task's ``[[verifier.collect]]`` hooks in the agent environment.
+
+        Hooks run after the agent finishes and immediately before artifact
+        collection so the task can materialize artifacts from the agent's work
+        (e.g. capture the change set as ``/logs/artifacts/model.patch`` for a
+        separate verifier). Failures are logged, not fatal: a missing or failed
+        capture simply yields no artifact, which downstream grading treats as
+        an empty submission. Hooks targeting a compose service other than main
+        are skipped: Pier does not run commands in sidecar services.
+        """
+        hooks = list(self._task.config.verifier.collect)
+        if step_cfg is not None:
+            hooks.extend(step_cfg.verifier.collect)
+        for hook in hooks:
+            if hook.service != MAIN_SERVICE_NAME:
+                self._logger.warning(
+                    f"Skipping collect hook targeting unsupported service "
+                    f"'{hook.service}': {hook.command!r}"
+                )
+                continue
+            self._logger.debug(
+                f"Running collect hook in service '{hook.service}': {hook.command!r}"
+            )
+            try:
+                result = await self._environment.exec(
+                    command=hook.command,
+                    timeout_sec=int(hook.timeout_sec),
+                    user=hook.user,
+                )
+                if result.return_code != 0:
+                    self._logger.warning(
+                        f"Collect hook in service '{hook.service}' exited with "
+                        f"code {result.return_code}: {hook.command!r}. "
+                        f"stdout: {result.stdout} stderr: {result.stderr}"
+                    )
+                else:
+                    self._logger.debug(
+                        f"Collect hook in service '{hook.service}' completed"
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    f"Collect hook in service '{hook.service}' failed "
+                    f"({hook.command!r}): {exc}"
+                )
 
     async def _maybe_upload_agent_logs(self) -> None:
         """Upload locally-generated agent logs back to the environment.
@@ -948,6 +996,7 @@ class Trial:
             # trials collect artifacts per-step inside _run_steps.
             if not self._task.has_steps:
                 await self._run_pre_artifacts_script()
+                await self._run_collect_hooks()
                 await self._maybe_upload_agent_logs()
                 await self._collect_artifacts()
 
