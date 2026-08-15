@@ -53,6 +53,9 @@ except ImportError:
 
 _MODAL_DEFAULT_CPU_REQUEST_CORES = 0.125
 _MODAL_DEFAULT_MEMORY_REQUEST_MB = 128
+_MODAL_SANDBOX_NAME_MAX_LENGTH = 64
+_MODAL_SANDBOX_NAME_SUFFIX_LENGTH = 8
+_MODAL_EGRESS_PROXY_NAME_SUFFIX = "-egress-proxy"
 
 
 class _ModalStrategy:
@@ -872,6 +875,7 @@ class ModalEnvironment(BaseEnvironment):
         self._image: Image | None = None
         self._app: App | None = None
         self._sandbox: Sandbox | None = None
+        self._sandbox_name_suffix = self._generate_sandbox_name_suffix()
         self._egress_proxy_sandbox: Sandbox | None = None
         self._egress_proxy_env: dict[str, str] = {}
         self._egress_cidr_allowlist: list[str] | None = None
@@ -895,6 +899,24 @@ class ModalEnvironment(BaseEnvironment):
         Alpine-based DinD images only have ``sh``; standard images have ``bash``.
         """
         return "sh" if self._compose_mode else "bash"
+
+    @staticmethod
+    def _generate_sandbox_name_suffix() -> str:
+        return uuid4().hex[:_MODAL_SANDBOX_NAME_SUFFIX_LENGTH]
+
+    @property
+    def _sandbox_name(self) -> str:
+        suffix = f"-{self._sandbox_name_suffix}"
+        max_session_length = (
+            _MODAL_SANDBOX_NAME_MAX_LENGTH
+            - len(suffix)
+            - len(_MODAL_EGRESS_PROXY_NAME_SUFFIX)
+        )
+        return f"{self.session_id[:max_session_length]}{suffix}"
+
+    @property
+    def _egress_proxy_sandbox_name(self) -> str:
+        return f"{self._sandbox_name}{_MODAL_EGRESS_PROXY_NAME_SUFFIX}"
 
     def _cpu_config(self) -> int | float | tuple[int | float, int] | None:
         """Resolve CPU configuration for sandbox creation.
@@ -1013,7 +1035,7 @@ class ModalEnvironment(BaseEnvironment):
             readiness_probe=modal.sandbox.Probe.with_tcp(EGRESS_PROXY_PORT),
             timeout=self._sandbox_timeout,
             idle_timeout=self._sandbox_idle_timeout,
-            name=f"{self.session_id}-egress-proxy",
+            name=self._egress_proxy_sandbox_name,
         )
         tunnel = (await self._egress_proxy_sandbox.tunnels.aio(timeout=60))[
             EGRESS_PROXY_PORT
@@ -1088,7 +1110,7 @@ class ModalEnvironment(BaseEnvironment):
             image=self._image,
             timeout=self._sandbox_timeout,
             idle_timeout=self._sandbox_idle_timeout,
-            name=self.session_id,
+            name=self._sandbox_name,
             block_network=block_network,
             cidr_allowlist=cidr_allowlist or self._egress_cidr_allowlist,
             secrets=self._secrets_config(),
