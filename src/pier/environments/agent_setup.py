@@ -154,6 +154,7 @@ def write_docker_proxy_compose(
     allowlist: NetworkAllowlist,
     token: str,
     compose_proxy_dir: str | None = None,
+    main_networks: Iterable[str] = (),
 ) -> Path:
     proxy_dir.mkdir(parents=True, exist_ok=True)
     (proxy_dir / "Dockerfile").write_text(
@@ -175,7 +176,9 @@ def write_docker_proxy_compose(
     compose = {
         "services": {
             "main": {
-                "networks": ["pier-egress-internal"],
+                "networks": list(
+                    dict.fromkeys([*main_networks, "pier-egress-internal"])
+                ),
                 "depends_on": {
                     EGRESS_PROXY_SERVICE: {
                         "condition": "service_healthy",

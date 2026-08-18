@@ -474,6 +474,7 @@ class _ModalDinD(_ModalStrategy):
         *,
         include_base_image: bool = False,
         include_agent_image: bool = True,
+        include_vm_networking: bool = True,
     ) -> list[str]:
         """Return -f flag pairs for all compose files as a flat list."""
         build_or_prebuilt = (
@@ -488,9 +489,10 @@ class _ModalDinD(_ModalStrategy):
         ]
         if self._use_vm_runtime:
             files.append(f"{self._COMPOSE_DIR}/{self._MOUNTS_COMPOSE}")
-            files.append(f"{self._COMPOSE_DIR}/{self._VM_NETWORK_COMPOSE}")
-            if self._egress_proxy_overlay_ready:
-                files.append(f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}")
+            if include_vm_networking:
+                files.append(f"{self._COMPOSE_DIR}/{self._VM_NETWORK_COMPOSE}")
+                if self._egress_proxy_overlay_ready:
+                    files.append(f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}")
             if include_base_image and self._base_image_overlay_ready:
                 files.append(f"{self._COMPOSE_DIR}/{self._BASE_IMAGE_COMPOSE}")
             if include_agent_image and self._agent_image_overlay_ready:
@@ -517,14 +519,21 @@ class _ModalDinD(_ModalStrategy):
             f"      - {self._LOGS_DIR}/artifacts:/logs/artifacts\n"
         )
 
-    def _build_vm_network_overlay(self, environment_dir: Path) -> str:
+    @staticmethod
+    def _service_network_names(service: dict[str, Any]) -> list[str]:
+        networks = service.get("networks") or {}
+        if isinstance(networks, dict):
+            return list(networks)
+        if isinstance(networks, list):
+            return [name for name in networks if isinstance(name, str)]
+        return []
+
+    def _build_vm_network_overlay(self, config: dict[str, Any]) -> str:
         """Apply task-level internet policy without opening sidecar networks."""
         import yaml
 
-        compose_path = environment_dir / "docker-compose.yaml"
-        doc = yaml.safe_load(compose_path.read_text()) or {}
-        services = doc.get("services") or {}
-        networks = doc.get("networks") or {}
+        services = config.get("services") or {}
+        networks = config.get("networks") or {}
         main = services.get("main") or {}
 
         if EGRESS_PROXY_SERVICE in services:
@@ -546,8 +555,15 @@ class _ModalDinD(_ModalStrategy):
         if self._env.task_env_config.allow_internet:
             if isinstance(main, dict) and main.get("network_mode"):
                 return "networks: {}\n"
+            main_networks = self._service_network_names(main)
             overlay = {
-                "services": {"main": {"networks": ["pier-main-internet"]}},
+                "services": {
+                    "main": {
+                        "networks": list(
+                            dict.fromkeys([*main_networks, "pier-main-internet"])
+                        )
+                    }
+                },
                 "networks": {"pier-main-internet": {}},
             }
             return yaml.safe_dump(overlay, sort_keys=False)
@@ -595,6 +611,38 @@ class _ModalDinD(_ModalStrategy):
         overlay = {"networks": isolated_networks}
         return yaml.safe_dump(overlay, sort_keys=False)
 
+    def _validate_vm_network_isolation(self, config: dict[str, Any]) -> None:
+        """Fail before startup if any task service retains unrestricted egress."""
+        if self._env.task_env_config.allow_internet:
+            return
+
+        services = config.get("services") or {}
+        networks = config.get("networks") or {}
+        violations: list[str] = []
+
+        for service_name, service in services.items():
+            if service_name == EGRESS_PROXY_SERVICE or not isinstance(service, dict):
+                continue
+            network_mode = service.get("network_mode")
+            if network_mode == "none":
+                continue
+            if network_mode:
+                violations.append(f"{service_name} uses network_mode={network_mode}")
+                continue
+            for network_name in self._service_network_names(service):
+                network = networks.get(network_name)
+                if not isinstance(network, dict) or not network.get("internal"):
+                    violations.append(
+                        f"{service_name} is attached to non-internal network "
+                        f"{network_name}"
+                    )
+
+        if violations:
+            raise RuntimeError(
+                "allow_internet=False network isolation failed: "
+                + "; ".join(sorted(violations))
+            )
+
     def _main_image_name(self, suffix: str) -> str:
         install = self._env.agent_install_spec
         fingerprint = install.fingerprint() if install else "none"
@@ -609,45 +657,45 @@ class _ModalDinD(_ModalStrategy):
         await self._env._sdk_upload_file(path, f"{self._COMPOSE_DIR}/{filename}")
 
     async def _prepare_vm_networking(self) -> None:
-        network_overlay = self._build_vm_network_overlay(self._env.environment_dir)
+        source_config = await self._resolve_compose_config(include_vm_networking=False)
+        network_overlay = self._build_vm_network_overlay(source_config)
         await self._upload_text(self._VM_NETWORK_COMPOSE, network_overlay)
 
         allowlist = self._env.network_allowlist
-        if self._env.task_env_config.allow_internet or not allowlist.domains:
-            return
+        if not self._env.task_env_config.allow_internet and allowlist.domains:
+            token = new_proxy_token()
+            self._env._egress_proxy_env = proxy_environment(
+                token,
+                EGRESS_PROXY_SERVICE,
+                EGRESS_PROXY_PORT,
+                no_proxy_hosts=self._compose_no_proxy_hosts(source_config),
+            )
+            local_proxy_dir = self._env.trial_paths.trial_dir / "modal-egress-proxy"
+            local_compose_path = (
+                self._env.trial_paths.trial_dir / self._EGRESS_PROXY_COMPOSE
+            )
+            main = source_config.get("services", {}).get("main") or {}
+            write_docker_proxy_compose(
+                path=local_compose_path,
+                proxy_dir=local_proxy_dir,
+                compose_proxy_dir=self._EGRESS_PROXY_DIR,
+                allowlist=allowlist,
+                token=token,
+                main_networks=self._service_network_names(main),
+            )
+            await self._env._sdk_upload_dir(local_proxy_dir, self._EGRESS_PROXY_DIR)
+            await self._env._sdk_upload_file(
+                local_compose_path,
+                f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}",
+            )
+            self._egress_proxy_overlay_ready = True
 
-        token = new_proxy_token()
-        self._env._egress_proxy_env = proxy_environment(
-            token,
-            EGRESS_PROXY_SERVICE,
-            EGRESS_PROXY_PORT,
-            no_proxy_hosts=self._compose_no_proxy_hosts(),
-        )
-        local_proxy_dir = self._env.trial_paths.trial_dir / "modal-egress-proxy"
-        local_compose_path = (
-            self._env.trial_paths.trial_dir / self._EGRESS_PROXY_COMPOSE
-        )
-        write_docker_proxy_compose(
-            path=local_compose_path,
-            proxy_dir=local_proxy_dir,
-            compose_proxy_dir=self._EGRESS_PROXY_DIR,
-            allowlist=allowlist,
-            token=token,
-        )
-        await self._env._sdk_upload_dir(local_proxy_dir, self._EGRESS_PROXY_DIR)
-        await self._env._sdk_upload_file(
-            local_compose_path,
-            f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}",
-        )
-        self._egress_proxy_overlay_ready = True
+        resolved_config = await self._resolve_compose_config()
+        self._validate_vm_network_isolation(resolved_config)
 
-    def _compose_no_proxy_hosts(self) -> list[str]:
+    def _compose_no_proxy_hosts(self, config: dict[str, Any]) -> list[str]:
         """Names that must keep using task-internal compose networking."""
-        import yaml
-
-        compose_path = self._env.environment_dir / "docker-compose.yaml"
-        doc = yaml.safe_load(compose_path.read_text()) or {}
-        services = doc.get("services") or {}
+        services = config.get("services") or {}
         hosts: set[str] = set(services.keys())
 
         for config in services.values():
@@ -678,10 +726,13 @@ class _ModalDinD(_ModalStrategy):
 
         return sorted(host for host in hosts if isinstance(host, str) and host)
 
-    async def _resolve_main_compose_config(self) -> dict[str, Any]:
+    async def _resolve_compose_config(
+        self, *, include_vm_networking: bool = True
+    ) -> dict[str, Any]:
         result = await self._compose_exec(
             ["config", "--format", "json"],
             include_agent_image=False,
+            include_vm_networking=include_vm_networking,
             timeout_sec=30,
         )
         if result.return_code != 0:
@@ -690,8 +741,17 @@ class _ModalDinD(_ModalStrategy):
             )
         try:
             config = json.loads(result.stdout or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("docker compose config returned invalid JSON") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError("docker compose config did not return a mapping")
+        return config
+
+    async def _resolve_main_compose_config(self) -> dict[str, Any]:
+        config = await self._resolve_compose_config()
+        try:
             main = config["services"]["main"]
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError) as exc:
             raise RuntimeError(
                 "docker compose config did not define service 'main'"
             ) from exc
@@ -775,6 +835,7 @@ class _ModalDinD(_ModalStrategy):
         *,
         include_base_image: bool = False,
         include_agent_image: bool = True,
+        include_vm_networking: bool = True,
     ) -> str:
         """Build a fully shell-escaped docker compose command string."""
         parts = [
@@ -787,6 +848,7 @@ class _ModalDinD(_ModalStrategy):
             *self._compose_file_flags(
                 include_base_image=include_base_image,
                 include_agent_image=include_agent_image,
+                include_vm_networking=include_vm_networking,
             ),
             *subcommand,
         ]
@@ -799,6 +861,7 @@ class _ModalDinD(_ModalStrategy):
         *,
         include_base_image: bool = False,
         include_agent_image: bool = True,
+        include_vm_networking: bool = True,
     ) -> ExecResult:
         """Run a docker compose subcommand on the sandbox."""
         return await self._vm_exec(
@@ -806,6 +869,7 @@ class _ModalDinD(_ModalStrategy):
                 subcommand,
                 include_base_image=include_base_image,
                 include_agent_image=include_agent_image,
+                include_vm_networking=include_vm_networking,
             ),
             env=self._compose_env_vars(),
             timeout_sec=timeout_sec,

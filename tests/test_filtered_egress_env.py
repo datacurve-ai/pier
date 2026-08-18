@@ -57,75 +57,194 @@ def test_docker_proxy_compose_does_not_inject_proxy_env_into_main(tmp_path):
     ]
 
 
-def test_modal_vm_no_internet_keeps_task_networks_internal(tmp_path):
-    (tmp_path / "docker-compose.yaml").write_text(
-        """
-services:
-  main:
-    networks: [task-network]
-  sidecar:
-    networks: [task-network]
-networks:
-  task-network:
-    internal: true
-"""
+def test_docker_proxy_compose_preserves_main_task_networks(tmp_path):
+    path = tmp_path / "docker-compose-egress-proxy.json"
+    write_docker_proxy_compose(
+        path=path,
+        proxy_dir=tmp_path / "proxy",
+        allowlist=type("Allowlist", (), {"domains": ["api.openai.com"]})(),
+        token="secret",
+        main_networks=["default"],
     )
+
+    compose = json.loads(path.read_text())
+
+    assert compose["services"]["main"]["networks"] == [
+        "default",
+        "pier-egress-internal",
+    ]
+
+
+def test_modal_vm_no_internet_keeps_task_networks_internal(tmp_path):
     strategy = _modal_vm_strategy(
         tmp_path, allow_internet=False, domains=["api.openai.com"]
     )
+    config = {
+        "services": {
+            "main": {"networks": {"task-network": None}},
+            "sidecar": {"networks": {"task-network": None}},
+        },
+        "networks": {"task-network": {"internal": True}},
+    }
 
-    overlay = yaml.safe_load(strategy._build_vm_network_overlay(tmp_path))
+    overlay = yaml.safe_load(strategy._build_vm_network_overlay(config))
 
     assert overlay["networks"]["task-network"]["internal"] is True
     assert overlay["networks"]["default"]["internal"] is True
     assert "services" not in overlay
-    assert strategy._compose_no_proxy_hosts() == ["main", "sidecar"]
+    assert strategy._compose_no_proxy_hosts(config) == ["main", "sidecar"]
 
 
 def test_modal_vm_internet_adds_egress_to_main_only(tmp_path):
-    (tmp_path / "docker-compose.yaml").write_text(
-        """
-services:
-  main:
-    networks: [task-network]
-  sidecar:
-    networks: [task-network]
-networks:
-  task-network:
-    internal: true
-"""
-    )
     strategy = _modal_vm_strategy(tmp_path, allow_internet=True)
+    config = {
+        "services": {
+            "main": {"networks": {"task-network": None}},
+            "sidecar": {"networks": {"task-network": None}},
+        },
+        "networks": {"task-network": {"internal": True}},
+    }
 
-    overlay = yaml.safe_load(strategy._build_vm_network_overlay(tmp_path))
+    overlay = yaml.safe_load(strategy._build_vm_network_overlay(config))
 
-    assert overlay["services"] == {"main": {"networks": ["pier-main-internet"]}}
+    assert overlay["services"] == {
+        "main": {"networks": ["task-network", "pier-main-internet"]}
+    }
     assert overlay["networks"] == {"pier-main-internet": {}}
 
 
-def test_modal_vm_proxy_bypasses_compose_aliases(tmp_path):
-    (tmp_path / "docker-compose.yaml").write_text(
-        """
-services:
-  main:
-    networks: [task-network]
-  sidecar:
-    hostname: sidecar-host
-    networks:
-      task-network:
-        aliases: [records.example.internal]
-networks:
-  task-network:
-    internal: true
-"""
-    )
+def test_modal_vm_internet_preserves_implicit_default_network(tmp_path):
+    strategy = _modal_vm_strategy(tmp_path, allow_internet=True)
+    config = {
+        "services": {
+            "main": {"networks": {"default": None}},
+            "sidecar": {"networks": {"default": None}},
+        },
+        "networks": {"default": {}},
+    }
+
+    overlay = yaml.safe_load(strategy._build_vm_network_overlay(config))
+
+    assert overlay["services"]["main"]["networks"] == [
+        "default",
+        "pier-main-internet",
+    ]
+
+
+def test_modal_vm_isolates_networks_from_resolved_includes(tmp_path):
     strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {
+        "services": {
+            "main": {"networks": {"default": None}},
+            "sidecar": {"networks": {"included-network": None}},
+        },
+        "networks": {"default": {}, "included-network": {}},
+    }
+
+    overlay = yaml.safe_load(strategy._build_vm_network_overlay(config))
+
+    assert overlay["networks"] == {
+        "default": {"internal": True},
+        "included-network": {"internal": True},
+    }
+
+
+def test_modal_vm_rejects_unisolated_resolved_task_network(tmp_path):
+    strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {
+        "services": {
+            "main": {"networks": {"default": None}},
+            "sidecar": {"networks": {"included-network": None}},
+        },
+        "networks": {
+            "default": {"internal": True},
+            "included-network": {},
+        },
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="sidecar is attached to non-internal network included-network",
+    ):
+        strategy._validate_vm_network_isolation(config)
+
+
+def test_modal_vm_allows_only_proxy_on_external_network(tmp_path):
+    strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {
+        "services": {
+            "main": {"networks": {"default": None, "pier-egress-internal": None}},
+            EGRESS_PROXY_SERVICE: {
+                "networks": {
+                    "pier-egress-internal": None,
+                    "pier-egress-external": None,
+                }
+            },
+        },
+        "networks": {
+            "default": {"internal": True},
+            "pier-egress-internal": {"internal": True},
+            "pier-egress-external": {},
+        },
+    }
+
+    strategy._validate_vm_network_isolation(config)
+
+
+def test_modal_vm_prepares_policy_from_resolved_config_before_start(tmp_path):
+    strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    source_config = {
+        "services": {
+            "main": {"networks": {"default": None}},
+            "sidecar": {"networks": {"included-network": None}},
+        },
+        "networks": {"default": {}, "included-network": {}},
+    }
+    isolated_config = {
+        **source_config,
+        "networks": {
+            "default": {"internal": True},
+            "included-network": {"internal": True},
+        },
+    }
+    resolve_calls = []
+    uploads = {}
+
+    async def resolve_config(*, include_vm_networking=True):
+        resolve_calls.append(include_vm_networking)
+        return isolated_config if include_vm_networking else source_config
+
+    async def upload_text(filename, content):
+        uploads[filename] = content
+
+    strategy._resolve_compose_config = resolve_config
+    strategy._upload_text = upload_text
+
+    asyncio.run(strategy._prepare_vm_networking())
+
+    overlay = yaml.safe_load(uploads[strategy._VM_NETWORK_COMPOSE])
+    assert resolve_calls == [False, True]
+    assert overlay["networks"]["included-network"]["internal"] is True
+
+
+def test_modal_vm_proxy_bypasses_compose_aliases(tmp_path):
+    strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {
+        "services": {
+            "main": {"networks": {"task-network": None}},
+            "sidecar": {
+                "hostname": "sidecar-host",
+                "networks": {"task-network": {"aliases": ["records.example.internal"]}},
+            },
+        },
+        "networks": {"task-network": {"internal": True}},
+    }
 
     env = proxy_environment(
         "secret",
         EGRESS_PROXY_SERVICE,
         EGRESS_PROXY_PORT,
-        no_proxy_hosts=strategy._compose_no_proxy_hosts(),
+        no_proxy_hosts=strategy._compose_no_proxy_hosts(config),
     )
 
     assert env["NO_PROXY"].split(",") == [
@@ -139,29 +258,22 @@ networks:
 
 
 def test_modal_vm_no_internet_rejects_network_mode_bypass(tmp_path):
-    (tmp_path / "docker-compose.yaml").write_text(
-        "services:\n  main:\n    network_mode: host\n"
-    )
     strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {"services": {"main": {"network_mode": "host"}}, "networks": {}}
 
     with pytest.raises(ValueError, match="main=host"):
-        strategy._build_vm_network_overlay(tmp_path)
+        strategy._build_vm_network_overlay(config)
 
 
 def test_modal_vm_rejects_reserved_proxy_network_collision(tmp_path):
-    (tmp_path / "docker-compose.yaml").write_text(
-        """
-services:
-  main:
-    networks: [pier-egress-external]
-networks:
-  pier-egress-external: {}
-"""
-    )
     strategy = _modal_vm_strategy(tmp_path, allow_internet=False)
+    config = {
+        "services": {"main": {"networks": {"pier-egress-external": None}}},
+        "networks": {"pier-egress-external": {}},
+    }
 
     with pytest.raises(ValueError, match="reserved by Pier"):
-        strategy._build_vm_network_overlay(tmp_path)
+        strategy._build_vm_network_overlay(config)
 
 
 def test_modal_vm_compose_advertises_preinstall_and_filtered_egress(
