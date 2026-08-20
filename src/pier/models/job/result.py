@@ -35,6 +35,7 @@ class JobStats(BaseModel):
     evals: dict[str, AgentDatasetStats] = Field(
         default_factory=lambda: defaultdict(AgentDatasetStats)
     )
+    n_agent_steps: int | None = None
     n_input_tokens: int | None = None
     n_cache_tokens: int | None = None
     n_output_tokens: int | None = None
@@ -168,6 +169,10 @@ class JobStats(BaseModel):
         if cost is not None:
             self.cost_usd = (self.cost_usd or 0.0) + cost
 
+        agent_steps = trial_result.agent_step_count()
+        if agent_steps is not None:
+            self.n_agent_steps = (self.n_agent_steps or 0) + agent_steps
+
     def remove_trial(self, trial_result: TrialResult) -> None:
         """Remove a trial's contributions from stats."""
         self.n_completed_trials -= 1
@@ -211,6 +216,10 @@ class JobStats(BaseModel):
             self.n_output_tokens = max(0, self.n_output_tokens - n_output)
         if cost is not None and self.cost_usd is not None:
             self.cost_usd = max(0.0, self.cost_usd - cost)
+
+        agent_steps = trial_result.agent_step_count()
+        if agent_steps is not None and self.n_agent_steps is not None:
+            self.n_agent_steps = max(0, self.n_agent_steps - agent_steps)
 
     def update_trial(
         self,
