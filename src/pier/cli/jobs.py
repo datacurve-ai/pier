@@ -267,13 +267,25 @@ def start(
         Option(
             "-n",
             "--n-concurrent",
-            help=f"Number of concurrent trials to run (default: {
+            help=f"Fixed concurrency, or starting per-route concurrency with "
+            f"--dynamic-concurrency (default: {
                 JobConfig.model_fields['n_concurrent_trials'].default
             })",
             rich_help_panel="Job Settings",
             show_default=False,
         ),
     ] = None,
+    dynamic_concurrency: Annotated[
+        bool,
+        Option(
+            "--dynamic-concurrency",
+            help=(
+                "Start each inference route at --n-concurrent and adapt using "
+                "real-time rate-limit signals"
+            ),
+            rich_help_panel="Job Settings",
+        ),
+    ] = False,
     max_retries: Annotated[
         int | None,
         Option(
@@ -623,6 +635,8 @@ def start(
 
     if n_concurrent_trials is not None:
         config.n_concurrent_trials = n_concurrent_trials
+    if dynamic_concurrency:
+        config.dynamic_concurrency = True
     if quiet:
         config.quiet = quiet
     if max_retries is not None:

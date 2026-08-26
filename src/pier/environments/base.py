@@ -7,7 +7,7 @@ import time
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal
 
@@ -43,6 +43,9 @@ class ExecResult(BaseModel):
     stdout: str | None = None
     stderr: str | None = None
     return_code: int
+
+
+ExecOutputCallback = Callable[[str, str], Awaitable[None]]
 
 
 class BaseEnvironment(ABC):
@@ -673,6 +676,33 @@ class BaseEnvironment(ABC):
                 ``self.default_user``; if that is also None the environment's
                 container default (typically root) is used.
         """
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        """Execute and report output incrementally when the backend supports it.
+
+        The compatibility fallback reports captured output after completion. Backends
+        override this to provide real-time delivery.
+        """
+        result = await self.exec(
+            command=command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+        if result.stdout:
+            await on_output("stdout", result.stdout)
+        if result.stderr:
+            await on_output("stderr", result.stderr)
+        return result
 
     async def is_dir(self, path: str, user: str | int | None = None) -> bool:
         """Check if a remote path is a directory.

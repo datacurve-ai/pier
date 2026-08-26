@@ -108,6 +108,7 @@ class JobLock(BaseModel):
     pier: PierLockInfo = Field(default_factory=PierLockInfo)
     invocation: list[str] | None = None
     n_concurrent_trials: int
+    dynamic_concurrency: bool = False
     retry: RetryConfig
     trials: list[TrialLock] = Field(default_factory=list)
 
@@ -151,6 +152,7 @@ def build_job_lock(
             invocation if invocation is not None else list(sys.argv)
         ),
         n_concurrent_trials=config.n_concurrent_trials,
+        dynamic_concurrency=config.dynamic_concurrency,
         retry=config.retry,
         trials=[_build_lock_trial(trial_config) for trial_config in trial_configs],
     )

@@ -101,6 +101,7 @@ class Job:
 
         self._trial_queue = TrialQueue(
             n_concurrent=self.config.n_concurrent_trials,
+            dynamic_concurrency=self.config.dynamic_concurrency,
             retry_config=self.config.retry,
         )
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)
@@ -801,8 +802,12 @@ class Job:
 
         coros = self._trial_queue.submit_batch(self._remaining_trial_configs)
 
-        async with asyncio.TaskGroup() as tg:
-            tasks = [tg.create_task(coro) for coro in coros]
+        await self._trial_queue.start()
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(coro) for coro in coros]
+        finally:
+            await self._trial_queue.stop()
 
         return [t.result() for t in tasks]
 

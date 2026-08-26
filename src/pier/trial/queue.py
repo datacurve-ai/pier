@@ -3,10 +3,15 @@ import shutil
 from collections.abc import Coroutine
 from typing import Any
 
+from pier.concurrency import (
+    DynamicConcurrencyPool,
+    EventBus,
+)
 from pier.models.job.config import RetryConfig
 from pier.models.trial.config import TrialConfig
 from pier.models.trial.result import TrialResult
 from pier.trial.hooks import HookCallback, TrialEvent
+from pier.telemetry import TelemetryContext, bind_telemetry
 from pier.utils.logger import logger
 
 
@@ -23,6 +28,7 @@ class TrialQueue:
     def __init__(
         self,
         n_concurrent: int,
+        dynamic_concurrency: bool = False,
         retry_config: RetryConfig | None = None,
         hooks: dict[TrialEvent, list[HookCallback]] | None = None,
     ):
@@ -32,11 +38,52 @@ class TrialQueue:
             for event in TrialEvent:
                 hooks.setdefault(event, [])
 
+        if n_concurrent < 1:
+            raise ValueError("n_concurrent must be at least 1")
         self._n_concurrent = n_concurrent
+        self._dynamic_concurrency = dynamic_concurrency
         self._retry_config = retry_config if retry_config is not None else RetryConfig()
         self._hooks = hooks
         self._logger = logger.getChild(__name__)
         self._semaphore = asyncio.Semaphore(n_concurrent)
+        self._event_bus: EventBus | None = None
+        self._dynamic_pool: DynamicConcurrencyPool | None = None
+        self._controller_task: asyncio.Task[None] | None = None
+        if dynamic_concurrency:
+            self._event_bus = EventBus()
+            self._dynamic_pool = DynamicConcurrencyPool(
+                events=self._event_bus,
+                initial_capacity=n_concurrent,
+            )
+
+    @property
+    def concurrency_limit(self) -> int:
+        """Fixed limit, or the starting per-route capacity in dynamic mode."""
+        return self._n_concurrent
+
+    def route_concurrency_limit(
+        self, provider: str | None, model: str | None, effort: str | None
+    ) -> int:
+        """Return the current capacity for an inference route."""
+        if self._dynamic_pool is None:
+            return self._n_concurrent
+        return self._dynamic_pool.capacity_for(provider, model, effort)
+
+    async def start(self) -> None:
+        """Start the adaptive controller. Fixed-concurrency queues are a no-op."""
+        if self._dynamic_pool is None or self._controller_task is not None:
+            return
+        self._controller_task = asyncio.create_task(
+            self._dynamic_pool.run(), name="pier-dynamic-concurrency"
+        )
+
+    async def stop(self) -> None:
+        """Stop the adaptive controller after all submitted trials finish."""
+        if self._event_bus is None or self._controller_task is None:
+            return
+        await self._event_bus.close()
+        await self._controller_task
+        self._controller_task = None
 
     def add_hook(self, event: TrialEvent, callback: HookCallback) -> "TrialQueue":
         """Register a callback for a trial lifecycle event and return the queue."""
@@ -149,8 +196,31 @@ class TrialQueue:
 
     async def _run_trial(self, trial_config: TrialConfig) -> TrialResult:
         """Execute a single trial, acquiring the semaphore for concurrency control."""
-        async with self._semaphore:
-            return await self._execute_trial_with_retries(trial_config)
+        if self._dynamic_pool is None or self._event_bus is None:
+            async with self._semaphore:
+                return await self._execute_trial_with_retries(trial_config)
+
+        model_name = trial_config.agent.model_name or ""
+        provider, separator, model = model_name.partition("/")
+        if not separator:
+            provider, model = None, model_name or None
+        effort = trial_config.agent.kwargs.get("reasoning_effort")
+        if effort is None:
+            effort = trial_config.agent.kwargs.get("effort")
+
+        context = TelemetryContext(
+            sink=self._event_bus.publish,
+            trial_id=trial_config.trial_name,
+            provider=provider,
+            model=model,
+            effort=str(effort) if effort is not None else None,
+        )
+        route_limiter = self._dynamic_pool.limiter_for(
+            context.provider, context.model, context.effort
+        )
+        async with route_limiter:
+            with bind_telemetry(context):
+                return await self._execute_trial_with_retries(trial_config)
 
     def submit(self, trial_config: TrialConfig) -> Coroutine[Any, Any, TrialResult]:
         """

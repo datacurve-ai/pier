@@ -20,7 +20,7 @@ from pier.environments.agent_setup import (
     proxy_policy_env,
     squid_bootstrap_command,
 )
-from pier.environments.base import BaseEnvironment, ExecResult
+from pier.environments.base import BaseEnvironment, ExecOutputCallback, ExecResult
 from pier.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -87,6 +87,21 @@ class _ModalStrategy:
         timeout_sec: int | None = None,
     ) -> ExecResult:
         """Execute a command in the environment's main container."""
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        result = await self.exec(command, cwd=cwd, env=env, timeout_sec=timeout_sec)
+        if result.stdout:
+            await on_output("stdout", result.stdout)
+        if result.stderr:
+            await on_output("stderr", result.stderr)
+        return result
 
     @abstractmethod
     async def attach(self) -> None:
@@ -224,6 +239,22 @@ class _ModalDirect(_ModalStrategy):
     ) -> ExecResult:
         return await self._env._sdk_exec(
             command, cwd=cwd, env=env, timeout_sec=timeout_sec
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        return await self._env._sdk_exec_stream(
+            command,
+            on_output=on_output,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
         )
 
     async def attach(self) -> None:
@@ -612,6 +643,29 @@ class _ModalDinD(_ModalStrategy):
         parts.extend(["main", "bash", "-c", command])
 
         return await self._compose_exec(parts, timeout_sec=timeout_sec)
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        parts: list[str] = ["exec", "-T"]
+        if cwd:
+            parts.extend(["-w", cwd])
+        if env:
+            for key, value in env.items():
+                parts.extend(["-e", f"{key}={value}"])
+        parts.extend(["main", "bash", "-c", command])
+        return await self._env._sdk_exec_stream(
+            self._compose_cmd(parts),
+            on_output=on_output,
+            env=self._compose_env_vars(),
+            timeout_sec=timeout_sec,
+            shell="sh",
+        )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         """Two-hop upload: SDK → sandbox temp, docker compose cp → main."""
@@ -1152,6 +1206,47 @@ class ModalEnvironment(BaseEnvironment):
             return_code=return_code,
         )
 
+    async def _sdk_exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        shell: str = "bash",
+        login: bool = False,
+    ) -> ExecResult:
+        env = self._merge_env(env)
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        process = await self._sandbox.exec.aio(
+            shell,
+            "-lc" if login else "-c",
+            command,
+            workdir=cwd,
+            secrets=[Secret.from_dict(env)] if env else [],  # type: ignore
+            timeout=timeout_sec,
+        )
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        async def drain(stream, name: str, chunks: list[str]) -> None:
+            async for chunk in stream:
+                chunks.append(chunk)
+                await on_output(name, chunk)
+
+        await asyncio.gather(
+            drain(process.stdout, "stdout", stdout_chunks),
+            drain(process.stderr, "stderr", stderr_chunks),
+        )
+        return_code = await process.wait.aio()
+        return ExecResult(
+            stdout="".join(stdout_chunks) or None,
+            stderr="".join(stderr_chunks) or None,
+            return_code=return_code,
+        )
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -1292,6 +1387,32 @@ class ModalEnvironment(BaseEnvironment):
         effective_cwd = cwd or self.task_env_config.workdir
         return await self._strategy.exec(
             command, cwd=effective_cwd, env=env, timeout_sec=timeout_sec
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+        if user is not None:
+            if isinstance(user, int):
+                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+            else:
+                user_arg = shlex.quote(str(user))
+            command = f"su -m {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+        effective_cwd = cwd or self.task_env_config.workdir
+        return await self._strategy.exec_stream(
+            command,
+            on_output=on_output,
+            cwd=effective_cwd,
+            env=env,
+            timeout_sec=timeout_sec,
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str):

@@ -899,4 +899,5 @@ mini-swe-agent --help
                 f"--exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt"
             ),
             env=env,
+            telemetry=True,
         )
