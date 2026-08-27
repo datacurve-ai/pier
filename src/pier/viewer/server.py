@@ -1298,15 +1298,7 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
                     environment_type = config.environment.type.value
 
             if result:
-                total_agent_steps: int | None = None
-                for trial_name in scanner.list_trials(name):
-                    trial_result = scanner.get_trial_result(name, trial_name)
-                    if trial_result is None:
-                        continue
-                    agent_steps = _agent_step_count_from_result(trial_result)
-                    if agent_steps is not None:
-                        total_agent_steps = (total_agent_steps or 0) + agent_steps
-
+                total_agent_steps = result.stats.n_agent_steps
                 # Extract evals from stats
                 evals = {
                     key: EvalSummary(metrics=eval_stats.metrics)
