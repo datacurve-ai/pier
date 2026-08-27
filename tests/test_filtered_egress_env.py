@@ -29,6 +29,20 @@ def test_docker_proxy_compose_does_not_inject_proxy_env_into_main(tmp_path):
     assert EGRESS_PROXY_SERVICE in main["depends_on"]
 
 
+def test_docker_proxy_shell_script_uses_unix_newlines(tmp_path):
+    write_docker_proxy_compose(
+        path=tmp_path / "docker-compose-egress-proxy.json",
+        proxy_dir=tmp_path / "proxy",
+        allowlist=type("Allowlist", (), {"domains": ["api.openai.com"]})(),
+        token="secret",
+    )
+
+    script = (tmp_path / "proxy" / "start-squid.sh").read_bytes()
+
+    assert b"\r\n" not in script
+    assert script.startswith(b"#!/usr/bin/env bash\n")
+
+
 def test_docker_agent_process_env_adds_proxy_only_for_agent_commands():
     env = DockerEnvironment.__new__(DockerEnvironment)
     env._egress_proxy_env = proxy_environment(

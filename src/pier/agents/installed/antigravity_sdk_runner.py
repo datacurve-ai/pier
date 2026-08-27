@@ -64,7 +64,16 @@ def resolve_skill_paths(raw_paths: str | None) -> list[str] | None:
         isinstance(path, str) for path in parsed
     ):
         return None
-    return [str(Path(path).expanduser()) for path in parsed]
+    home = os.environ.get("HOME")
+
+    def expand(path: str) -> str:
+        if home and (path == "~" or path.startswith("~/")):
+            return f"{home.rstrip('/')}{path[1:]}"
+        if path.startswith("/"):
+            return path
+        return str(Path(path).expanduser())
+
+    return [expand(path) for path in parsed]
 
 
 def thinking_level(effort: str, levels: Any) -> Any:

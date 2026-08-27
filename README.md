@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `copilot-cli`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -130,6 +130,27 @@ through your env file.
   model_name: cursor/composer-2.5
   env:
     CURSOR_API_KEY: ${CURSOR_API_KEY}
+```
+
+**GitHub Copilot CLI** uses the official `copilot` binary in non-interactive
+mode and preserves its native session events alongside the ATIF trajectory.
+Delegated `task` runs become embedded `subagent_trajectories` linked from the
+tool call that spawned them (nested delegations nest in turn), Copilot's own
+`system.message` events and context-compaction summaries become `system` steps,
+tools the user dispatched become `llm_call_count: 0` steps, and a failed tool
+result records `extra.is_error` (Copilot's own `success` flag reports the
+harness rather than the command, so it is kept verbatim as `copilot_success`
+instead). Provide a fine-grained personal access token with the **Copilot
+Requests** permission through `COPILOT_GITHUB_TOKEN` (preferred), `GH_TOKEN`,
+or `GITHUB_TOKEN`.
+
+```yaml
+- name: copilot-cli
+  model_name: gpt-5.4
+  env:
+    COPILOT_GITHUB_TOKEN: ${COPILOT_GITHUB_TOKEN}
+  kwargs:
+    reasoning_effort: high
 ```
 
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
