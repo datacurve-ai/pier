@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -15,18 +14,6 @@ from pier.utils.logger import logger
 
 EVENT_PREFIX = "PIER_EVENT "
 CONCURRENCY_LOG_PREFIX = "CONCURRENCY "
-_RATE_LIMIT_RE = re.compile(
-    r"(?:\b429\b|too many requests|"
-    r"(?:rate[ _-]?limit(?:ed|ing|error)?).{0,80}"
-    r"(?:error|exception|retry|backoff|throttl)|"
-    r"(?:error|exception|retry|backoff|throttl).{0,80}"
-    r"(?:rate[ _-]?limit(?:ed|ing|error)?))",
-    re.I,
-)
-_RETRY_AFTER_RE = re.compile(
-    r"retry[- _]?after(?:_ms| milliseconds| ms)?[\"'=:\s]+([0-9]+(?:\.[0-9]+)?)",
-    re.I,
-)
 
 
 def utc_now() -> str:
@@ -66,7 +53,6 @@ class PierEvent:
     payload: dict[str, Any] = field(default_factory=dict)
     event_id: str = field(default_factory=lambda: new_event_id("event"))
     observed_at: str = field(default_factory=utc_now)
-    verified: bool = False
     evidence: str | None = None
     capacity_period: int | None = None
 
@@ -104,7 +90,6 @@ class TelemetryContext:
 class _RateLimitSignal:
     payload: dict[str, Any]
     retry_after_sec: float | None
-    verified: bool
     evidence: str | None
     capacity_period: int | None
 
@@ -144,33 +129,16 @@ def _structured_rate_limit(line: str) -> _RateLimitSignal | None:
 
     status_code = _int_or_none(payload.get("status_code"))
     evidence = str(payload.get("evidence") or "") or None
-    verified_value = payload.get("verified")
-    if isinstance(verified_value, bool):
-        verified = verified_value
-    else:
-        verified = status_code == 429 or evidence == "typed_rate_limit_error"
+    if status_code != 429 and evidence != "typed_rate_limit_error":
+        return None
     if status_code == 429 and evidence is None:
         evidence = "http_status_429"
 
     return _RateLimitSignal(
         payload=payload,
         retry_after_sec=retry_after,
-        verified=verified,
         evidence=evidence,
         capacity_period=_int_or_none(payload.get("capacity_period")),
-    )
-
-
-def _heuristic_rate_limit(line: str) -> _RateLimitSignal | None:
-    if not _RATE_LIMIT_RE.search(line):
-        return None
-    match = _RETRY_AFTER_RE.search(line)
-    return _RateLimitSignal(
-        payload={"source": "agent_output_heuristic"},
-        retry_after_sec=float(match.group(1)) if match else None,
-        verified=False,
-        evidence="agent_output_heuristic",
-        capacity_period=None,
     )
 
 
@@ -212,13 +180,9 @@ class TelemetryDecoder:
 
     async def _decode_line(self, line: str) -> None:
         line = line.strip()
-        if not line:
+        if not line.startswith(EVENT_PREFIX):
             return
-        signal = (
-            _structured_rate_limit(line)
-            if line.startswith(EVENT_PREFIX)
-            else _heuristic_rate_limit(line)
-        )
+        signal = _structured_rate_limit(line)
         if signal is None:
             return
 
@@ -226,7 +190,7 @@ class TelemetryDecoder:
             PierEvent(
                 type="inference.rate_limited",
                 trial_id=self._context.trial_id,
-                # Route capacity is acquired from the trial configuration, so events
+                # Group capacity is acquired from the trial configuration, so events
                 # must use that same key. Payload values fill only missing context.
                 provider=str(
                     self._context.provider or signal.payload.get("provider") or ""
@@ -237,7 +201,6 @@ class TelemetryDecoder:
                 effort=str(self._context.effort or signal.payload.get("effort") or "")
                 or None,
                 retry_after_sec=signal.retry_after_sec,
-                verified=signal.verified,
                 evidence=signal.evidence,
                 capacity_period=signal.capacity_period,
                 # Do not forward the raw line: model output can contain secrets.

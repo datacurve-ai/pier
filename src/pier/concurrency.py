@@ -127,7 +127,6 @@ class DynamicConcurrencyController:
         self.recovery_floor = limiter.capacity
         self.known_bad_capacity: int | None = None
         self.current_probe_capacity: int | None = None
-        self.recovery_probes_enabled = True
         self._last_reduction_period: int | None = None
         self._rate_limit_count = 0
         self._backoff_allowed_at = 0.0
@@ -145,7 +144,6 @@ class DynamicConcurrencyController:
             "known_bad_capacity": self.known_bad_capacity,
             "recovery_ceiling": self.recovery_ceiling,
             "current_probe_capacity": self.current_probe_capacity,
-            "recovery_probes_enabled": self.recovery_probes_enabled,
             "capacity_period": self.request_throttling_manager.capacity_period,
             "control_index": self.request_throttling_manager.control_index,
             "last_reduction_period": self._last_reduction_period,
@@ -182,30 +180,41 @@ class DynamicConcurrencyController:
             return self._concurrency_group
         return _concurrency_group(event.provider, event.model, event.effort)
 
-    def _audit_rate_limit(self, event: PierEvent) -> None:
+    def _audit_rate_limit(
+        self,
+        event: PierEvent,
+        *,
+        decision_id: str,
+        action: str,
+        capacity_before: int,
+        trigger_rate_limit_count: int,
+        **fields: Any,
+    ) -> None:
         signal = {
             key: value
             for key, value in event.payload.items()
             if key in {"source", "status_code", "request_id", "attempt"}
         }
-        if event.capacity_period is not None:
-            signal["capacity_period"] = event.capacity_period
         _log_concurrency_event(
             "inference.rate_limit",
             event_id=event.event_id,
+            decision_id=decision_id,
             observed_at=event.observed_at,
-            verified=event.verified,
             evidence=event.evidence,
             trial_id=event.trial_id,
             concurrency_group=self._event_group(event),
+            action=action,
+            capacity_before=capacity_before,
+            capacity_after=self.limiter.capacity,
+            event_capacity_period=event.capacity_period,
+            trigger_rate_limit_count=trigger_rate_limit_count,
             retry_after_sec=event.retry_after_sec,
-            capacity_period=event.capacity_period,
             signal=signal,
+            **fields,
+            **self._state(),
         )
 
     def _ignored_action(self, event: PierEvent) -> str | None:
-        if not event.verified:
-            return "ignored_unverified"
         if self._last_reduction_period is None:
             return None
         if event.capacity_period is None:
@@ -216,28 +225,13 @@ class DynamicConcurrencyController:
             return "ignored_unknown_capacity_period"
         return None
 
-    def _audit_decision(
-        self,
-        *,
-        decision_id: str,
-        action: str,
-        capacity_before: int,
-        event: PierEvent | None = None,
-        **fields: Any,
-    ) -> None:
+    def _audit_ramp(self, *, decision_id: str, capacity_before: int) -> None:
         _log_concurrency_event(
-            "concurrency.decision",
+            "concurrency.ramp",
             decision_id=decision_id,
-            trigger_event_id=event.event_id if event is not None else None,
-            action=action,
-            concurrency_group=(
-                self._event_group(event)
-                if event is not None
-                else self._concurrency_group
-            ),
+            concurrency_group=self._concurrency_group,
             capacity_before=capacity_before,
             capacity_after=self.limiter.capacity,
-            **fields,
             **self._state(),
         )
 
@@ -281,7 +275,6 @@ class DynamicConcurrencyController:
         )
         self.current_probe_capacity = None
         if failed_probe:
-            self.recovery_probes_enabled = False
             return self.recovery_floor
 
         self.recovery_floor = min(self.recovery_floor, percentage_target)
@@ -294,26 +287,20 @@ class DynamicConcurrencyController:
         now = time.monotonic() if now is None else now
         current = self.limiter.capacity
         decision_id = _new_id("decision")
-        self._audit_rate_limit(event)
 
         if ignored_action := self._ignored_action(event):
-            ignored_fields: dict[str, Any] = {}
-            if ignored_action != "ignored_unverified":
-                ignored_fields = {
-                    "event_capacity_period": event.capacity_period,
-                    "required_capacity_period": self._last_reduction_period,
-                }
-            self._audit_decision(
+            self._audit_rate_limit(
+                event,
                 decision_id=decision_id,
                 action=ignored_action,
                 capacity_before=current,
-                event=event,
-                **ignored_fields,
+                trigger_rate_limit_count=self._rate_limit_count,
+                required_capacity_period=self._last_reduction_period,
             )
             return
 
         delay = max(self.cooldown_sec, event.retry_after_sec or 0.0)
-        # A fresh verified signal restarts the quiet window, even when the next
+        # A fresh rate-limit signal restarts the quiet window, even when the next
         # capacity reduction is still cooling down.
         self._next_probe_at = max(
             self._next_probe_at,
@@ -353,20 +340,18 @@ class DynamicConcurrencyController:
                 event.retry_after_sec,
                 cause_id=event.event_id,
             )
-        self._audit_decision(
+        self._audit_rate_limit(
+            event,
             decision_id=decision_id,
             action=action,
             capacity_before=current,
-            event=event,
-            cooldown_sec=delay,
-            event_capacity_period=event.capacity_period,
             trigger_rate_limit_count=trigger_rate_limit_count,
-            retry_after_sec=event.retry_after_sec,
+            cooldown_sec=delay,
         )
 
     async def maybe_ramp(self, *, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else now
-        if not self.recovery_probes_enabled or now < self._next_probe_at:
+        if now < self._next_probe_at:
             return False
 
         current = self.limiter.capacity
@@ -386,12 +371,7 @@ class DynamicConcurrencyController:
             and current >= ceiling
             and self.current_probe_capacity is None
         ):
-            self.recovery_probes_enabled = False
-            self._audit_decision(
-                decision_id=_new_id("decision"),
-                action="recovery_ceiling_reached",
-                capacity_before=current,
-            )
+            self._next_probe_at = now + self.ramp_interval_sec
             return False
 
         if self.limiter.queued == 0 and paused == 0:
@@ -413,9 +393,8 @@ class DynamicConcurrencyController:
             "No rate limits observed; increasing trial concurrency to %s",
             self.limiter.capacity,
         )
-        self._audit_decision(
+        self._audit_ramp(
             decision_id=decision_id,
-            action="ramp",
             capacity_before=current,
         )
         self._next_probe_at = now + self.ramp_interval_sec

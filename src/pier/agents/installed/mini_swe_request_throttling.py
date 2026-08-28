@@ -71,19 +71,12 @@ def _status_code(error: Exception) -> int | None:
     return None
 
 
-def _rate_limit_evidence(error: Exception) -> tuple[str, bool] | None:
+def _rate_limit_evidence(error: Exception) -> str | None:
     if _status_code(error) == 429:
-        return "http_status_429", True
+        return "http_status_429"
     name = type(error).__name__.lower()
     if "ratelimit" in name:
-        return "typed_rate_limit_error", True
-    message = str(error).lower()
-    if (
-        "rate limit" in message
-        or "too many requests" in message
-        or "http 429" in message
-    ):
-        return "exception_text_heuristic", False
+        return "typed_rate_limit_error"
     return None
 
 
@@ -100,13 +93,11 @@ def _retry_after(error: Exception) -> float | None:
 def _emit_rate_limit(
     error: Exception,
     evidence: str,
-    verified: bool,
     capacity_period: int,
 ) -> None:
     payload = {
         "type": "model.request.rate_limited",
         "evidence": evidence,
-        "verified": verified,
         "capacity_period": capacity_period,
     }
     status_code = _status_code(error)
@@ -131,7 +122,7 @@ class _PierRequestThrottlingMixin:
             if classification is not None:
                 _emit_rate_limit(
                     error,
-                    *classification,
+                    classification,
                     capacity_period=capacity_period,
                 )
             raise

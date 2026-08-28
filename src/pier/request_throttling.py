@@ -94,9 +94,8 @@ class RequestThrottlingManager:
         *,
         force: set[str] | None = None,
         stagger_resumes: bool = False,
-        reason: str,
+        reason: str | None = None,
         cause_id: str | None = None,
-        removed_trial_ids: list[str] | None = None,
     ) -> None:
         previous = self._running
         desired = self._desired_running()
@@ -140,7 +139,7 @@ class RequestThrottlingManager:
             and trial_id in state_changed
             and trial_id not in desired
         ]
-        if notified or removed_trial_ids:
+        if reason is not None and (newly_running or newly_paused):
             log_concurrency_event(
                 "request.pause_changed",
                 concurrency_group=self._concurrency_group,
@@ -153,7 +152,6 @@ class RequestThrottlingManager:
                 paused=self.paused,
                 resumed_trial_ids=newly_running,
                 paused_trial_ids=newly_paused,
-                removed_trial_ids=removed_trial_ids or [],
                 resume_not_before={
                     trial_id: max(
                         self._not_before,
@@ -178,7 +176,7 @@ class RequestThrottlingManager:
             if trial_id in self._members:
                 raise ValueError(f"Trial {trial_id!r} is already registered")
             self._members[trial_id] = pause_messages
-            self._reconcile(force={trial_id}, reason="trial_registered")
+            self._reconcile(force={trial_id})
 
     async def unregister(self, trial_id: str) -> None:
         async with self._lock:
@@ -187,10 +185,7 @@ class RequestThrottlingManager:
             del self._members[trial_id]
             self._running.discard(trial_id)
             # If a running rollout exits, resume the oldest paused rollout.
-            self._reconcile(
-                reason="trial_unregistered",
-                removed_trial_ids=[trial_id],
-            )
+            self._reconcile()
 
     async def resize(
         self,

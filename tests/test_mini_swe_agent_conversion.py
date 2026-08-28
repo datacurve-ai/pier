@@ -214,6 +214,62 @@ def test_injected_mini_swe_model_tags_429_with_request_capacity_period(
         assert event["type"] == "model.request.rate_limited"
         assert event["status_code"] == 429
         assert event["capacity_period"] == 7
+        assert "verified" not in event
+        assert process.stdout.readline().strip() == "done"
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+
+def test_injected_mini_swe_model_does_not_emit_text_only_rate_limit(
+    tmp_path: Path,
+):
+    package = tmp_path / "minisweagent" / "models"
+    package.mkdir(parents=True)
+    (tmp_path / "minisweagent" / "__init__.py").write_text("")
+    (package / "__init__.py").write_text(
+        "class BaseModel:\n"
+        "    def _query(self, messages, **kwargs):\n"
+        "        raise RuntimeError('HTTP 429 rate limit')\n\n"
+        "def get_model_class(model_name, model_class):\n"
+        "    return BaseModel\n"
+    )
+    (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
+    script = (
+        "from pier_minisweagent import PierModel\n"
+        "print('ready', flush=True)\n"
+        "try:\n"
+        "    PierModel()._query([])\n"
+        "except Exception:\n"
+        "    pass\n"
+        "print('done', flush=True)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdin is not None
+        assert process.stdout.readline().strip() == "ready"
+        process.stdin.write(
+            json.dumps(
+                {
+                    "type": "request.pause",
+                    "control_index": 1,
+                    "capacity_period": 7,
+                    "paused": False,
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+
         assert process.stdout.readline().strip() == "done"
         assert process.wait(timeout=2) == 0
     finally:

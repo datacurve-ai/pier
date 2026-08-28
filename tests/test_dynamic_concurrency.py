@@ -65,7 +65,6 @@ async def deliver_backoff_threshold(
             PierEvent(
                 type="inference.rate_limited",
                 trial_id=f"pressure-{index}",
-                verified=True,
                 capacity_period=capacity_period,
             ),
             now=now,
@@ -75,7 +74,6 @@ async def deliver_backoff_threshold(
         or PierEvent(
             type="inference.rate_limited",
             trial_id="pressure-final",
-            verified=True,
             capacity_period=capacity_period,
         ),
         now=now,
@@ -446,7 +444,7 @@ def test_controller_resizes_request_throttling_manager_in_lockstep():
     run(scenario())
 
 
-def test_audit_log_causally_links_verified_429_backoff_and_paused_trials(tmp_path):
+def test_audit_log_causally_links_429_backoff_and_paused_trials(tmp_path):
     async def scenario():
         audit_path = tmp_path / "job.log"
         handler = logging.FileHandler(audit_path)
@@ -481,7 +479,6 @@ def test_audit_log_causally_links_verified_429_backoff_and_paused_trials(tmp_pat
                 effort="high",
                 event_id="rate-limit-17",
                 observed_at="2026-08-26T18:42:10Z",
-                verified=True,
                 evidence="http_status_429",
                 payload={"status_code": 429, "request_id": "request-8"},
             )
@@ -504,12 +501,6 @@ def test_audit_log_causally_links_verified_429_backoff_and_paused_trials(tmp_pat
             if record["type"] == "inference.rate_limit"
             and record["event_id"] == "rate-limit-17"
         )
-        decision = next(
-            record
-            for record in records
-            if record["type"] == "concurrency.decision"
-            and record["trigger_event_id"] == "rate-limit-17"
-        )
         pause_change = next(
             record
             for record in records
@@ -518,7 +509,7 @@ def test_audit_log_causally_links_verified_429_backoff_and_paused_trials(tmp_pat
         )
 
         assert rate_limit["event_id"] == "rate-limit-17"
-        assert rate_limit["verified"] is True
+        assert "verified" not in rate_limit
         assert rate_limit["evidence"] == "http_status_429"
         assert rate_limit["signal"] == {
             "request_id": "request-8",
@@ -530,56 +521,19 @@ def test_audit_log_causally_links_verified_429_backoff_and_paused_trials(tmp_pat
             "effort": "high",
         }
         assert rate_limit["concurrency_group"] == expected_group
-        assert decision["action"] == "backoff"
-        assert decision["concurrency_group"] == expected_group
-        assert decision["trigger_event_id"] == rate_limit["event_id"]
-        assert decision["capacity_before"] == 3
-        assert decision["capacity_after"] == 2
-        assert decision["recovery_probes_enabled"] is True
-        assert decision["trigger_rate_limit_count"] == 5
-        assert decision["rate_limit_count"] == 0
-        assert pause_change["cause_id"] == decision["decision_id"]
+        assert rate_limit["action"] == "backoff"
+        assert rate_limit["capacity_before"] == 3
+        assert rate_limit["capacity_after"] == 2
+        assert rate_limit["trigger_rate_limit_count"] == 5
+        assert rate_limit["rate_limit_count"] == 0
+        assert pause_change["cause_id"] == rate_limit["decision_id"]
         assert pause_change["concurrency_group"] == expected_group
         assert pause_change["paused_trial_ids"] == ["trial-2"]
         assert pause_change["running"] == 2
         assert pause_change["paused"] == 1
-
-    run(scenario())
-
-
-def test_unverified_rate_limit_is_audited_without_adjusting_capacity(tmp_path):
-    async def scenario():
-        audit_path = tmp_path / "job.log"
-        handler = logging.FileHandler(audit_path)
-        handler.setLevel(logging.DEBUG)
-        logger.addHandler(handler)
-        try:
-            limiter = ResizableLimiter(10)
-            controller = make_controller(
-                limiter=limiter,
-            )
-            await controller.handle(
-                PierEvent(
-                    type="inference.rate_limited",
-                    trial_id="trial-1",
-                    event_id="heuristic-1",
-                    verified=False,
-                    evidence="agent_output_heuristic",
-                ),
-                now=10**9,
-            )
-        finally:
-            logger.removeHandler(handler)
-            handler.close()
-
-        records = decode_audit_lines(audit_path.read_text())
-        decision = next(
-            record for record in records if record["type"] == "concurrency.decision"
-        )
-        assert limiter.capacity == 10
-        assert decision["action"] == "ignored_unverified"
-        assert decision["trigger_event_id"] == "heuristic-1"
-        assert decision["capacity_before"] == decision["capacity_after"] == 10
+        assert len(records) == 6
+        assert sum(record["type"] == "inference.rate_limit" for record in records) == 5
+        assert sum(record["type"] == "request.pause_changed" for record in records) == 1
 
     run(scenario())
 
@@ -615,20 +569,14 @@ def test_group_lifecycle_and_stable_ramp_are_audited(tmp_path):
             handler.close()
 
         records = decode_audit_lines(audit_path.read_text())
-        assert [
-            record["type"]
-            for record in records
-            if record["type"].startswith("concurrency.")
-        ] == [
+        assert [record["type"] for record in records] == [
             "concurrency.group_initialized",
-            "concurrency.decision",
+            "concurrency.ramp",
             "concurrency.group_finalized",
         ]
         ramp = next(
-            record for record in records if record["type"] == "concurrency.decision"
+            record for record in records if record["type"] == "concurrency.ramp"
         )
-        assert ramp["action"] == "ramp"
-        assert ramp["trigger_event_id"] is None
         assert ramp["capacity_before"] == 1
         assert ramp["capacity_after"] == 2
 
@@ -662,20 +610,35 @@ def test_paused_rollouts_count_as_demand_for_ramping():
     run(scenario())
 
 
-def test_retry_after_is_broadcast_without_changing_learned_capacity(monkeypatch):
+def test_retry_after_is_broadcast_and_audited_without_changing_capacity(
+    monkeypatch, tmp_path
+):
     async def scenario():
+        audit_path = tmp_path / "job.log"
+        handler = logging.FileHandler(audit_path)
+        handler.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
         manager = RequestThrottlingManager(2)
         pause_queue = asyncio.Queue()
-        await manager.register("trial", pause_messages=pause_queue)
-        pause_queue.get_nowait()
-        monkeypatch.setattr("pier.concurrency.time.time", lambda: 100.0)
+        try:
+            await manager.register("trial", pause_messages=pause_queue)
+            pause_queue.get_nowait()
+            monkeypatch.setattr("pier.concurrency.time.time", lambda: 100.0)
 
-        await manager.apply_retry_after(7.5)
+            await manager.apply_retry_after(7.5, cause_id="rate-limit-1")
+        finally:
+            logger.removeHandler(handler)
+            handler.close()
 
         message = decode_control(pause_queue.get_nowait())
         assert message["paused"] is False
         assert message["not_before"] == 107.5
         assert manager.capacity == 2
+        records = decode_audit_lines(audit_path.read_text())
+        assert len(records) == 1
+        assert records[0]["type"] == "request.retry_after_applied"
+        assert records[0]["cause_id"] == "rate-limit-1"
+        assert records[0]["controlled_trial_ids"] == ["trial"]
 
     run(scenario())
 
@@ -709,14 +672,13 @@ def test_controller_probes_up_then_returns_to_recovery_floor_on_429():
                 trial_id="trial-1",
                 provider="openai",
                 model="gpt-5",
-                verified=True,
             ),
         )
         assert limiter.capacity == 2
         assert limiter.admitted == 3
         assert controller.recovery_floor == 2
         assert controller.current_probe_capacity is None
-        assert controller.recovery_probes_enabled is False
+        assert controller.recovery_ceiling == 2
         assert not await controller.maybe_ramp(now=10**9 + 10_000)
 
         # A burst from requests that were already in flight is one pressure event.
@@ -724,7 +686,6 @@ def test_controller_probes_up_then_returns_to_recovery_floor_on_429():
             PierEvent(
                 type="inference.rate_limited",
                 trial_id="trial-2",
-                verified=True,
             ),
             now=10**9 + 2,
         )
@@ -796,9 +757,9 @@ def test_controller_uses_percentage_steps_at_high_concurrency():
         await deliver_backoff_threshold(controller, now=10**9 + 1)
         assert limiter.capacity == 100
         assert controller.known_bad_capacity == 110
-        assert controller.recovery_probes_enabled is False
+        assert controller.recovery_ceiling == 99
 
-        # Once pressure is observed, elapsed quiet time never re-enables ramps.
+        # The learned ceiling prevents immediately retrying the failed capacity.
         assert not await controller.maybe_ramp(now=10**9 + 10_000)
         assert limiter.capacity == 100
 
@@ -820,12 +781,11 @@ def test_pressure_at_current_capacity_starts_bounded_recovery():
         assert controller.known_bad_capacity == 100
         assert controller.recovery_ceiling == 90
         assert limiter.capacity == 67
-        assert controller.recovery_probes_enabled is True
 
     run(scenario())
 
 
-def test_backoff_requires_five_verified_signals_at_the_current_capacity():
+def test_backoff_requires_five_rate_limit_signals_at_the_current_capacity():
     async def scenario():
         limiter = ResizableLimiter(80)
         controller = make_controller(
@@ -837,7 +797,6 @@ def test_backoff_requires_five_verified_signals_at_the_current_capacity():
                 PierEvent(
                     type="inference.rate_limited",
                     trial_id=f"trial-{index}",
-                    verified=True,
                     capacity_period=0,
                 ),
                 now=10**9,
@@ -848,7 +807,6 @@ def test_backoff_requires_five_verified_signals_at_the_current_capacity():
             PierEvent(
                 type="inference.rate_limited",
                 trial_id="trial-final",
-                verified=True,
                 capacity_period=0,
             ),
             now=10**9,
@@ -858,7 +816,7 @@ def test_backoff_requires_five_verified_signals_at_the_current_capacity():
     run(scenario())
 
 
-def test_verified_pressure_restarts_the_quiet_window_without_forcing_backoff():
+def test_rate_limit_pressure_restarts_the_quiet_window_without_forcing_backoff():
     async def scenario():
         base = 10**9
         limiter = ResizableLimiter(100)
@@ -876,7 +834,6 @@ def test_verified_pressure_restarts_the_quiet_window_without_forcing_backoff():
             PierEvent(
                 type="inference.rate_limited",
                 trial_id="single-pressure-signal",
-                verified=True,
                 capacity_period=1,
             ),
             now=base + 200,
@@ -921,12 +878,12 @@ def test_backoff_recovers_in_bounded_steps_below_known_bad():
         assert limiter.capacity == 72
         await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
 
-        # The ceiling itself gets one full quiet observation window. It then
-        # becomes known-good and upward exploration stops for the group.
+        # The ceiling itself gets one full quiet observation window, then holds
+        # without permanently disabling later recovery from a lower capacity.
         assert not await controller.maybe_ramp(now=base + 1200)
         assert controller.recovery_floor == 72
         assert controller.current_probe_capacity is None
-        assert controller.recovery_probes_enabled is False
+        assert not await controller.maybe_ramp(now=base + 1500)
 
         for _ in range(72):
             await limiter.release()
@@ -934,7 +891,7 @@ def test_backoff_recovers_in_bounded_steps_below_known_bad():
     run(scenario())
 
 
-def test_failed_recovery_probe_returns_to_known_good_and_locks_ramps():
+def test_failed_recovery_probe_can_recover_again_after_a_later_backoff():
     async def scenario():
         base = 10**9
         limiter = ResizableLimiter(80)
@@ -964,10 +921,28 @@ def test_failed_recovery_probe_returns_to_known_good_and_locks_ramps():
         assert controller.known_bad_capacity == 60
         assert controller.recovery_floor == 54
         assert controller.current_probe_capacity is None
-        assert controller.recovery_probes_enabled is False
-        assert not await controller.maybe_ramp(now=base + 10_000)
+        assert not await controller.maybe_ramp(now=base + 600)
 
-        for _ in range(60):
+        # More pressure can establish a lower floor. Recovery remains available
+        # from that lower capacity rather than being disabled for the run.
+        await deliver_backoff_threshold(
+            controller,
+            now=base + 601,
+            capacity_period=3,
+        )
+        assert limiter.capacity == 36
+        assert controller.recovery_floor == 36
+        assert controller.recovery_ceiling == 48
+
+        for _ in range(24):
+            await limiter.release()
+        waiter = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0)
+        assert await controller.maybe_ramp(now=base + 901)
+        await asyncio.wait_for(waiter, timeout=1)
+        assert limiter.capacity == 40
+
+        for _ in range(37):
             await limiter.release()
 
     run(scenario())
@@ -992,7 +967,6 @@ def test_continuous_fresh_429s_can_backoff_once_per_fixed_interval():
                 PierEvent(
                     type="inference.rate_limited",
                     trial_id=f"fresh-{now}",
-                    verified=True,
                     capacity_period=1,
                 ),
                 now=now,
@@ -1005,7 +979,6 @@ def test_continuous_fresh_429s_can_backoff_once_per_fixed_interval():
             PierEvent(
                 type="inference.rate_limited",
                 trial_id="fresh-160",
-                verified=True,
                 capacity_period=1,
             ),
             now=160,
@@ -1033,7 +1006,6 @@ def test_only_requests_started_after_latest_reduction_can_backoff_again():
                 PierEvent(
                     type="inference.rate_limited",
                     trial_id=trial_id,
-                    verified=True,
                     capacity_period=period,
                 ),
                 now=200,
@@ -1048,7 +1020,6 @@ def test_only_requests_started_after_latest_reduction_can_backoff_again():
             PierEvent(
                 type="inference.rate_limited",
                 trial_id="formerly-fresh",
-                verified=True,
                 capacity_period=1,
             ),
             now=300,
@@ -1080,7 +1051,6 @@ def test_dynamic_pool_isolates_provider_model_effort_groups():
                     provider="openai",
                     model="gpt-5",
                     effort="high",
-                    verified=True,
                 )
             )
         for _ in range(10):
@@ -1096,7 +1066,7 @@ def test_dynamic_pool_isolates_provider_model_effort_groups():
     run(scenario())
 
 
-def test_telemetry_decoder_accepts_protocol_and_text_fallback():
+def test_telemetry_decoder_accepts_structured_evidence_and_ignores_plain_text():
     async def scenario():
         events = []
 
@@ -1120,6 +1090,17 @@ def test_telemetry_decoder_accepts_protocol_and_text_fallback():
         encoded = EVENT_PREFIX + json.dumps(record) + "\n"
         await decoder.feed(encoded[:12])
         await decoder.feed(encoded[12:])
+        await decoder.feed(
+            EVENT_PREFIX
+            + json.dumps(
+                {
+                    "type": "model.request.rate_limited",
+                    "evidence": "typed_rate_limit_error",
+                    "capacity_period": 8,
+                }
+            )
+            + "\n"
+        )
         await decoder.feed("litellm.RateLimitError: HTTP 429 retry-after: 4\n")
         await decoder.feed("normal verbose model output\n")
         await decoder.flush()
@@ -1128,13 +1109,10 @@ def test_telemetry_decoder_accepts_protocol_and_text_fallback():
         assert events[0].retry_after_sec == 2.5
         assert events[0].provider == "openai"
         assert events[0].effort == "high"
-        assert events[0].verified is True
         assert events[0].evidence == "http_status_429"
         assert events[0].capacity_period == 7
-        assert events[1].retry_after_sec == 4
-        assert events[1].payload == {"source": "agent_output_heuristic"}
-        assert events[1].verified is False
-        assert events[1].evidence == "agent_output_heuristic"
+        assert events[1].evidence == "typed_rate_limit_error"
+        assert events[1].capacity_period == 8
 
     run(scenario())
 
@@ -1161,7 +1139,7 @@ def test_telemetry_decoder_ignores_malformed_fields_without_stopping_stream():
             + json.dumps(
                 {
                     "type": "model.request.rate_limited",
-                    "verified": True,
+                    "status_code": 429,
                     "retry_after_sec": "invalid",
                     "capacity_period": "invalid",
                 }
@@ -1170,7 +1148,6 @@ def test_telemetry_decoder_ignores_malformed_fields_without_stopping_stream():
         )
 
         assert len(events) == 1
-        assert events[0].verified is True
         assert events[0].retry_after_sec is None
         assert events[0].capacity_period is None
 
