@@ -49,6 +49,8 @@ class ClaudeCode(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
     memory_dir: str | None
 
+    _OUTPUT_FILENAME = "claude-code.txt"
+
     CLI_FLAGS = [
         CliFlag(
             "max_turns",
@@ -672,27 +674,37 @@ class ClaudeCode(BaseInstalledAgent):
         flush()
         return result
 
-    def _parse_total_cost_from_stream_json(self) -> float | None:
-        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+    def _iter_stream_events(self):
+        """Yield parsed JSON events from the teed stdout stream.
 
-        Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to stdout,
-        which Pier tees to ``<logs_dir>/claude-code.txt``. Returns ``None`` if
-        the file is missing, malformed, or the result event lacks the field.
+        Skips blank/non-JSON lines. Decode errors are replaced rather than
+        raised (the agent can be killed mid-write), and an OSError — missing
+        file included — simply ends the stream.
         """
-        stream_path = self.logs_dir / "claude-code.txt"
+        stream_path = self.logs_dir / self._OUTPUT_FILENAME
         try:
-            content = stream_path.read_text(encoding="utf-8")
+            with open(stream_path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
         except OSError:
-            return None
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            return
+
+    def _parse_total_cost_from_stream_json(self) -> float | None:
+        """Extract authoritative `total_cost_usd` from the CLI's stdout stream.
+
+        The `--output-format=stream-json --print` mode emits a final
+        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to
+        stdout, which Pier tees to ``<logs_dir>/<_OUTPUT_FILENAME>``. Returns
+        ``None`` if the file is missing, malformed, or the result event lacks
+        the field.
+        """
+        for event in self._iter_stream_events():
             if event.get("type") == "result":
                 cost = event.get("total_cost_usd")
                 if cost is None:
@@ -728,6 +740,12 @@ class ClaudeCode(BaseInstalledAgent):
         if not raw_events:
             return None
 
+        return self._convert_raw_events_to_trajectory(raw_events, session_dir.name)
+
+    def _convert_raw_events_to_trajectory(
+        self, raw_events: list[dict[str, Any]], fallback_session_id: str
+    ) -> Trajectory | None:
+        """Convert already-loaded session events into an ATIF trajectory."""
         raw_events.sort(key=lambda e: e.get("timestamp", ""))
         events = [event for event in raw_events if event.get("isSidechain")] + [
             event for event in raw_events if not event.get("isSidechain")
@@ -735,7 +753,7 @@ class ClaudeCode(BaseInstalledAgent):
         if not events:
             return None
 
-        session_id: str = session_dir.name
+        session_id: str = fallback_session_id
         for event in events:
             sid = event.get("sessionId")
             if isinstance(sid, str):
@@ -748,6 +766,11 @@ class ClaudeCode(BaseInstalledAgent):
             if isinstance(ver, str) and ver:
                 agent_version = ver
                 break
+        if agent_version == "unknown":
+            # _version is the constructor pin or post-install detection; the
+            # installers install exact pinned versions (or fail the setup),
+            # so this reflects the installed build for practical purposes.
+            agent_version = self.version() or agent_version
 
         cwds = {
             event.get("cwd")
@@ -1100,7 +1123,7 @@ class ClaudeCode(BaseInstalledAgent):
             schema_version="ATIF-v1.7",
             session_id=session_id,
             agent=Agent(
-                name=AgentName.CLAUDE_CODE.value,
+                name=self.name(),
                 version=agent_version,
                 model_name=default_model_name,
                 extra=agent_extra,
@@ -1110,6 +1133,23 @@ class ClaudeCode(BaseInstalledAgent):
         )
 
         return trajectory
+
+    def _write_trajectory(self, trajectory: Trajectory, context: AgentContext) -> None:
+        """Persist the trajectory to logs_dir and propagate final metrics."""
+        trajectory_path = self.logs_dir / "trajectory.json"
+        try:
+            with open(trajectory_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    trajectory.to_json_dict(), handle, indent=2, ensure_ascii=False
+                )
+            self.logger.debug(f"Wrote {self.name()} trajectory to {trajectory_path}")
+        except OSError as exc:
+            self.logger.debug(
+                f"Failed to write trajectory file {trajectory_path}: {exc}"
+            )
+
+        if trajectory.final_metrics:
+            populate_context_from_final_metrics(context, trajectory.final_metrics)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         session_dir = self._get_session_dir()
@@ -1128,20 +1168,7 @@ class ClaudeCode(BaseInstalledAgent):
             self.logger.debug("Failed to convert Claude Code session to trajectory")
             return
 
-        trajectory_path = self.logs_dir / "trajectory.json"
-        try:
-            with open(trajectory_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    trajectory.to_json_dict(), handle, indent=2, ensure_ascii=False
-                )
-            self.logger.debug(f"Wrote Claude Code trajectory to {trajectory_path}")
-        except OSError as exc:
-            self.logger.debug(
-                f"Failed to write trajectory file {trajectory_path}: {exc}"
-            )
-
-        if trajectory.final_metrics:
-            populate_context_from_final_metrics(context, trajectory.final_metrics)
+        self._write_trajectory(trajectory, context)
 
     def _build_register_skills_command(self) -> str | None:
         """Return a shell command that copies skills from the environment to Claude's config.
@@ -1332,6 +1359,7 @@ class ClaudeCode(BaseInstalledAgent):
 
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
+        output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
 
         await self.exec_as_agent(
             environment,
@@ -1346,7 +1374,7 @@ class ClaudeCode(BaseInstalledAgent):
                 f"--permission-mode=bypassPermissions "
                 f"{extra_flags}"
                 f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
-                f"/logs/agent/claude-code.txt"
+                f"{output_path}"
             ),
             env=env,
         )
