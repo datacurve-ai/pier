@@ -34,6 +34,7 @@ from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats
 from pier.models.trial.config import TaskConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
 from pier.models.trial.result import TrialResult
+from pier.telemetry import TelemetrySnapshot
 from pier.trial.hooks import HookCallback, TrialEvent, TrialHookEvent
 from pier.trial.queue import TrialQueue
 from pier.utils.logger import logger
@@ -139,6 +140,7 @@ class Job:
         self._trial_queue = TrialQueue(
             n_concurrent=self.config.n_concurrent_trials,
             optimize_concurrency=self.config.optimize_concurrency,
+            telemetry=TelemetrySnapshot(self.job_dir / "logs" / "telemetry.json"),
             retry_config=self.config.retry,
         )
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)

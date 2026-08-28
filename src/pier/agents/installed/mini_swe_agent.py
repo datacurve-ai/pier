@@ -785,7 +785,7 @@ mini-swe-agent --help
         self,
         *,
         custom_config_path: str | None = None,
-        request_throttling: bool = False,
+        telemetry: bool = False,
     ) -> str:
         config_flags = "-c mini.yaml "
 
@@ -796,9 +796,7 @@ mini-swe-agent --help
             config_flags += f"-c {custom_config_path} "
 
         model_class = (
-            "pier_minisweagent.PierModel"
-            if request_throttling
-            else self._model_class_override
+            "pier_minisweagent.PierModel" if telemetry else self._model_class_override
         )
         if model_class:
             config_flags += f"-c model.model_class={shlex.quote(model_class)} "
@@ -873,14 +871,16 @@ mini-swe-agent --help
             }
         )
         telemetry_context = current_telemetry_context()
+        telemetry = telemetry_context is not None
         request_throttling = bool(
-            telemetry_context is not None
+            telemetry
             and telemetry_context.pause_messages is not None
             and environment.capabilities.exec_stdin
         )
-        if request_throttling:
+        if telemetry:
             env["PIER_MINISWE_BASE_MODEL_CLASS"] = self._model_class_override or ""
             env["PIER_MINISWE_MODEL_NAME"] = run_model_name
+            env["PIER_REQUEST_THROTTLING"] = "1" if request_throttling else "0"
 
         if self._get_env("MSWEA_API_KEY"):
             env["MSWEA_API_KEY"] = self._get_env("MSWEA_API_KEY") or ""
@@ -925,7 +925,7 @@ mini-swe-agent --help
 
         config_flags = self._build_config_flags(
             custom_config_path=custom_config_path,
-            request_throttling=request_throttling,
+            telemetry=telemetry,
         )
         stdin_redirect = "" if request_throttling else " </dev/null"
 

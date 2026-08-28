@@ -27,10 +27,10 @@ from pier.request_throttling import (
 from pier.telemetry import (
     CONCURRENCY_LOG_PREFIX,
     EVENT_PREFIX,
-    EventBus,
     PierEvent,
     TelemetryContext,
     TelemetryDecoder,
+    TelemetrySnapshot,
     current_telemetry_context,
 )
 from pier.trial.queue import TrialQueue
@@ -180,6 +180,61 @@ def test_dynamic_mini_swe_modal_trial_gets_initial_request_pause_state():
     run(scenario())
 
 
+def test_fixed_concurrency_still_collects_telemetry(tmp_path):
+    async def scenario():
+        telemetry_path = tmp_path / "logs" / "telemetry.json"
+        queue = TrialQueue(
+            n_concurrent=3,
+            telemetry=TelemetrySnapshot(telemetry_path),
+        )
+        config = SimpleNamespace(
+            trial_name="trial-one",
+            agent=AgentConfig(
+                name="mini-swe-agent",
+                model_name="openai/gpt-5.5",
+            ),
+            environment=EnvironmentConfig(type=EnvironmentType.MODAL),
+        )
+
+        async def execute(_config):
+            context = current_telemetry_context()
+            assert context is not None
+            assert context.pause_messages is None
+            await context.sink(
+                PierEvent(
+                    type="model.request.completed",
+                    trial_id="trial-one",
+                    provider="openai",
+                    model="gpt-5.5",
+                    payload={
+                        "producer_id": "producer-one",
+                        "sequence": 1,
+                        "input_tokens": 100,
+                        "cached_input_tokens": 20,
+                        "output_tokens": 30,
+                        "agent_steps": 1,
+                        "tool_calls": 1,
+                        "cost_usd": 0.05,
+                        "first_response_at": 1_800_000_000.0,
+                        "last_response_at": 1_800_000_001.0,
+                        "buckets": {},
+                    },
+                )
+            )
+            return "done"
+
+        queue._execute_trial_with_retries = execute
+        await queue.start()
+        assert await queue.submit(config) == "done"
+        await queue.stop()
+
+        document = json.loads(telemetry_path.read_text())
+        assert document["current_concurrency"] == 3
+        assert document["totals"]["input_tokens"] == 100
+
+    run(scenario())
+
+
 def test_live_concurrency_column_shows_each_concurrency_group():
     async def scenario():
         queue = TrialQueue(n_concurrent=4, optimize_concurrency=True)
@@ -202,14 +257,18 @@ def test_live_concurrency_column_shows_each_concurrency_group():
 
         rendered = _ConcurrencyColumn(queue).render(None).plain
 
+        assert queue.current_concurrency == 9
         assert "anthropic/claude/low running=1 capacity=4 queued=0 paused=0" in rendered
         assert "openai/gpt-5/high running=2 capacity=5 queued=0 paused=0" in rendered
 
         await high_manager.unregister("high-1")
         await high_manager.unregister("high-2")
+        await high.release()
+        await high.release()
+
+        assert queue.current_concurrency == 4
+
         await low_manager.unregister("low-1")
-        await high.release()
-        await high.release()
         await low.release()
 
     run(scenario())
@@ -545,9 +604,7 @@ def test_group_lifecycle_and_stable_ramp_are_audited(tmp_path):
         handler.setLevel(logging.DEBUG)
         logger.addHandler(handler)
         try:
-            bus = EventBus()
             pool = DynamicConcurrencyPool(
-                events=bus,
                 initial_capacity=1,
                 ramp_interval_sec=1,
             )
@@ -562,8 +619,7 @@ def test_group_lifecycle_and_stable_ramp_are_audited(tmp_path):
             await limiter.release()
             await limiter.release()
 
-            await bus.close()
-            await pool.run()
+            pool.finalize()
         finally:
             logger.removeHandler(handler)
             handler.close()
@@ -1031,9 +1087,7 @@ def test_only_requests_started_after_latest_reduction_can_backoff_again():
 
 def test_dynamic_pool_isolates_provider_model_effort_groups():
     async def scenario():
-        bus = EventBus()
         pool = DynamicConcurrencyPool(
-            events=bus,
             initial_capacity=2,
             ramp_interval_sec=1,
         )
@@ -1042,9 +1096,8 @@ def test_dynamic_pool_isolates_provider_model_effort_groups():
         await high.resize(3)
         await low.resize(4)
 
-        task = asyncio.create_task(pool.run())
         for index in range(BACKOFF_SIGNAL_THRESHOLD):
-            await bus.publish(
+            await pool.handle(
                 PierEvent(
                     type="inference.rate_limited",
                     trial_id=f"trial-high-{index}",
@@ -1053,13 +1106,6 @@ def test_dynamic_pool_isolates_provider_model_effort_groups():
                     effort="high",
                 )
             )
-        for _ in range(10):
-            if high.capacity == 2:
-                break
-            await asyncio.sleep(0)
-        await bus.close()
-        await task
-
         assert high.capacity == 2
         assert low.capacity == 4
 
@@ -1152,3 +1198,86 @@ def test_telemetry_decoder_ignores_malformed_fields_without_stopping_stream():
         assert events[0].capacity_period is None
 
     run(scenario())
+
+
+def test_telemetry_decoder_accepts_cumulative_request_usage():
+    async def scenario():
+        events = []
+
+        async def sink(event):
+            events.append(event)
+
+        decoder = TelemetryDecoder(
+            TelemetryContext(
+                sink=sink,
+                trial_id="trial-1",
+                provider="openai",
+                model="gpt-5",
+                effort="high",
+            )
+        )
+        record = {
+            "type": "model.request.completed",
+            "producer_id": "producer-1",
+            "sequence": 2,
+            "input_tokens": 120,
+            "cached_input_tokens": 20,
+            "output_tokens": 30,
+            "agent_steps": 2,
+            "tool_calls": 1,
+            "cost_usd": 0.04,
+            "first_response_at": 1_800_000_000.0,
+            "last_response_at": 1_800_000_010.0,
+            "buckets": {
+                "30000000": {"tokens": 150, "requests": 2},
+            },
+        }
+
+        await decoder.feed(EVENT_PREFIX + json.dumps(record) + "\n")
+
+        assert len(events) == 1
+        assert events[0].type == "model.request.completed"
+        assert events[0].trial_id == "trial-1"
+        assert events[0].provider == "openai"
+        assert events[0].payload["sequence"] == 2
+        assert events[0].payload["input_tokens"] == 120
+
+    run(scenario())
+
+
+def test_telemetry_snapshot_deduplicates_and_uses_job_capacity(tmp_path):
+    snapshot = TelemetrySnapshot(
+        tmp_path / "logs" / "telemetry.json",
+    )
+    payload = {
+        "producer_id": "producer-1",
+        "sequence": 1,
+        "input_tokens": 100,
+        "cached_input_tokens": 20,
+        "output_tokens": 40,
+        "agent_steps": 1,
+        "tool_calls": 2,
+        "cost_usd": 0.03,
+        "first_response_at": 1_800_000_000.0,
+        "last_response_at": 1_800_000_001.0,
+        "buckets": {},
+    }
+    event = PierEvent(
+        type="model.request.completed",
+        trial_id="trial-1",
+        provider="openai",
+        model="gpt-5",
+        effort="high",
+        payload=payload,
+    )
+
+    snapshot.record(event)
+    snapshot.record(event)
+    assert snapshot.build(128)["current_concurrency"] == 128
+
+    document = snapshot.build(126)
+
+    assert document["current_concurrency"] == 126
+    assert document["totals"]["input_tokens"] == 100
+    assert document["totals"]["agent_steps"] == 1
+    assert document["groups"][0]["model_name"] == "openai/gpt-5"

@@ -11,7 +11,6 @@ from pier.request_throttling import (
     RequestThrottlingManager,
 )
 from pier.telemetry import (
-    EventBus,
     PierEvent,
     concurrency_group_fields as _concurrency_group,
     log_concurrency_event as _log_concurrency_event,
@@ -410,14 +409,12 @@ class DynamicConcurrencyPool:
     def __init__(
         self,
         *,
-        events: EventBus,
         initial_capacity: int,
         ramp_interval_sec: float = STABILITY_WINDOW_SEC,
         cooldown_sec: float = COOLDOWN_SEC,
     ) -> None:
         if initial_capacity < 1:
             raise ValueError("initial_capacity must be at least 1")
-        self.events = events
         self.initial_capacity = initial_capacity
         self.ramp_interval_sec = ramp_interval_sec
         self.cooldown_sec = cooldown_sec
@@ -515,24 +512,22 @@ class DynamicConcurrencyPool:
             ),
         )
 
-    async def run(self) -> None:
-        poll_interval = min(1.0, max(0.05, self.ramp_interval_sec))
-        while True:
-            try:
-                event = await asyncio.wait_for(
-                    self.events.next(), timeout=poll_interval
-                )
-            except TimeoutError:
-                for controller in tuple(self._controllers.values()):
-                    await controller.maybe_ramp()
-                continue
-            if event is None:
-                for controller in self._controllers.values():
-                    controller.audit_finalized()
-                return
-            controller = self._controller_for(
-                event.provider,
-                event.model,
-                event.effort,
-            )
-            await controller.handle(event)
+    async def handle(self, event: PierEvent) -> bool:
+        """Apply one rate-limit event and report whether capacity changed."""
+        if event.type != "inference.rate_limited":
+            return False
+        controller = self._controller_for(event.provider, event.model, event.effort)
+        previous = controller.limiter.capacity
+        await controller.handle(event)
+        return controller.limiter.capacity != previous
+
+    async def maybe_ramp(self) -> bool:
+        """Probe every concurrency group and report whether any capacity changed."""
+        changed = False
+        for controller in tuple(self._controllers.values()):
+            changed = await controller.maybe_ramp() or changed
+        return changed
+
+    def finalize(self) -> None:
+        for controller in self._controllers.values():
+            controller.audit_finalized()

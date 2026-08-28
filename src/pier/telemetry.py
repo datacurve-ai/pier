@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
@@ -94,6 +97,16 @@ class _RateLimitSignal:
     capacity_period: int | None
 
 
+_USAGE_METRICS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "agent_steps",
+    "tool_calls",
+    "cost_usd",
+)
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None
@@ -108,13 +121,7 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-def _structured_rate_limit(line: str) -> _RateLimitSignal | None:
-    try:
-        payload = json.loads(line[len(EVENT_PREFIX) :])
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
+def _structured_rate_limit(payload: dict[str, Any]) -> _RateLimitSignal | None:
     if payload.get("type") not in {
         "inference.rate_limited",
         "model.request.rate_limited",
@@ -140,6 +147,68 @@ def _structured_rate_limit(line: str) -> _RateLimitSignal | None:
         evidence=evidence,
         capacity_period=_int_or_none(payload.get("capacity_period")),
     )
+
+
+def _nonnegative_number(value: Any, *, integer: bool = False) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not math.isfinite(float(value)) or value < 0:
+        return None
+    return int(value) if integer else float(value)
+
+
+def _structured_request_completed(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if payload.get("type") != "model.request.completed":
+        return None
+    producer_id = payload.get("producer_id")
+    sequence = _nonnegative_number(payload.get("sequence"), integer=True)
+    if (
+        not isinstance(producer_id, str)
+        or not producer_id
+        or len(producer_id) > 128
+        or sequence is None
+        or sequence < 1
+    ):
+        return None
+
+    sanitized: dict[str, Any] = {
+        "producer_id": producer_id,
+        "sequence": sequence,
+    }
+    for metric in _USAGE_METRICS:
+        value = _nonnegative_number(
+            payload.get(metric),
+            integer=metric != "cost_usd",
+        )
+        if value is None:
+            return None
+        sanitized[metric] = value
+
+    for timestamp_field in ("first_response_at", "last_response_at"):
+        value = _nonnegative_number(payload.get(timestamp_field))
+        if value is None:
+            return None
+        sanitized[timestamp_field] = value
+
+    buckets = payload.get("buckets")
+    if not isinstance(buckets, dict) or len(buckets) > 25:
+        return None
+    sanitized_buckets: dict[str, dict[str, int]] = {}
+    for minute, bucket in buckets.items():
+        if not isinstance(minute, str) or not minute.lstrip("-").isdigit():
+            return None
+        if not isinstance(bucket, dict):
+            return None
+        tokens = _nonnegative_number(bucket.get("tokens"), integer=True)
+        requests = _nonnegative_number(bucket.get("requests"), integer=True)
+        if tokens is None or requests is None:
+            return None
+        sanitized_buckets[minute] = {
+            "tokens": tokens,
+            "requests": requests,
+        }
+    sanitized["buckets"] = sanitized_buckets
+    return sanitized
 
 
 _CURRENT_CONTEXT: ContextVar[TelemetryContext | None] = ContextVar(
@@ -182,7 +251,28 @@ class TelemetryDecoder:
         line = line.strip()
         if not line.startswith(EVENT_PREFIX):
             return
-        signal = _structured_rate_limit(line)
+        try:
+            payload = json.loads(line[len(EVENT_PREFIX) :])
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+
+        completed = _structured_request_completed(payload)
+        if completed is not None:
+            await self._context.sink(
+                PierEvent(
+                    type="model.request.completed",
+                    trial_id=self._context.trial_id,
+                    provider=self._context.provider,
+                    model=self._context.model,
+                    effort=self._context.effort,
+                    payload=completed,
+                )
+            )
+            return
+
+        signal = _structured_rate_limit(payload)
         if signal is None:
             return
 
@@ -218,3 +308,143 @@ class TelemetryDecoder:
                 },
             )
         )
+
+
+class TelemetrySnapshot:
+    """Aggregate cumulative request events into one compact atomic snapshot."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._producers: dict[tuple[str, str], dict[str, Any]] = {}
+        self._baseline_groups = self._load_baseline_groups()
+        self._last_write = 0.0
+
+    def _load_baseline_groups(self) -> list[dict[str, Any]]:
+        try:
+            document = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            return []
+        return document["groups"]
+
+    def record(self, event: PierEvent) -> None:
+        if event.type != "model.request.completed":
+            return
+        producer_id = event.payload["producer_id"]
+        sequence = event.payload["sequence"]
+        key = (event.trial_id, producer_id)
+        previous = self._producers.get(key)
+        if previous is not None and previous["sequence"] >= sequence:
+            return
+        model_name = "/".join(value for value in (event.provider, event.model) if value)
+        self._producers[key] = {
+            **event.payload,
+            "provider": event.provider,
+            "model": event.model,
+            "model_name": model_name,
+            "effort": event.effort,
+        }
+
+    @staticmethod
+    def _group_key(value: dict[str, Any]) -> tuple[Any, Any, Any]:
+        return value["provider"], value["model"], value["effort"]
+
+    def build(self, current_concurrency: int) -> dict[str, Any]:
+        groups: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+
+        def merge_group(source: dict[str, Any]) -> None:
+            key = self._group_key(source)
+            target = groups.setdefault(
+                key,
+                {
+                    "provider": source["provider"],
+                    "model": source["model"],
+                    "model_name": source["model_name"],
+                    "effort": source["effort"],
+                    **{
+                        metric: 0.0 if metric == "cost_usd" else 0
+                        for metric in _USAGE_METRICS
+                    },
+                    "buckets": {},
+                },
+            )
+            for metric in _USAGE_METRICS:
+                target[metric] += source[metric]
+            for minute, bucket in source["buckets"].items():
+                merged = target["buckets"].setdefault(
+                    str(minute), {"tokens": 0, "requests": 0}
+                )
+                merged["tokens"] += int(bucket.get("tokens") or 0)
+                merged["requests"] += int(bucket.get("requests") or 0)
+
+        for baseline in self._baseline_groups:
+            merge_group(baseline)
+        for producer in self._producers.values():
+            merge_group(producer)
+
+        oldest_minute = int(datetime.now(timezone.utc).timestamp() // 60) - 20
+        serialized_groups: list[dict[str, Any]] = []
+        totals = {
+            metric: 0.0 if metric == "cost_usd" else 0 for metric in _USAGE_METRICS
+        }
+        totals.update({"recent_tokens": 0, "recent_requests": 0})
+        for group in groups.values():
+            group["buckets"] = {
+                minute: bucket
+                for minute, bucket in group["buckets"].items()
+                if int(minute) >= oldest_minute
+            }
+            for metric in _USAGE_METRICS:
+                totals[metric] += group[metric]
+            group["recent_tokens"] = sum(
+                bucket["tokens"] for bucket in group["buckets"].values()
+            )
+            group["recent_requests"] = sum(
+                bucket["requests"] for bucket in group["buckets"].values()
+            )
+            totals["recent_tokens"] += group["recent_tokens"]
+            totals["recent_requests"] += group["recent_requests"]
+            serialized_groups.append(group)
+
+        return {
+            "schema_version": 1,
+            "observed_at": utc_now(),
+            "current_concurrency": current_concurrency,
+            "totals": totals,
+            "groups": sorted(
+                serialized_groups,
+                key=lambda group: (
+                    group["provider"] or "",
+                    group["model"] or "",
+                    group["effort"] or "",
+                ),
+            ),
+        }
+
+    def _write(self, document: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(document, separators=(",", ":"), sort_keys=True) + "\n"
+        )
+        temporary.replace(self.path)
+
+    async def maybe_write(
+        self,
+        current_concurrency: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = asyncio.get_running_loop().time()
+        if not force and now - self._last_write < 1.0:
+            return
+        self._last_write = now
+        try:
+            await asyncio.to_thread(self._write, self.build(current_concurrency))
+        except OSError as exc:
+            logger.getChild(__name__).warning(
+                "Failed to write telemetry snapshot %s: %s",
+                self.path,
+                exc,
+            )

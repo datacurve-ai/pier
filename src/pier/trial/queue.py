@@ -14,7 +14,12 @@ from pier.models.job.config import RetryConfig
 from pier.models.trial.config import TrialConfig
 from pier.models.trial.result import TrialResult
 from pier.request_throttling import AgentPauseMessageQueue
-from pier.telemetry import EventBus, TelemetryContext, bind_telemetry
+from pier.telemetry import (
+    EventBus,
+    TelemetryContext,
+    TelemetrySnapshot,
+    bind_telemetry,
+)
 from pier.trial.hooks import HookCallback, TrialEvent
 from pier.utils.logger import logger
 
@@ -33,6 +38,7 @@ class TrialQueue:
         self,
         n_concurrent: int,
         optimize_concurrency: bool = False,
+        telemetry: TelemetrySnapshot | None = None,
         retry_config: RetryConfig | None = None,
         hooks: dict[TrialEvent, list[HookCallback]] | None = None,
     ):
@@ -49,13 +55,14 @@ class TrialQueue:
         self._hooks = hooks
         self._logger = logger.getChild(__name__)
         self._fixed_limiter = ResizableLimiter(n_concurrent)
-        self._event_bus: EventBus | None = None
+        self._telemetry = telemetry
+        self._event_bus = (
+            EventBus() if optimize_concurrency or self._telemetry else None
+        )
         self._dynamic_pool: DynamicConcurrencyPool | None = None
-        self._controller_task: asyncio.Task[None] | None = None
+        self._event_task: asyncio.Task[None] | None = None
         if optimize_concurrency:
-            self._event_bus = EventBus()
             self._dynamic_pool = DynamicConcurrencyPool(
-                events=self._event_bus,
                 initial_capacity=n_concurrent,
             )
 
@@ -88,6 +95,21 @@ class TrialQueue:
             )
         ]
 
+    @property
+    def current_concurrency(self) -> int:
+        """Return Pier's single job-level capacity."""
+        snapshots = self.concurrency_snapshots()
+        active = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.running or snapshot.paused or snapshot.queued
+        ]
+        if active:
+            return sum(snapshot.capacity for snapshot in active)
+        if snapshots:
+            return sum(snapshot.capacity for snapshot in snapshots)
+        return self._n_concurrent
+
     @staticmethod
     def _concurrency_group(
         trial_config: TrialConfig,
@@ -102,20 +124,65 @@ class TrialQueue:
         return provider, model, str(effort) if effort is not None else None
 
     async def start(self) -> None:
-        """Start the adaptive controller. Fixed-concurrency queues are a no-op."""
-        if self._dynamic_pool is None or self._controller_task is not None:
+        """Start the job event processor."""
+        if self._event_bus is None or self._event_task is not None:
             return
-        self._controller_task = asyncio.create_task(
-            self._dynamic_pool.run(), name="pier-dynamic-concurrency"
+        await self._write_telemetry(force=True)
+        self._event_task = asyncio.create_task(
+            self._process_events(), name="pier-events"
         )
 
     async def stop(self) -> None:
-        """Stop the adaptive controller after all submitted trials finish."""
-        if self._event_bus is None or self._controller_task is None:
+        """Drain job events and write the final telemetry snapshot."""
+        if self._event_bus is None or self._event_task is None:
             return
         await self._event_bus.close()
-        await self._controller_task
-        self._controller_task = None
+        await self._event_task
+        self._event_task = None
+
+    async def _write_telemetry(self, *, force: bool = False) -> None:
+        if self._telemetry is not None:
+            await self._telemetry.maybe_write(
+                self.current_concurrency,
+                force=force,
+            )
+
+    async def _process_events(self) -> None:
+        assert self._event_bus is not None
+        poll_interval = (
+            min(1.0, max(0.05, self._dynamic_pool.ramp_interval_sec))
+            if self._dynamic_pool is not None
+            else None
+        )
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    self._event_bus.next(),
+                    timeout=poll_interval,
+                )
+            except TimeoutError:
+                assert self._dynamic_pool is not None
+                if await self._dynamic_pool.maybe_ramp():
+                    await self._write_telemetry()
+                continue
+
+            if event is None:
+                if self._dynamic_pool is not None:
+                    self._dynamic_pool.finalize()
+                await self._write_telemetry(force=True)
+                return
+
+            if self._telemetry is not None:
+                self._telemetry.record(event)
+            capacity_changed = (
+                await self._dynamic_pool.handle(event)
+                if self._dynamic_pool is not None
+                else False
+            )
+            if self._telemetry is not None and (
+                event.type == "model.request.completed" or capacity_changed
+            ):
+                await self._write_telemetry(force=capacity_changed)
 
     def add_hook(self, event: TrialEvent, callback: HookCallback) -> "TrialQueue":
         """Register a callback for a trial lifecycle event and return the queue."""
@@ -231,48 +298,55 @@ class TrialQueue:
         limiter = self._fixed_limiter
         concurrency_group: tuple[str | None, str | None, str | None] | None = None
 
-        if self._dynamic_pool is not None and self._event_bus is not None:
+        if self._dynamic_pool is not None:
             concurrency_group = self._concurrency_group(trial_config)
             limiter = self._dynamic_pool.limiter_for(*concurrency_group)
 
         async with limiter:
-            if (
-                concurrency_group is None
-                or self._dynamic_pool is None
-                or self._event_bus is None
-            ):
+            if self._event_bus is None:
                 return await self._execute_trial_with_retries(trial_config)
+            if concurrency_group is None:
+                concurrency_group = self._concurrency_group(trial_config)
 
-            supports_request_throttling = AgentFactory.supports_request_throttling(
-                trial_config.agent
-            ) and EnvironmentFactory.supports_exec_stdin(
-                trial_config.environment.type,
-                trial_config.environment.import_path,
+            supports_request_throttling = (
+                self._dynamic_pool is not None
+                and AgentFactory.supports_request_throttling(trial_config.agent)
+                and EnvironmentFactory.supports_exec_stdin(
+                    trial_config.environment.type,
+                    trial_config.environment.import_path,
+                )
             )
             pause_messages: AgentPauseMessageQueue | None = (
                 asyncio.Queue() if supports_request_throttling else None
             )
-            await self._dynamic_pool.register_trial(
-                *concurrency_group,
-                trial_id=trial_config.trial_name,
-                pause_messages=pause_messages,
-            )
-            context = TelemetryContext(
-                sink=self._event_bus.publish,
-                trial_id=trial_config.trial_name,
-                provider=concurrency_group[0],
-                model=concurrency_group[1],
-                effort=concurrency_group[2],
-                pause_messages=pause_messages,
-            )
+            if self._dynamic_pool is not None:
+                await self._dynamic_pool.register_trial(
+                    *concurrency_group,
+                    trial_id=trial_config.trial_name,
+                    pause_messages=pause_messages,
+                )
+                await self._write_telemetry()
             try:
+                context = TelemetryContext(
+                    sink=self._event_bus.publish,
+                    trial_id=trial_config.trial_name,
+                    provider=concurrency_group[0],
+                    model=concurrency_group[1],
+                    effort=concurrency_group[2],
+                    pause_messages=pause_messages,
+                )
                 with bind_telemetry(context):
                     return await self._execute_trial_with_retries(trial_config)
             finally:
-                await self._dynamic_pool.unregister_trial(
-                    *concurrency_group,
-                    trial_id=trial_config.trial_name,
-                )
+                if self._dynamic_pool is not None:
+                    previous_concurrency = self.current_concurrency
+                    await self._dynamic_pool.unregister_trial(
+                        *concurrency_group,
+                        trial_id=trial_config.trial_name,
+                    )
+                    await self._write_telemetry(
+                        force=self.current_concurrency != previous_concurrency
+                    )
 
     def submit(self, trial_config: TrialConfig) -> Coroutine[Any, Any, TrialResult]:
         """

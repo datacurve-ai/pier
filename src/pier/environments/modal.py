@@ -1269,12 +1269,16 @@ class ModalEnvironment(BaseEnvironment):
             secrets=[Secret.from_dict(env)] if env else [],  # type: ignore
             timeout=timeout_sec,
         )
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
+        # Stream callbacks consume telemetry immediately. Retain only a bounded
+        # diagnostic tail so long-running agents cannot grow coordinator memory
+        # in proportion to the number of telemetry records they emit.
+        capture_limit = 131_072
+        stdout_tail = [""]
+        stderr_tail = [""]
 
-        async def drain(stream, name: str, chunks: list[str]) -> None:
+        async def drain(stream, name: str, tail: list[str]) -> None:
             async for chunk in stream:
-                chunks.append(chunk)
+                tail[0] = (tail[0] + chunk)[-capture_limit:]
                 await on_output(name, chunk)
 
         async def forward_input() -> None:
@@ -1298,8 +1302,8 @@ class ModalEnvironment(BaseEnvironment):
             else None
         )
         output_task = asyncio.gather(
-            drain(process.stdout, "stdout", stdout_chunks),
-            drain(process.stderr, "stderr", stderr_chunks),
+            drain(process.stdout, "stdout", stdout_tail),
+            drain(process.stderr, "stderr", stderr_tail),
         )
         wait_task = asyncio.create_task(process.wait.aio(), name="pier-modal-exec-wait")
 
@@ -1325,8 +1329,8 @@ class ModalEnvironment(BaseEnvironment):
                 return_exceptions=True,
             )
         return ExecResult(
-            stdout="".join(stdout_chunks) or None,
-            stderr="".join(stderr_chunks) or None,
+            stdout=stdout_tail[0] or None,
+            stderr=stderr_tail[0] or None,
             return_code=return_code,
         )
 

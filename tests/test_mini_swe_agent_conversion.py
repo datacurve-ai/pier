@@ -53,13 +53,13 @@ def test_mini_swe_openai_uses_responses_model_class(tmp_path: Path):
     assert "-c model.model_kwargs.reasoning_effort=xhigh" in config_flags
 
 
-def test_mini_swe_request_throttling_wraps_the_selected_model_class(tmp_path: Path):
+def test_mini_swe_telemetry_wraps_the_selected_model_class(tmp_path: Path):
     agent = MiniSweAgent(
         logs_dir=tmp_path,
         model_name="openai/gpt-5.5",
     )
 
-    config_flags = agent._build_config_flags(request_throttling=True)
+    config_flags = agent._build_config_flags(telemetry=True)
 
     assert "-c model.model_class=pier_minisweagent.PierModel" in config_flags
     assert "model.model_class=litellm_response" not in config_flags
@@ -107,6 +107,47 @@ def test_mini_swe_dynamic_run_uses_bidirectional_request_throttling(
         assert "</dev/null" not in command
         assert calls[0]["env"]["PIER_MINISWE_BASE_MODEL_CLASS"] == ("litellm_response")
         assert calls[0]["env"]["PIER_MINISWE_MODEL_NAME"] == "openai/gpt-5.5"
+        assert calls[0]["env"]["PIER_REQUEST_THROTTLING"] == "1"
+
+    asyncio.run(scenario())
+
+
+def test_mini_swe_telemetry_does_not_require_request_throttling(tmp_path: Path):
+    async def scenario():
+        agent = MiniSweAgent(
+            logs_dir=tmp_path,
+            model_name="openai/gpt-5.5",
+            extra_env={"OPENAI_API_KEY": "test-key"},
+        )
+        calls = []
+
+        async def exec_as_agent(_environment, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(return_code=0)
+
+        agent.exec_as_agent = exec_as_agent
+
+        async def sink(_event):
+            return None
+
+        context = TelemetryContext(
+            sink=sink,
+            trial_id="trial",
+            provider="openai",
+            model="gpt-5.5",
+            effort=None,
+        )
+        environment = SimpleNamespace(
+            capabilities=SimpleNamespace(exec_stdin=True),
+        )
+
+        with bind_telemetry(context):
+            await agent.run("instruction", environment, AgentContext())
+
+        command = calls[0]["command"]
+        assert "model.model_class=pier_minisweagent.PierModel" in command
+        assert "</dev/null" in command
+        assert calls[0]["env"]["PIER_REQUEST_THROTTLING"] == "0"
 
     asyncio.run(scenario())
 
@@ -118,12 +159,22 @@ def test_injected_mini_swe_model_waits_for_initial_pause_state(tmp_path: Path):
     (package / "__init__.py").write_text(
         "class BaseModel:\n"
         "    def _query(self, messages, **kwargs):\n"
-        "        return 'request-complete'\n\n"
+        "        return {\n"
+        "            'usage': {\n"
+        "                'prompt_tokens': 100,\n"
+        "                'completion_tokens': 20,\n"
+        "                'prompt_tokens_details': {'cached_tokens': 40},\n"
+        "                'cost': 0.05,\n"
+        "            },\n"
+        "            'choices': [{'message': {'tool_calls': [{'id': 'call-1'}]}}],\n"
+        "        }\n\n"
         "def get_model_class(model_name, model_class):\n"
         "    return BaseModel\n"
     )
     (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
     script = (
+        "import os\n"
+        "os.environ['PIER_REQUEST_THROTTLING'] = '1'\n"
         "from pier_minisweagent import PierModel\n"
         "print('ready', flush=True)\n"
         "print(PierModel()._query([]), flush=True)\n"
@@ -151,7 +202,18 @@ def test_injected_mini_swe_model_waits_for_initial_pause_state(tmp_path: Path):
         process.stdin.write(json.dumps(message) + "\n")
         process.stdin.flush()
 
-        assert process.stdout.readline().strip() == "request-complete"
+        event_line = process.stdout.readline().strip()
+        assert event_line.startswith("PIER_EVENT ")
+        event = json.loads(event_line[len("PIER_EVENT ") :])
+        assert event["type"] == "model.request.completed"
+        assert event["sequence"] == 1
+        assert event["agent_steps"] == 1
+        assert event["input_tokens"] == 100
+        assert event["cached_input_tokens"] == 40
+        assert event["output_tokens"] == 20
+        assert event["tool_calls"] == 1
+        assert event["cost_usd"] == 0.05
+        assert process.stdout.readline().strip().startswith("{'usage':")
         assert process.wait(timeout=2) == 0
     finally:
         if process.poll() is None:
@@ -175,6 +237,8 @@ def test_injected_mini_swe_model_tags_429_with_request_capacity_period(
     )
     (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
     script = (
+        "import os\n"
+        "os.environ['PIER_REQUEST_THROTTLING'] = '1'\n"
         "from pier_minisweagent import PierModel\n"
         "print('ready', flush=True)\n"
         "try:\n"
@@ -237,6 +301,8 @@ def test_injected_mini_swe_model_does_not_emit_text_only_rate_limit(
     )
     (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
     script = (
+        "import os\n"
+        "os.environ['PIER_REQUEST_THROTTLING'] = '1'\n"
         "from pier_minisweagent import PierModel\n"
         "print('ready', flush=True)\n"
         "try:\n"
