@@ -57,7 +57,7 @@ class _ConcurrencyColumn(ProgressColumn):
 
     def render(self, task: Task) -> Text:
         snapshots = self._queue.concurrency_snapshots()
-        if not self._queue.dynamic_concurrency:
+        if not self._queue.optimize_concurrency:
             snapshot = snapshots[0]
             return Text(
                 f"Concurrency: running={snapshot.running} "
@@ -138,7 +138,7 @@ class Job:
 
         self._trial_queue = TrialQueue(
             n_concurrent=self.config.n_concurrent_trials,
-            dynamic_concurrency=self.config.dynamic_concurrency,
+            optimize_concurrency=self.config.optimize_concurrency,
             retry_config=self.config.retry,
         )
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)

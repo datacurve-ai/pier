@@ -32,7 +32,7 @@ class TrialQueue:
     def __init__(
         self,
         n_concurrent: int,
-        dynamic_concurrency: bool = False,
+        optimize_concurrency: bool = False,
         retry_config: RetryConfig | None = None,
         hooks: dict[TrialEvent, list[HookCallback]] | None = None,
     ):
@@ -52,7 +52,7 @@ class TrialQueue:
         self._event_bus: EventBus | None = None
         self._dynamic_pool: DynamicConcurrencyPool | None = None
         self._controller_task: asyncio.Task[None] | None = None
-        if dynamic_concurrency:
+        if optimize_concurrency:
             self._event_bus = EventBus()
             self._dynamic_pool = DynamicConcurrencyPool(
                 events=self._event_bus,
@@ -73,7 +73,7 @@ class TrialQueue:
         return self._dynamic_pool.capacity_for(provider, model, effort)
 
     @property
-    def dynamic_concurrency(self) -> bool:
+    def optimize_concurrency(self) -> bool:
         return self._dynamic_pool is not None
 
     def concurrency_snapshots(self) -> list[ConcurrencySnapshot]:

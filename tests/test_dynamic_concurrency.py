@@ -100,7 +100,7 @@ def test_fixed_concurrency_remains_the_default():
     config = JobConfig(n_concurrent_trials=7)
     queue = TrialQueue(n_concurrent=config.n_concurrent_trials)
 
-    assert config.dynamic_concurrency is False
+    assert config.optimize_concurrency is False
     assert queue.concurrency_limit == 7
     assert queue._dynamic_pool is None
     assert isinstance(queue._fixed_limiter, ResizableLimiter)
@@ -132,8 +132,8 @@ def test_fixed_queue_uses_resizable_limiter_as_a_fixed_global_limit():
     run(scenario())
 
 
-def test_dynamic_concurrency_uses_configured_value_as_group_start_capacity():
-    queue = TrialQueue(n_concurrent=7, dynamic_concurrency=True)
+def test_optimized_concurrency_uses_configured_value_as_group_start_capacity():
+    queue = TrialQueue(n_concurrent=7, optimize_concurrency=True)
 
     assert queue.concurrency_limit == 7
     assert queue.concurrency_group_capacity("openai", "gpt-5", "high") == 7
@@ -151,7 +151,7 @@ def test_dynamic_concurrency_uses_configured_value_as_group_start_capacity():
 
 def test_dynamic_mini_swe_modal_trial_gets_initial_request_pause_state():
     async def scenario():
-        queue = TrialQueue(n_concurrent=2, dynamic_concurrency=True)
+        queue = TrialQueue(n_concurrent=2, optimize_concurrency=True)
         config = SimpleNamespace(
             trial_name="trial-one",
             agent=AgentConfig(
@@ -184,7 +184,7 @@ def test_dynamic_mini_swe_modal_trial_gets_initial_request_pause_state():
 
 def test_live_concurrency_column_shows_each_concurrency_group():
     async def scenario():
-        queue = TrialQueue(n_concurrent=4, dynamic_concurrency=True)
+        queue = TrialQueue(n_concurrent=4, optimize_concurrency=True)
         assert queue._dynamic_pool is not None
         high = queue._dynamic_pool.limiter_for("openai", "gpt-5", "high")
         low = queue._dynamic_pool.limiter_for("anthropic", "claude", "low")

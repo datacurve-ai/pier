@@ -226,12 +226,12 @@ class JobConfig(BaseModel):
     environment_build_timeout_multiplier: float | None = None
     debug: bool = Field(default=False, description="Enable debug logging")
     n_concurrent_trials: int = 4
-    dynamic_concurrency: bool = Field(
+    optimize_concurrency: bool = Field(
         default=False,
         description=(
             "Dynamically adjust active trial concurrency in response to streamed "
             "inference rate-limit signals. n_concurrent_trials is the starting "
-            "capacity for each provider/model/effort route."
+            "capacity for each provider/model/effort concurrency group."
         ),
     )
     quiet: bool = Field(default=False, description="Suppress trial progress displays")

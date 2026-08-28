@@ -641,7 +641,7 @@ def start(
     if n_concurrent_trials is not None:
         config.n_concurrent_trials = n_concurrent_trials
     if optimize_concurrency:
-        config.dynamic_concurrency = True
+        config.optimize_concurrency = True
     if quiet:
         config.quiet = quiet
     if max_retries is not None:

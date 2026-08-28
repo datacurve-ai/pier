@@ -13,4 +13,5 @@ def test_run_uses_optimize_concurrency_flag():
     }
 
     assert "--optimize_concurrency" in option_names
+    assert "--dynamic_concurrency" not in option_names
     assert "--dynamic-concurrency" not in option_names
