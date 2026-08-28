@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterator
+from uuid import uuid4
 
-from pier.concurrency import PierEvent
+from pier.utils.logger import logger
 
-EVENT_PREFIX = "PIER_EVENT_V1 "
+EVENT_PREFIX = "PIER_EVENT "
+CONCURRENCY_LOG_PREFIX = "CONCURRENCY "
 _RATE_LIMIT_RE = re.compile(
     r"(?:\b429\b|too many requests|"
     r"(?:rate[ _-]?limit(?:ed|ing|error)?).{0,80}"
@@ -24,7 +28,66 @@ _RETRY_AFTER_RE = re.compile(
     re.I,
 )
 
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def new_event_id(prefix: str) -> str:
+    return f"{prefix}-{uuid4().hex}"
+
+
+def concurrency_group_fields(
+    provider: str | None, model: str | None, effort: str | None
+) -> dict[str, Any]:
+    return {"provider": provider, "model": model, "effort": effort}
+
+
+def log_concurrency_event(event_type: str, **fields: Any) -> None:
+    """Write one structured concurrency record through the existing job logger."""
+    record = {"ts": utc_now(), "type": event_type, **fields}
+    logger.getChild(__name__).debug(
+        "%s%s",
+        CONCURRENCY_LOG_PREFIX,
+        json.dumps(record, separators=(",", ":"), sort_keys=True),
+    )
+
+
+@dataclass(frozen=True)
+class PierEvent:
+    """A small, generic telemetry event emitted by a running trial."""
+
+    type: str
+    trial_id: str
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    retry_after_sec: float | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    event_id: str = field(default_factory=lambda: new_event_id("event"))
+    observed_at: str = field(default_factory=utc_now)
+    verified: bool = False
+    evidence: str | None = None
+    capacity_period: int | None = None
+
+
 EventSink = Callable[[PierEvent], Awaitable[None]]
+
+
+class EventBus:
+    """In-process event bus used by rollout producers and job controllers."""
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[PierEvent | None] = asyncio.Queue()
+
+    async def publish(self, event: PierEvent) -> None:
+        await self._queue.put(event)
+
+    async def next(self) -> PierEvent | None:
+        return await self._queue.get()
+
+    async def close(self) -> None:
+        await self._queue.put(None)
 
 
 @dataclass(frozen=True)
@@ -34,6 +97,81 @@ class TelemetryContext:
     provider: str | None
     model: str | None
     effort: str | None
+    pause_messages: asyncio.Queue[str | None] | None = None
+
+
+@dataclass(frozen=True)
+class _RateLimitSignal:
+    payload: dict[str, Any]
+    retry_after_sec: float | None
+    verified: bool
+    evidence: str | None
+    capacity_period: int | None
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _structured_rate_limit(line: str) -> _RateLimitSignal | None:
+    try:
+        payload = json.loads(line[len(EVENT_PREFIX) :])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") not in {
+        "inference.rate_limited",
+        "model.request.rate_limited",
+    }:
+        return None
+
+    retry_after = _float_or_none(payload.get("retry_after_sec"))
+    if retry_after is None:
+        retry_after_ms = _float_or_none(payload.get("retry_after_ms"))
+        if retry_after_ms is not None:
+            retry_after = retry_after_ms / 1000
+
+    status_code = _int_or_none(payload.get("status_code"))
+    evidence = str(payload.get("evidence") or "") or None
+    verified_value = payload.get("verified")
+    if isinstance(verified_value, bool):
+        verified = verified_value
+    else:
+        verified = status_code == 429 or evidence == "typed_rate_limit_error"
+    if status_code == 429 and evidence is None:
+        evidence = "http_status_429"
+
+    return _RateLimitSignal(
+        payload=payload,
+        retry_after_sec=retry_after,
+        verified=verified,
+        evidence=evidence,
+        capacity_period=_int_or_none(payload.get("capacity_period")),
+    )
+
+
+def _heuristic_rate_limit(line: str) -> _RateLimitSignal | None:
+    if not _RATE_LIMIT_RE.search(line):
+        return None
+    match = _RETRY_AFTER_RE.search(line)
+    return _RateLimitSignal(
+        payload={"source": "agent_output_heuristic"},
+        retry_after_sec=float(match.group(1)) if match else None,
+        verified=False,
+        evidence="agent_output_heuristic",
+        capacity_period=None,
+    )
 
 
 _CURRENT_CONTEXT: ContextVar[TelemetryContext | None] = ContextVar(
@@ -55,7 +193,7 @@ def bind_telemetry(context: TelemetryContext) -> Iterator[None]:
 
 
 class TelemetryDecoder:
-    """Incrementally converts a minimal agent control stream into Pier events."""
+    """Incrementally converts a minimal agent telemetry stream into Pier events."""
 
     def __init__(self, context: TelemetryContext) -> None:
         self._context = context
@@ -76,30 +214,12 @@ class TelemetryDecoder:
         line = line.strip()
         if not line:
             return
-
-        payload: dict[str, Any] = {}
-        event_type = ""
-        retry_after: float | None = None
-
-        if line.startswith(EVENT_PREFIX):
-            try:
-                payload = json.loads(line[len(EVENT_PREFIX) :])
-            except (TypeError, ValueError):
-                return
-            event_type = str(payload.get("type", ""))
-            retry_after_value = payload.get("retry_after_sec")
-            if retry_after_value is None and payload.get("retry_after_ms") is not None:
-                retry_after_value = float(payload["retry_after_ms"]) / 1000
-            if retry_after_value is not None:
-                retry_after = float(retry_after_value)
-        elif _RATE_LIMIT_RE.search(line):
-            event_type = "inference.rate_limited"
-            match = _RETRY_AFTER_RE.search(line)
-            if match:
-                retry_after = float(match.group(1))
-            payload = {"source": "agent_output_heuristic"}
-
-        if event_type not in {"inference.rate_limited", "model.request.rate_limited"}:
+        signal = (
+            _structured_rate_limit(line)
+            if line.startswith(EVENT_PREFIX)
+            else _heuristic_rate_limit(line)
+        )
+        if signal is None:
             return
 
         await self._context.sink(
@@ -108,22 +228,29 @@ class TelemetryDecoder:
                 trial_id=self._context.trial_id,
                 # Route capacity is acquired from the trial configuration, so events
                 # must use that same key. Payload values fill only missing context.
-                provider=str(self._context.provider or payload.get("provider") or "")
+                provider=str(
+                    self._context.provider or signal.payload.get("provider") or ""
+                )
                 or None,
-                model=str(self._context.model or payload.get("model") or "") or None,
-                effort=str(self._context.effort or payload.get("effort") or "")
+                model=str(self._context.model or signal.payload.get("model") or "")
                 or None,
-                retry_after_sec=retry_after,
+                effort=str(self._context.effort or signal.payload.get("effort") or "")
+                or None,
+                retry_after_sec=signal.retry_after_sec,
+                verified=signal.verified,
+                evidence=signal.evidence,
+                capacity_period=signal.capacity_period,
                 # Do not forward the raw line: model output can contain secrets.
                 payload={
                     key: value
-                    for key, value in payload.items()
+                    for key, value in signal.payload.items()
                     if key
                     in {
                         "source",
                         "status_code",
                         "request_id",
                         "attempt",
+                        "capacity_period",
                     }
                 },
             )

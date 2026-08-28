@@ -1,8 +1,20 @@
+import asyncio
+import json
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from pier.agents.installed.mini_swe_agent import (
+    _MINI_SWE_REQUEST_THROTTLING_PATH,
     MiniSweAgent,
     convert_mini_swe_agent_to_atif,
+)
+from pier.models.agent.context import AgentContext
+from pier.telemetry import TelemetryContext, bind_telemetry
+
+_MINI_SWE_REQUEST_THROTTLING_MODULE = _MINI_SWE_REQUEST_THROTTLING_PATH.read_text(
+    encoding="utf-8"
 )
 
 
@@ -14,6 +26,8 @@ def test_mini_swe_install_refreshes_litellm_cost_map_backup(tmp_path: Path):
     assert spec.steps[-1].env == {"LITELLM_LOCAL_MODEL_COST_MAP": "true"}
     assert MiniSweAgent._LITELLM_MODEL_COST_MAP_URL in spec.steps[-1].run
     assert "model_prices_and_context_window_backup.json" in spec.steps[-1].run
+    assert "pier_minisweagent.py" in spec.steps[-1].run
+    compile(_MINI_SWE_REQUEST_THROTTLING_MODULE, "pier_minisweagent.py", "exec")
 
 
 def test_mini_swe_cost_limit_zero_is_config_override(tmp_path: Path):
@@ -37,6 +51,174 @@ def test_mini_swe_openai_uses_responses_model_class(tmp_path: Path):
 
     assert "-c model.model_class=litellm_response" in config_flags
     assert "-c model.model_kwargs.reasoning_effort=xhigh" in config_flags
+
+
+def test_mini_swe_request_throttling_wraps_the_selected_model_class(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openai/gpt-5.5",
+    )
+
+    config_flags = agent._build_config_flags(request_throttling=True)
+
+    assert "-c model.model_class=pier_minisweagent.PierModel" in config_flags
+    assert "model.model_class=litellm_response" not in config_flags
+
+
+def test_mini_swe_dynamic_run_uses_bidirectional_request_throttling(
+    tmp_path: Path,
+):
+    async def scenario():
+        agent = MiniSweAgent(
+            logs_dir=tmp_path,
+            model_name="openai/gpt-5.5",
+            extra_env={"OPENAI_API_KEY": "test-key"},
+        )
+        calls = []
+
+        async def exec_as_agent(_environment, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(return_code=0)
+
+        agent.exec_as_agent = exec_as_agent
+        pause_queue = asyncio.Queue()
+
+        async def sink(_event):
+            return None
+
+        telemetry = TelemetryContext(
+            sink=sink,
+            trial_id="trial",
+            provider="openai",
+            model="gpt-5.5",
+            effort=None,
+            pause_messages=pause_queue,
+        )
+        environment = SimpleNamespace(
+            capabilities=SimpleNamespace(exec_stdin=True),
+        )
+
+        with bind_telemetry(telemetry):
+            await agent.run("instruction", environment, AgentContext())
+
+        assert len(calls) == 1
+        command = calls[0]["command"]
+        assert "model.model_class=pier_minisweagent.PierModel" in command
+        assert "</dev/null" not in command
+        assert calls[0]["env"]["PIER_MINISWE_BASE_MODEL_CLASS"] == ("litellm_response")
+        assert calls[0]["env"]["PIER_MINISWE_MODEL_NAME"] == "openai/gpt-5.5"
+
+    asyncio.run(scenario())
+
+
+def test_injected_mini_swe_model_waits_for_initial_pause_state(tmp_path: Path):
+    package = tmp_path / "minisweagent" / "models"
+    package.mkdir(parents=True)
+    (tmp_path / "minisweagent" / "__init__.py").write_text("")
+    (package / "__init__.py").write_text(
+        "class BaseModel:\n"
+        "    def _query(self, messages, **kwargs):\n"
+        "        return 'request-complete'\n\n"
+        "def get_model_class(model_name, model_class):\n"
+        "    return BaseModel\n"
+    )
+    (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
+    script = (
+        "from pier_minisweagent import PierModel\n"
+        "print('ready', flush=True)\n"
+        "print(PierModel()._query([]), flush=True)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdin is not None
+        assert process.stdout.readline().strip() == "ready"
+        assert process.poll() is None
+
+        message = {
+            "type": "request.pause",
+            "control_index": 1,
+            "capacity_period": 0,
+            "paused": False,
+        }
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+        assert process.stdout.readline().strip() == "request-complete"
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+
+def test_injected_mini_swe_model_tags_429_with_request_capacity_period(
+    tmp_path: Path,
+):
+    package = tmp_path / "minisweagent" / "models"
+    package.mkdir(parents=True)
+    (tmp_path / "minisweagent" / "__init__.py").write_text("")
+    (package / "__init__.py").write_text(
+        "class RateLimitError(Exception):\n"
+        "    status_code = 429\n\n"
+        "class BaseModel:\n"
+        "    def _query(self, messages, **kwargs):\n"
+        "        raise RateLimitError('limited')\n\n"
+        "def get_model_class(model_name, model_class):\n"
+        "    return BaseModel\n"
+    )
+    (tmp_path / "pier_minisweagent.py").write_text(_MINI_SWE_REQUEST_THROTTLING_MODULE)
+    script = (
+        "from pier_minisweagent import PierModel\n"
+        "print('ready', flush=True)\n"
+        "try:\n"
+        "    PierModel()._query([])\n"
+        "except Exception:\n"
+        "    pass\n"
+        "print('done', flush=True)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdin is not None
+        assert process.stdout.readline().strip() == "ready"
+        process.stdin.write(
+            json.dumps(
+                {
+                    "type": "request.pause",
+                    "control_index": 1,
+                    "capacity_period": 7,
+                    "paused": False,
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+
+        event_line = process.stdout.readline().strip()
+        assert event_line.startswith("PIER_EVENT ")
+        event = json.loads(event_line[len("PIER_EVENT ") :])
+        assert event["type"] == "model.request.rate_limited"
+        assert event["status_code"] == 429
+        assert event["capacity_period"] == 7
+        assert process.stdout.readline().strip() == "done"
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
 
 
 def test_mini_swe_model_class_can_be_overridden(tmp_path: Path):
@@ -194,9 +376,7 @@ def test_convert_chat_message_keeps_reasoning_separate_from_visible_content():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.01, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "anthropic/claude-opus-4-7"}
-                },
+                "config": {"model": {"model_name": "anthropic/claude-opus-4-7"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
@@ -241,9 +421,7 @@ def test_convert_openrouter_byok_uses_upstream_cost_details():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.0, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "moonshotai/kimi-k2.6"}
-                },
+                "config": {"model": {"model_name": "moonshotai/kimi-k2.6"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},

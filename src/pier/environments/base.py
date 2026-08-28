@@ -46,6 +46,7 @@ class ExecResult(BaseModel):
 
 
 ExecOutputCallback = Callable[[str, str], Awaitable[None]]
+ExecInputQueue = asyncio.Queue[str | None]
 
 
 class BaseEnvironment(ABC):
@@ -463,6 +464,11 @@ class BaseEnvironment(ABC):
     def resource_capabilities(cls) -> EnvironmentResourceCapabilities | None:
         return None
 
+    @classmethod
+    def supports_exec_stdin(cls) -> bool:
+        """Whether streamed exec processes can receive incremental stdin."""
+        return False
+
     @abstractmethod
     def _validate_definition(self):
         """
@@ -681,6 +687,7 @@ class BaseEnvironment(ABC):
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
@@ -689,8 +696,13 @@ class BaseEnvironment(ABC):
         """Execute and report output incrementally when the backend supports it.
 
         The compatibility fallback reports captured output after completion. Backends
-        override this to provide real-time delivery.
+        override this to provide real-time delivery. Backends advertising
+        ``capabilities.exec_stdin`` also forward ``input_queue`` to the process.
         """
+        if input_queue is not None:
+            raise NotImplementedError(
+                "This environment does not support streamed stdin"
+            )
         result = await self.exec(
             command=command,
             cwd=cwd,

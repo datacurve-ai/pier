@@ -20,7 +20,12 @@ from pier.environments.agent_setup import (
     proxy_policy_env,
     squid_bootstrap_command,
 )
-from pier.environments.base import BaseEnvironment, ExecOutputCallback, ExecResult
+from pier.environments.base import (
+    BaseEnvironment,
+    ExecInputQueue,
+    ExecOutputCallback,
+    ExecResult,
+)
 from pier.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -41,7 +46,7 @@ from pier.utils.optional_import import MissingExtraError
 
 try:
     import modal
-    from modal import App, Image, Sandbox, Secret, Volume
+    from modal import App, Image, Proxy, Sandbox, Secret, Volume
     from modal.exception import (
         SandboxFilesystemNotADirectoryError,
         SandboxFilesystemNotFoundError,
@@ -92,10 +97,15 @@ class _ModalStrategy:
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
     ) -> ExecResult:
+        if input_queue is not None:
+            raise NotImplementedError(
+                "This Modal strategy does not support streamed stdin"
+            )
         result = await self.exec(command, cwd=cwd, env=env, timeout_sec=timeout_sec)
         if result.stdout:
             await on_output("stdout", result.stdout)
@@ -245,6 +255,7 @@ class _ModalDirect(_ModalStrategy):
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
@@ -252,6 +263,7 @@ class _ModalDirect(_ModalStrategy):
         return await self._env._sdk_exec_stream(
             command,
             on_output=on_output,
+            input_queue=input_queue,
             cwd=cwd,
             env=env,
             timeout_sec=timeout_sec,
@@ -648,6 +660,7 @@ class _ModalDinD(_ModalStrategy):
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
@@ -662,6 +675,7 @@ class _ModalDinD(_ModalStrategy):
         return await self._env._sdk_exec_stream(
             self._compose_cmd(parts),
             on_output=on_output,
+            input_queue=input_queue,
             env=self._compose_env_vars(),
             timeout_sec=timeout_sec,
             shell="sh",
@@ -833,6 +847,10 @@ class ModalEnvironment(BaseEnvironment):
             memory_request=True,
         )
 
+    @classmethod
+    def supports_exec_stdin(cls) -> bool:
+        return True
+
     @property
     def capabilities(self) -> EnvironmentCapabilities:
         return self._capabilities
@@ -866,6 +884,8 @@ class ModalEnvironment(BaseEnvironment):
         registry_secret: str | None = None,
         volumes: dict[str, str] | None = None,
         app_name: str = "__pier__",
+        proxy_name: str | None = None,
+        proxy_environment_name: str | None = None,
         sandbox_timeout_secs: int = 60 * 60 * 24,
         sandbox_idle_timeout_secs: int | None = None,
         *args,
@@ -891,6 +911,11 @@ class ModalEnvironment(BaseEnvironment):
             app_name: Name of the Modal App to use. All sandboxes created
                 with the same app name share a single Modal App. Default
                 is "__pier__".
+            proxy_name: Optional Modal Proxy name to use for static outbound IPs.
+                The proxy is attached to both task sandboxes and Pier's filtered-
+                egress proxy sandbox.
+            proxy_environment_name: Optional Modal environment containing
+                ``proxy_name``. If omitted, Modal's active environment is used.
             sandbox_timeout_secs: Maximum lifetime of the sandbox in seconds.
                 The sandbox will be terminated after this duration regardless of
                 activity. Default is 86400 (24 hours). See Modal sandbox docs:
@@ -910,6 +935,7 @@ class ModalEnvironment(BaseEnvironment):
             filtered_egress=not self._compose_mode,
             preinstall_agents=not self._compose_mode,
             docker_compose=True,
+            exec_stdin=True,
         )
         self._kwargs = kwargs
         if not _HAS_MODAL:
@@ -933,6 +959,18 @@ class ModalEnvironment(BaseEnvironment):
         self._registry_secret = registry_secret
         self._volumes = volumes or {}
         self._app_name = app_name
+        if proxy_environment_name and not proxy_name:
+            raise ValueError(
+                "proxy_environment_name requires proxy_name to be configured."
+            )
+        self._proxy = (
+            Proxy.from_name(
+                proxy_name,
+                environment_name=proxy_environment_name,
+            )
+            if proxy_name
+            else None
+        )
         self._sandbox_timeout = sandbox_timeout_secs
         self._sandbox_idle_timeout = sandbox_idle_timeout_secs
 
@@ -1068,6 +1106,7 @@ class ModalEnvironment(BaseEnvironment):
             timeout=self._sandbox_timeout,
             idle_timeout=self._sandbox_idle_timeout,
             name=f"{self.session_id}-egress-proxy",
+            proxy=self._proxy,
         )
         tunnel = (await self._egress_proxy_sandbox.tunnels.aio(timeout=60))[
             EGRESS_PROXY_PORT
@@ -1147,6 +1186,7 @@ class ModalEnvironment(BaseEnvironment):
             cidr_allowlist=cidr_allowlist or self._egress_cidr_allowlist,
             secrets=self._secrets_config(),
             volumes=self._volumes_config(),  # type: ignore[arg-type]
+            proxy=self._proxy,
             **kwargs,
         )
 
@@ -1210,6 +1250,7 @@ class ModalEnvironment(BaseEnvironment):
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
@@ -1236,11 +1277,53 @@ class ModalEnvironment(BaseEnvironment):
                 chunks.append(chunk)
                 await on_output(name, chunk)
 
-        await asyncio.gather(
+        async def forward_input() -> None:
+            assert input_queue is not None
+            try:
+                while True:
+                    chunk = await input_queue.get()
+                    if chunk is None:
+                        process.stdin.write_eof()
+                        await process.stdin.drain.aio()
+                        return
+                    process.stdin.write(chunk.encode())
+                    await process.stdin.drain.aio()
+            except (BrokenPipeError, ConnectionError):
+                # The agent can exit between the queue read and the remote write.
+                return
+
+        input_task = (
+            asyncio.create_task(forward_input(), name="pier-modal-exec-stdin")
+            if input_queue is not None
+            else None
+        )
+        output_task = asyncio.gather(
             drain(process.stdout, "stdout", stdout_chunks),
             drain(process.stderr, "stderr", stderr_chunks),
         )
-        return_code = await process.wait.aio()
+        wait_task = asyncio.create_task(process.wait.aio(), name="pier-modal-exec-wait")
+
+        try:
+            if input_task is not None:
+                done, _pending = await asyncio.wait(
+                    (wait_task, input_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if input_task in done:
+                    # Propagate control-channel failures instead of leaving a
+                    # fail-closed agent blocked until its outer timeout.
+                    input_task.result()
+            return_code = await wait_task
+            await output_task
+        finally:
+            if input_task is not None:
+                input_task.cancel()
+            wait_task.cancel()
+            output_task.cancel()
+            await asyncio.gather(
+                *(task for task in (input_task, wait_task, output_task) if task),
+                return_exceptions=True,
+            )
         return ExecResult(
             stdout="".join(stdout_chunks) or None,
             stderr="".join(stderr_chunks) or None,
@@ -1393,6 +1476,7 @@ class ModalEnvironment(BaseEnvironment):
         self,
         command: str,
         on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
@@ -1410,6 +1494,7 @@ class ModalEnvironment(BaseEnvironment):
         return await self._strategy.exec_stream(
             command,
             on_output=on_output,
+            input_queue=input_queue,
             cwd=effective_cwd,
             env=env,
             timeout_sec=timeout_sec,

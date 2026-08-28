@@ -147,7 +147,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
     CLI_FLAGS: ClassVar[list[CliFlag]] = []
     ENV_VARS: ClassVar[list[EnvVar]] = []
     _TELEMETRY_FILTER_PATTERN = (
-        r"^PIER_EVENT_V1 |(^|[^0-9])429([^0-9]|$)|"
+        r"^PIER_EVENT |(^|[^0-9])429([^0-9]|$)|"
         r"rate[ _-]?limit|too many requests"
     )
 
@@ -348,7 +348,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
             )
         else:
             # Agent commands already tee their complete output to /logs/agent. This
-            # final filter keeps the host control stream tiny while preserving the
+            # final filter keeps the host telemetry stream tiny while preserving the
             # upstream pipeline's exit status through `set -o pipefail`.
             filtered_command = (
                 f"{command} | {{ grep --line-buffered -E -i "
@@ -362,6 +362,11 @@ class BaseInstalledAgent(BaseAgent, ABC):
             result = await environment.exec_stream(
                 command=f"set -o pipefail; {filtered_command}",
                 on_output=on_output,
+                input_queue=(
+                    telemetry_context.pause_messages
+                    if environment.capabilities.exec_stdin
+                    else None
+                ),
                 user=user,
                 env=environment.agent_process_env(merged_env),
                 cwd=cwd,

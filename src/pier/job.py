@@ -11,12 +11,15 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
+    Task,
     TaskID,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.text import Text
 
 from pier.environments.factory import EnvironmentFactory
 from pier.metrics.base import BaseMetric
@@ -38,6 +41,40 @@ from pier.utils.pass_at_k import compute_pass_at_k_by_evals
 
 
 CANCELLED_ERROR_TYPE = "CancelledError"
+
+
+class _ConcurrencyColumn(ProgressColumn):
+    """Render live running/capacity state"""
+
+    def __init__(self, queue: TrialQueue) -> None:
+        super().__init__()
+        self._queue = queue
+
+    @staticmethod
+    def _group_label(snapshot) -> str:
+        parts = [snapshot.provider, snapshot.model, snapshot.effort]
+        return "/".join(part for part in parts if part) or "unknown"
+
+    def render(self, task: Task) -> Text:
+        snapshots = self._queue.concurrency_snapshots()
+        if not self._queue.dynamic_concurrency:
+            snapshot = snapshots[0]
+            return Text(
+                f"Concurrency: running={snapshot.running} "
+                f"capacity={snapshot.capacity} queued={snapshot.queued} "
+                f"paused={snapshot.paused}",
+                style="cyan",
+            )
+        if not snapshots:
+            return Text("Concurrency: starting", style="cyan")
+
+        groups = " | ".join(
+            f"{self._group_label(snapshot)} "
+            f"running={snapshot.running} capacity={snapshot.capacity} "
+            f"queued={snapshot.queued} paused={snapshot.paused}"
+            for snapshot in snapshots
+        )
+        return Text(f"Concurrency: {groups}", style="cyan")
 
 
 class Job:
@@ -632,6 +669,7 @@ class Job:
             loading_progress = Progress(
                 SpinnerColumn(),
                 MofNCompleteColumn(),
+                _ConcurrencyColumn(self._trial_queue),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TimeElapsedColumn(),
@@ -686,7 +724,9 @@ class Job:
                 )
 
                 if trial_result.verifier_result is not None:
-                    final_rewards[evals_key].append(trial_result.verifier_result.rewards)
+                    final_rewards[evals_key].append(
+                        trial_result.verifier_result.rewards
+                    )
                 else:
                     final_rewards[evals_key].append(None)
 

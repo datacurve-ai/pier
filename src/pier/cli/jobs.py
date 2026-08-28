@@ -12,7 +12,12 @@ from rich.table import Table
 from typer import Option, Typer
 
 from pier.cli.host_env import confirm_host_env_access
-from pier.cli.utils import parse_env_vars, parse_kwargs, run_async
+from pier.cli.utils import (
+    parse_env_vars,
+    parse_kwargs,
+    prevent_system_sleep,
+    run_async,
+)
 from pier.models.agent.name import AgentName
 from pier.models.environment_type import EnvironmentType
 from pier.models.job.config import (
@@ -267,20 +272,20 @@ def start(
         Option(
             "-n",
             "--n-concurrent",
-            help=f"Fixed concurrency, or starting per-route concurrency with "
-            f"--dynamic-concurrency (default: {
+            help=f"Fixed concurrency, or starting per-group concurrency with "
+            f"--optimize_concurrency (default: {
                 JobConfig.model_fields['n_concurrent_trials'].default
             })",
             rich_help_panel="Job Settings",
             show_default=False,
         ),
     ] = None,
-    dynamic_concurrency: Annotated[
+    optimize_concurrency: Annotated[
         bool,
         Option(
-            "--dynamic-concurrency",
+            "--optimize_concurrency",
             help=(
-                "Start each inference route at --n-concurrent and adapt using "
+                "Start each concurrency group at --n-concurrent and adapt using "
                 "real-time rate-limit signals"
             ),
             rich_help_panel="Job Settings",
@@ -635,7 +640,7 @@ def start(
 
     if n_concurrent_trials is not None:
         config.n_concurrent_trials = n_concurrent_trials
-    if dynamic_concurrency:
+    if optimize_concurrency:
         config.dynamic_concurrency = True
     if quiet:
         config.quiet = quiet
@@ -784,7 +789,8 @@ def start(
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    job, job_result = run_async(_run_job())
+    with prevent_system_sleep():
+        job, job_result = run_async(_run_job())
 
 
 @jobs_app.command()
@@ -859,7 +865,8 @@ def resume(
         job_result = await job.run()
         return job_result
 
-    job_result = run_async(_run_job())
+    with prevent_system_sleep():
+        job_result = run_async(_run_job())
 
     # Print results tables
     print_job_results_tables(job_result)

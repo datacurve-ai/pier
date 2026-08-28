@@ -30,6 +30,9 @@ class EnvironmentCapabilities(BaseModel):
     docker_compose: bool = False
     """Whether the environment can run Docker Compose task environments."""
 
+    exec_stdin: bool = False
+    """Whether streamed exec processes accept incremental stdin from Pier."""
+
 
 class EnvironmentResourceCapabilities(BaseModel):
     cpu_limit: bool = False
