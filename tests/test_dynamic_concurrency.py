@@ -235,6 +235,48 @@ def test_fixed_concurrency_still_collects_telemetry(tmp_path):
     run(scenario())
 
 
+def test_ramp_timer_is_not_starved_by_continuous_events():
+    async def scenario():
+        queue = TrialQueue(n_concurrent=1, optimize_concurrency=True)
+        assert queue._dynamic_pool is not None
+        queue._dynamic_pool.ramp_interval_sec = 0.01
+        limiter = queue._dynamic_pool.limiter_for("openai", "gpt-5", "high")
+        await limiter.acquire()
+        waiter = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0)
+        assert limiter.queued == 1
+
+        await queue.start()
+        publishing = True
+
+        async def publish_continuously():
+            while publishing:
+                assert queue._event_bus is not None
+                await queue._event_bus.publish(
+                    PierEvent(
+                        type="model.request.completed",
+                        trial_id="busy-trial",
+                        provider="openai",
+                        model="gpt-5",
+                        effort="high",
+                    )
+                )
+                await asyncio.sleep(0.001)
+
+        producer = asyncio.create_task(publish_continuously())
+        await asyncio.wait_for(waiter, timeout=1)
+        assert limiter.capacity == 2
+
+        publishing = False
+        await producer
+        await queue.stop()
+        assert queue._event_task is None
+        await limiter.release()
+        await limiter.release()
+
+    run(scenario())
+
+
 def test_live_concurrency_column_shows_each_concurrency_group():
     async def scenario():
         queue = TrialQueue(n_concurrent=4, optimize_concurrency=True)

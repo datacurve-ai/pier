@@ -149,40 +149,70 @@ class TrialQueue:
 
     async def _process_events(self) -> None:
         assert self._event_bus is not None
-        poll_interval = (
+        event_task = asyncio.create_task(self._event_bus.next(), name="pier-next-event")
+        ramp_interval = (
             min(1.0, max(0.05, self._dynamic_pool.ramp_interval_sec))
             if self._dynamic_pool is not None
             else None
         )
-        while True:
-            try:
-                event = await asyncio.wait_for(
-                    self._event_bus.next(),
-                    timeout=poll_interval,
-                )
-            except TimeoutError:
-                assert self._dynamic_pool is not None
-                if await self._dynamic_pool.maybe_ramp():
-                    await self._write_telemetry()
-                continue
-
-            if event is None:
-                if self._dynamic_pool is not None:
-                    self._dynamic_pool.finalize()
-                await self._write_telemetry(force=True)
-                return
-
-            if self._telemetry is not None:
-                self._telemetry.record(event)
-            capacity_changed = (
-                await self._dynamic_pool.handle(event)
-                if self._dynamic_pool is not None
-                else False
+        ramp_timer = (
+            asyncio.create_task(
+                asyncio.sleep(ramp_interval), name="pier-concurrency-ramp-timer"
             )
-            if self._telemetry is not None and (
-                event.type == "model.request.completed" or capacity_changed
-            ):
-                await self._write_telemetry(force=capacity_changed)
+            if ramp_interval is not None
+            else None
+        )
+        try:
+            while True:
+                waiters = {event_task}
+                if ramp_timer is not None:
+                    waiters.add(ramp_timer)
+                completed, _ = await asyncio.wait(
+                    waiters,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if event_task in completed:
+                    event = event_task.result()
+                    if event is None:
+                        if self._dynamic_pool is not None:
+                            self._dynamic_pool.finalize()
+                        await self._write_telemetry(force=True)
+                        return
+                    event_task = asyncio.create_task(
+                        self._event_bus.next(), name="pier-next-event"
+                    )
+
+                    if self._telemetry is not None:
+                        self._telemetry.record(event)
+                    capacity_changed = (
+                        await self._dynamic_pool.handle(event)
+                        if self._dynamic_pool is not None
+                        else False
+                    )
+                    if self._telemetry is not None and (
+                        event.type == "model.request.completed" or capacity_changed
+                    ):
+                        await self._write_telemetry(force=capacity_changed)
+
+                if ramp_timer is not None and ramp_timer in completed:
+                    assert self._dynamic_pool is not None
+                    if await self._dynamic_pool.maybe_ramp():
+                        await self._write_telemetry()
+                    ramp_timer = asyncio.create_task(
+                        asyncio.sleep(ramp_interval),
+                        name="pier-concurrency-ramp-timer",
+                    )
+        finally:
+            pending = [
+                task
+                for task in (event_task, ramp_timer)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     def add_hook(self, event: TrialEvent, callback: HookCallback) -> "TrialQueue":
         """Register a callback for a trial lifecycle event and return the queue."""
