@@ -12,7 +12,7 @@ from modal.exception import (
     SandboxFilesystemNotFoundError,
 )
 
-from pier.environments.modal import _ModalStrategy
+from pier.environments.modal import ModalEnvironment, _ModalStrategy
 
 
 def run_async(fn):
@@ -39,7 +39,9 @@ class _ListFiles:
         return outcome
 
 
-def _strategy_with_list_files(outcomes: dict[str, object]) -> tuple[_ModalStrategy, _ListFiles]:
+def _strategy_with_list_files(
+    outcomes: dict[str, object],
+) -> tuple[_ModalStrategy, _ListFiles]:
     list_files = _ListFiles(outcomes)
 
     class _Filesystem:
@@ -97,3 +99,60 @@ async def test_is_dir_and_is_file_also_map_builtin_os_errors() -> None:
     assert await strategy.is_file("/file") is True
     assert await strategy.is_dir("/missing") is False
     assert await strategy.is_file("/missing") is False
+
+
+@run_async
+async def test_sdk_exec_stream_forwards_control_queue_to_process_stdin() -> None:
+    import asyncio
+
+    closed = asyncio.Event()
+    writes: list[bytes] = []
+
+    class _EmptyAfterDrain:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await closed.wait()
+            raise StopAsyncIteration
+
+    class _Stdin:
+        def __init__(self) -> None:
+            self.drain = SimpleNamespace(aio=self._drain)
+
+        def write(self, value: bytes) -> None:
+            writes.append(value)
+
+        def write_eof(self) -> None:
+            writes.append(b"<eof>")
+            closed.set()
+
+        async def _drain(self) -> None:
+            return None
+
+    process = SimpleNamespace(
+        stdin=_Stdin(),
+        stdout=_EmptyAfterDrain(),
+        stderr=_EmptyAfterDrain(),
+        wait=SimpleNamespace(aio=lambda: asyncio.sleep(0, result=0)),
+    )
+
+    async def exec_aio(*_args, **_kwargs):
+        return process
+
+    env = object.__new__(ModalEnvironment)
+    env._persistent_env = {}
+    env._sandbox = SimpleNamespace(exec=SimpleNamespace(aio=exec_aio))
+    queue = asyncio.Queue()
+    message = '{"type":"request.pause","paused":false}\n'
+    queue.put_nowait(message)
+    queue.put_nowait(None)
+
+    result = await env._sdk_exec_stream(
+        "command",
+        on_output=lambda _stream, _chunk: asyncio.sleep(0),
+        input_queue=queue,
+    )
+
+    assert result.return_code == 0
+    assert writes == [message.encode(), b"<eof>"]

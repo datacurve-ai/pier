@@ -19,7 +19,7 @@ from pier.environments.agent_setup import (
     write_agent_dockerfile,
     write_docker_proxy_compose,
 )
-from pier.environments.base import BaseEnvironment, ExecResult
+from pier.environments.base import BaseEnvironment, ExecOutputCallback, ExecResult
 from pier.environments.capabilities import EnvironmentCapabilities
 from pier.environments.docker import (
     COMPOSE_BASE_PATH,
@@ -470,7 +470,11 @@ class DockerEnvironment(BaseEnvironment):
         return command
 
     async def _run_docker_compose_command(
-        self, command: list[str], check: bool = True, timeout_sec: int | None = None
+        self,
+        command: list[str],
+        check: bool = True,
+        timeout_sec: int | None = None,
+        on_output: ExecOutputCallback | None = None,
     ) -> ExecResult:
         """Run a docker compose command and return the result."""
         full_command = [
@@ -502,23 +506,52 @@ class DockerEnvironment(BaseEnvironment):
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        try:
-            if timeout_sec:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout_sec
-                )
-            else:
-                stdout_bytes, stderr_bytes = await process.communicate()
-        except asyncio.TimeoutError:
-            process.terminate()
+        if on_output is None:
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=5
-                )
+                if timeout_sec:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_sec
+                    )
+                else:
+                    stdout_bytes, stderr_bytes = await process.communicate()
             except asyncio.TimeoutError:
-                process.kill()
-                stdout_bytes, stderr_bytes = await process.communicate()
-            raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
+                process.terminate()
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=5
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    stdout_bytes, stderr_bytes = await process.communicate()
+                raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
+        else:
+            chunks: list[bytes] = []
+
+            async def drain_stdout() -> None:
+                if process.stdout is None:
+                    return
+                while chunk := await process.stdout.read(4096):
+                    chunks.append(chunk)
+                    await on_output("stdout", chunk.decode(errors="replace"))
+
+            drain_task = asyncio.create_task(drain_stdout())
+            try:
+                if timeout_sec:
+                    await asyncio.wait_for(process.wait(), timeout=timeout_sec)
+                else:
+                    await process.wait()
+            except asyncio.TimeoutError:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                await drain_task
+                raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
+            await drain_task
+            stdout_bytes = b"".join(chunks)
+            stderr_bytes = None
 
         stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
         stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else None
@@ -760,6 +793,35 @@ class DockerEnvironment(BaseEnvironment):
 
         return await self._run_docker_compose_command(
             exec_command, check=False, timeout_sec=timeout_sec
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+        exec_command = ["exec"]
+        effective_cwd = cwd or self.task_env_config.workdir
+        if effective_cwd:
+            exec_command.extend(["-w", effective_cwd])
+        if env:
+            for key, value in env.items():
+                exec_command.extend(["-e", f"{key}={value}"])
+        if user is not None:
+            exec_command.extend(["-u", str(user)])
+        exec_command.append("main")
+        exec_command.extend(self._platform.exec_shell_args(command))
+        return await self._run_docker_compose_command(
+            exec_command,
+            check=False,
+            timeout_sec=timeout_sec,
+            on_output=on_output,
         )
 
     async def attach(self) -> None:

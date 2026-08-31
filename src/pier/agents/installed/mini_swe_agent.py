@@ -30,11 +30,17 @@ from pier.models.trajectories import (
     Trajectory,
 )
 from pier.models.trial.paths import EnvironmentPaths
+from pier.telemetry import current_telemetry_context
 from pier.utils.logger import logger
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
     populate_context_from_final_metrics,
+)
+
+
+_MINI_SWE_REQUEST_THROTTLING_PATH = Path(__file__).with_name(
+    "mini_swe_request_throttling.py"
 )
 
 
@@ -552,6 +558,7 @@ class MiniSweAgent(BaseInstalledAgent):
     """
 
     SUPPORTS_ATIF: bool = True
+    SUPPORTS_REQUEST_THROTTLING: bool = True
 
     CLI_FLAGS: ClassVar[list[CliFlag]] = []
     _LITELLM_MODEL_COST_MAP_URL = (
@@ -622,6 +629,9 @@ class MiniSweAgent(BaseInstalledAgent):
 
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"=={self._version}" if self._version else ""
+        request_throttling_module = _MINI_SWE_REQUEST_THROTTLING_PATH.read_text(
+            encoding="utf-8"
+        )
         install_extra_packages = ""
         if self._install_python_packages:
             packages = " ".join(
@@ -659,6 +669,7 @@ import json
 import sys
 import urllib.request
 from importlib.resources import files
+from pathlib import Path
 
 url = "{self._LITELLM_MODEL_COST_MAP_URL}"
 path = files("litellm").joinpath("model_prices_and_context_window_backup.json")
@@ -678,6 +689,12 @@ except Exception as exc:
         f"Warning: failed to refresh LiteLLM model cost map backup: {{exc}}",
         file=sys.stderr,
     )
+
+site_packages = next(Path(value) for value in __import__("site").getsitepackages())
+(site_packages / "pier_minisweagent.py").write_text(
+    {request_throttling_module!r},
+    encoding="utf-8",
+)
 PY
 
 mini-swe-agent --help
@@ -764,7 +781,12 @@ mini-swe-agent --help
             for key, value in self._model_kwargs.items()
         )
 
-    def _build_config_flags(self, *, custom_config_path: str | None = None) -> str:
+    def _build_config_flags(
+        self,
+        *,
+        custom_config_path: str | None = None,
+        telemetry: bool = False,
+    ) -> str:
         config_flags = "-c mini.yaml "
 
         if self._cost_limit is not None:
@@ -773,7 +795,10 @@ mini-swe-agent --help
         if custom_config_path:
             config_flags += f"-c {custom_config_path} "
 
-        if model_class := self._model_class_override:
+        model_class = (
+            "pier_minisweagent.PierModel" if telemetry else self._model_class_override
+        )
+        if model_class:
             config_flags += f"-c model.model_class={shlex.quote(model_class)} "
 
         if self._reasoning_effort:
@@ -845,6 +870,17 @@ mini-swe-agent --help
                 "MSWEA_COST_TRACKING": "ignore_errors",  # Ignore unknown model costs
             }
         )
+        telemetry_context = current_telemetry_context()
+        telemetry = telemetry_context is not None
+        request_throttling = bool(
+            telemetry
+            and telemetry_context.pause_messages is not None
+            and environment.capabilities.exec_stdin
+        )
+        if telemetry:
+            env["PIER_MINISWE_BASE_MODEL_CLASS"] = self._model_class_override or ""
+            env["PIER_MINISWE_MODEL_NAME"] = run_model_name
+            env["PIER_REQUEST_THROTTLING"] = "1" if request_throttling else "0"
 
         if self._get_env("MSWEA_API_KEY"):
             env["MSWEA_API_KEY"] = self._get_env("MSWEA_API_KEY") or ""
@@ -887,7 +923,11 @@ mini-swe-agent --help
             )
             await self.exec_as_agent(environment, command=write_config_cmd, env=env)
 
-        config_flags = self._build_config_flags(custom_config_path=custom_config_path)
+        config_flags = self._build_config_flags(
+            custom_config_path=custom_config_path,
+            telemetry=telemetry,
+        )
+        stdin_redirect = "" if request_throttling else " </dev/null"
 
         await self.exec_as_agent(
             environment,
@@ -896,7 +936,9 @@ mini-swe-agent --help
                 f"mini-swe-agent --yolo --model={run_model_name} --task={escaped_instruction} "
                 f"--output={self._mini_swe_agent_trajectory_path} {extra_flags}"
                 f"{config_flags}"
-                f"--exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt"
+                f"--exit-immediately 2>&1{stdin_redirect} | "
+                "tee /logs/agent/mini-swe-agent.txt"
             ),
             env=env,
+            telemetry=True,
         )

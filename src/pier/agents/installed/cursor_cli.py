@@ -728,4 +728,5 @@ class CursorCli(BaseInstalledAgent):
                 f"2>&1 | stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,
+            telemetry=True,
         )

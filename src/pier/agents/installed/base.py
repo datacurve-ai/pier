@@ -1,5 +1,6 @@
 import functools
 import os
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
 from pier.utils.env import parse_bool_env_value
 from pier.utils.templating import render_prompt_template
+from pier.telemetry import TelemetryDecoder, current_telemetry_context
 
 
 class NonZeroAgentExitCodeError(RuntimeError):
@@ -144,6 +146,10 @@ class BaseInstalledAgent(BaseAgent, ABC):
 
     CLI_FLAGS: ClassVar[list[CliFlag]] = []
     ENV_VARS: ClassVar[list[EnvVar]] = []
+    _TELEMETRY_FILTER_PATTERN = (
+        r"^PIER_EVENT |(^|[^0-9])429([^0-9]|$)|"
+        r"rate[ _-]?limit|too many requests"
+    )
 
     def __init__(
         self,
@@ -312,6 +318,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        telemetry: bool = False,
     ) -> Any:
         """Execute a command with logging, _extra_env merging, and error handling.
 
@@ -330,13 +337,42 @@ class BaseInstalledAgent(BaseAgent, ABC):
             },
         )
 
-        result = await environment.exec(
-            command=f"set -o pipefail; {command}",
-            user=user,
-            env=environment.agent_process_env(merged_env),
-            cwd=cwd,
-            timeout_sec=timeout_sec,
-        )
+        telemetry_context = current_telemetry_context() if telemetry else None
+        if telemetry_context is None:
+            result = await environment.exec(
+                command=f"set -o pipefail; {command}",
+                user=user,
+                env=environment.agent_process_env(merged_env),
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+            )
+        else:
+            # Agent commands already tee their complete output to /logs/agent. This
+            # final filter keeps the host telemetry stream tiny while preserving the
+            # upstream pipeline's exit status through `set -o pipefail`.
+            filtered_command = (
+                f"{command} | {{ grep --line-buffered -E -i "
+                f"{shlex.quote(self._TELEMETRY_FILTER_PATTERN)} || true; }}"
+            )
+            decoder = TelemetryDecoder(telemetry_context)
+
+            async def on_output(_stream: str, chunk: str) -> None:
+                await decoder.feed(chunk)
+
+            result = await environment.exec_stream(
+                command=f"set -o pipefail; {filtered_command}",
+                on_output=on_output,
+                input_queue=(
+                    telemetry_context.pause_messages
+                    if environment.capabilities.exec_stdin
+                    else None
+                ),
+                user=user,
+                env=environment.agent_process_env(merged_env),
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+            )
+            await decoder.flush()
         if result.return_code != 0:
             self.logger.debug(
                 "Command failed",
@@ -381,10 +417,16 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        telemetry: bool = False,
     ) -> Any:
         """Execute a command as the default agent user."""
         return await self._exec(
-            environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec
+            environment,
+            command,
+            env=env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            telemetry=telemetry,
         )
 
     def render_instruction(self, instruction: str) -> str:

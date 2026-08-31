@@ -1164,6 +1164,7 @@ class Codex(BaseInstalledAgent):
                     }"
                 ),
                 env=env,
+                telemetry=True,
             )
         finally:
             try:

@@ -746,6 +746,7 @@ class GeminiCli(BaseInstalledAgent):
                     f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/gemini-cli.txt"
                 ),
                 env=env,
+                telemetry=True,
             )
         finally:
             try:
