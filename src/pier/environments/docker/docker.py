@@ -499,7 +499,7 @@ class DockerEnvironment(BaseEnvironment):
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
         )
 
         try:
