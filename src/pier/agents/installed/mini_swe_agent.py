@@ -562,6 +562,7 @@ class MiniSweAgent(BaseInstalledAgent):
         "anthropic": ["api.anthropic.com"],
         "bedrock": [".amazonaws.com"],
         "deepseek": ["api.deepseek.com"],
+        "fireworks_ai": ["api.fireworks.ai"],
         "gemini": [".googleapis.com"],
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],

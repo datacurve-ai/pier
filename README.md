@@ -10,7 +10,7 @@ pier run -p path/to/task --agent claude-code --env modal
 
 Pier is a fork. We wanted a smaller, more opinionated base to build on. On top of Harbor, Pier adds:
 
-- **Installed agents in air-gapped tasks (`allow_internet = false`).** When the agent runs *inside* the sandbox (Claude Code, Codex, etc.), both the install step and the inference call need the network. Pier lets agents declare their install scripts and a network allowlist, which `docker` and `modal` environments honor when setting up the sandbox.
+- **Installed agents in air-gapped tasks (`allow_internet = false`).** When the agent runs *inside* the sandbox (Claude Code, Codex, etc.), both the install step and the inference call need the network. Pier lets agents declare their install scripts and a network allowlist, which `docker`, `modal`, `daytona`, and `e2b` environments honor when setting up the sandbox.
 - **Augmented ATIF v1.7.** Strict one step per API turn, strict reasoning vs agent message separation, no fabricated assistant text, `peak_context_tokens`, `summarization_count`, `llm_call_count`, real upstream timestamps.
 - **A chat-style trajectory viewer** (`pier view`).
 - **`pier critique run`** for inspecting completed trials with a fresh agent in a fresh sandbox.
@@ -18,7 +18,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 ## What works today
 
 - **Task format:** Harbor-compatible.
-- **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
+- **Environments:** `docker`, `modal`, `daytona`, `e2b`. Per-agent install specs and network allowlists are honored on all of them, so installed agents work under `allow_internet = false`.
 - **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
@@ -55,6 +55,15 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 ```
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
+
+## Environment configuration
+
+`--env` selects the sandbox backend — `docker`, `modal`, `daytona`, or `e2b` —
+and each reads its own credentials from the process env or `--env-file` (e.g.
+`E2B_API_KEY` for E2B). `-n` sets how many trials run concurrently (default 4);
+raise it only within your provider quotas and budget. Per-backend behavior —
+image and Dockerfile semantics, template/layer caching, and command retries —
+lives in each environment class's docstring.
 
 ## Agent runtime configuration
 
@@ -144,4 +153,12 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
   env: { OPENROUTER_API_KEY: ${OPENROUTER_API_KEY} }
   kwargs:
     set_cache_control: default_end
+```
+
+For Fireworks via mini-swe-agent, pass `FIREWORKS_AI_API_KEY` directly.
+
+```yaml
+- name: mini-swe-agent
+  model_name: fireworks_ai/accounts/fireworks/models/kimi-k2p6
+  env: { FIREWORKS_AI_API_KEY: ${FIREWORKS_AI_API_KEY} }
 ```
