@@ -41,7 +41,11 @@ from pier.utils.optional_import import MissingExtraError
 
 try:
     import modal
-    from modal import App, Image, Sandbox, Secret, Volume
+    from modal import App, Image, Proxy, Sandbox, Secret, Volume
+    from modal.exception import (
+        SandboxFilesystemNotADirectoryError,
+        SandboxFilesystemNotFoundError,
+    )
 
     _HAS_MODAL = True
 except ImportError:
@@ -101,25 +105,30 @@ class _ModalStrategy:
         await self._env._sdk_download_dir(source_dir, target_dir)
 
     async def is_dir(self, path: str, user: str | int | None = None) -> bool:
-        """Check if a remote path is a directory (uses sandbox.ls)."""
+        """Check if a remote path is a directory."""
         if not self._env._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
         try:
-            await self._env._sandbox.ls.aio(path)
+            await self._env._sandbox.filesystem.list_files.aio(path)
             return True
-        except (NotADirectoryError, FileNotFoundError):
+        except (
+            NotADirectoryError,
+            FileNotFoundError,
+            SandboxFilesystemNotADirectoryError,
+            SandboxFilesystemNotFoundError,
+        ):
             return False
 
     async def is_file(self, path: str, user: str | int | None = None) -> bool:
-        """Check if a remote path is a file (uses sandbox.ls)."""
+        """Check if a remote path is a file."""
         if not self._env._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
         try:
-            await self._env._sandbox.ls.aio(path)
+            await self._env._sandbox.filesystem.list_files.aio(path)
             return False
-        except NotADirectoryError:
+        except (NotADirectoryError, SandboxFilesystemNotADirectoryError):
             return True
-        except FileNotFoundError:
+        except (FileNotFoundError, SandboxFilesystemNotFoundError):
             return False
 
     async def _teardown_sandbox(self) -> None:
@@ -803,6 +812,8 @@ class ModalEnvironment(BaseEnvironment):
         registry_secret: str | None = None,
         volumes: dict[str, str] | None = None,
         app_name: str = "__pier__",
+        proxy_name: str | None = None,
+        proxy_environment_name: str | None = None,
         sandbox_timeout_secs: int = 60 * 60 * 24,
         sandbox_idle_timeout_secs: int | None = None,
         *args,
@@ -828,6 +839,11 @@ class ModalEnvironment(BaseEnvironment):
             app_name: Name of the Modal App to use. All sandboxes created
                 with the same app name share a single Modal App. Default
                 is "__pier__".
+            proxy_name: Optional Modal Proxy name to use for static outbound IPs.
+                The proxy is attached to both task sandboxes and Pier's filtered-
+                egress proxy sandbox.
+            proxy_environment_name: Optional Modal environment containing
+                ``proxy_name``. If omitted, Modal's active environment is used.
             sandbox_timeout_secs: Maximum lifetime of the sandbox in seconds.
                 The sandbox will be terminated after this duration regardless of
                 activity. Default is 86400 (24 hours). See Modal sandbox docs:
@@ -870,6 +886,18 @@ class ModalEnvironment(BaseEnvironment):
         self._registry_secret = registry_secret
         self._volumes = volumes or {}
         self._app_name = app_name
+        if proxy_environment_name and not proxy_name:
+            raise ValueError(
+                "proxy_environment_name requires proxy_name to be configured."
+            )
+        self._proxy = (
+            Proxy.from_name(
+                proxy_name,
+                environment_name=proxy_environment_name,
+            )
+            if proxy_name
+            else None
+        )
         self._sandbox_timeout = sandbox_timeout_secs
         self._sandbox_idle_timeout = sandbox_idle_timeout_secs
 
@@ -1005,6 +1033,7 @@ class ModalEnvironment(BaseEnvironment):
             timeout=self._sandbox_timeout,
             idle_timeout=self._sandbox_idle_timeout,
             name=f"{self.session_id}-egress-proxy",
+            proxy=self._proxy,
         )
         tunnel = (await self._egress_proxy_sandbox.tunnels.aio(timeout=60))[
             EGRESS_PROXY_PORT
@@ -1084,6 +1113,7 @@ class ModalEnvironment(BaseEnvironment):
             cidr_allowlist=cidr_allowlist or self._egress_cidr_allowlist,
             secrets=self._secrets_config(),
             volumes=self._volumes_config(),  # type: ignore[arg-type]
+            proxy=self._proxy,
             **kwargs,
         )
 
