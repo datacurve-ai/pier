@@ -15,6 +15,8 @@ class TimingInfo(BaseModel):
 
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    attempt: int | None = None
+    max_attempts: int | None = None
 
 
 class ExceptionInfo(BaseModel):
@@ -64,6 +66,8 @@ class StepResult(BaseModel):
     exception_info: ExceptionInfo | None = None
     agent_execution: TimingInfo | None = None
     verifier: TimingInfo | None = None
+    verifier_attempt: int | None = None
+    max_verifier_attempts: int | None = None
 
 
 class TrialResult(BaseModel):
@@ -85,6 +89,8 @@ class TrialResult(BaseModel):
     agent_setup: TimingInfo | None = None
     agent_execution: TimingInfo | None = None
     verifier: TimingInfo | None = None
+    verifier_attempt: int | None = None
+    max_verifier_attempts: int | None = None
     n_agent_steps: int | None = None
     step_results: list[StepResult] | None = None
 

@@ -224,6 +224,17 @@ def start(
             show_default=False,
         ),
     ] = None,
+    verifier_max_attempts: Annotated[
+        int | None,
+        Option(
+            "--verifier-max-attempts",
+            "--verifier-attempts",
+            help="Maximum number of verifier execution attempts (default: 2). Set to 1 to disable retries.",
+            rich_help_panel="Job Settings",
+            show_default=False,
+        ),
+    ] = None,
+
     agent_setup_timeout_multiplier: Annotated[
         float | None,
         Option(
@@ -695,8 +706,11 @@ def start(
 
     if verifier_env is not None:
         config.verifier.env.update(parse_env_vars(verifier_env))
+    if verifier_max_attempts is not None:
+        config.verifier.max_attempts = verifier_max_attempts
     if disable_verification:
         config.verifier.disable = disable_verification
+
 
     if artifact_paths is not None:
         config.artifacts = list(artifact_paths)

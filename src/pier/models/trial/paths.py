@@ -216,6 +216,12 @@ class TrialPaths:
         return self.trial_dir / "result.json"
 
     @property
+    def progress_path(self) -> Path:
+        """Durable progress state of the trial."""
+        return self.trial_dir / "progress.json"
+
+
+    @property
     def exception_message_path(self) -> Path:
         """
         A text file containing the exception message.

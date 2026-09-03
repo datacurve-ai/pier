@@ -193,6 +193,8 @@ class RetryConfig(BaseModel):
         default_factory=lambda: {
             "AgentTimeoutError",
             "VerifierTimeoutError",
+            "VerifierTestExecutionTimeoutError",
+            "VerifierRewardParseTimeoutError",
             "RewardFileNotFoundError",
             "RewardFileEmptyError",
             "VerifierOutputParseError",
