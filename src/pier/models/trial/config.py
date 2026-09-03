@@ -173,13 +173,28 @@ class EnvironmentConfig(BaseModel):
 class VerifierConfig(BaseModel):
     override_timeout_sec: float | None = None
     max_timeout_sec: float | None = None
+    max_attempts: int = Field(
+        default=2,
+        ge=1,
+        description="Maximum number of verifier execution attempts. Set to 1 to disable retries.",
+    )
     env: dict[str, str] = Field(default_factory=dict)
     disable: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_max_retries(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "max_retries" in data and "max_attempts" not in data:
+                data = dict(data)
+                data["max_attempts"] = data.pop("max_retries") + 1
+        return data
 
     @field_serializer("env")
     @classmethod
     def _serialize_env(cls, env: dict[str, str]) -> dict[str, str]:
         return templatize_sensitive_env(env)
+
 
 
 class TaskConfig(BaseModel):
