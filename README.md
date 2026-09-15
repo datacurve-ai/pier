@@ -10,7 +10,7 @@ pier run -p path/to/task --agent claude-code --env modal
 
 Pier is a fork. We wanted a smaller, more opinionated base to build on. On top of Harbor, Pier adds:
 
-- **Installed agents in air-gapped tasks (`allow_internet = false`).** When the agent runs *inside* the sandbox (Claude Code, Codex, etc.), both the install step and the inference call need the network. Pier lets agents declare their install scripts and a network allowlist, which `docker` and `modal` environments honor when setting up the sandbox.
+- **Installed agents in air-gapped tasks (`allow_internet = false`).** When the agent runs *inside* the sandbox (Claude Code, Codex, etc.), both the install step and the inference call need the network. Pier lets agents declare their install scripts and a network allowlist, which `docker`, `modal`, `daytona`, and `e2b` environments honor when setting up the sandbox.
 - **Augmented ATIF v1.7.** Strict one step per API turn, strict reasoning vs agent message separation, no fabricated assistant text, `peak_context_tokens`, `summarization_count`, `llm_call_count`, real upstream timestamps.
 - **A chat-style trajectory viewer** (`pier view`).
 - **`pier critique run`** for inspecting completed trials with a fresh agent in a fresh sandbox.
@@ -18,7 +18,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 ## What works today
 
 - **Task format:** Harbor-compatible.
-- **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
+- **Environments:** `docker`, `modal`, `daytona`, `e2b`. Per-agent install specs and network allowlists are honored on all of them, so installed agents work under `allow_internet = false`.
 - **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
@@ -55,6 +55,45 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 ```
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
+
+## Environment configuration
+
+`--env` selects the sandbox backend — `docker`, `modal`, `daytona`, or `e2b` —
+and each reads its own credentials from the process env or `--env-file` (e.g.
+`E2B_API_KEY` for E2B). `-n` sets how many trials run concurrently (default 4);
+raise it only within your provider quotas and budget. Per-backend behavior —
+image and Dockerfile semantics, template/layer caching, and command retries —
+lives in each environment class's docstring.
+
+E2B requires a prebuilt task image: set `[environment].docker_image` in
+`task.toml` to a published Linux amd64 image, ideally pinned by digest. Pier
+uses `Template().from_image()` and adds the agent installation as cached template
+steps; the task's local Dockerfile is ignored. Separate verifiers also require
+`[verifier.environment].docker_image`, with their tests baked into that image.
+
+```bash
+pier run -p path/to/task --agent oracle --env e2b --env-file .env
+# Reuse the prepared templates and fail if one is missing:
+pier run -p path/to/task --agent oracle --env e2b --env-file .env \
+  --ek template_mode=required
+```
+
+Build and publish Dockerfile-only tasks with Docker before running them on E2B.
+Pier does not parse or convert Dockerfiles for E2B. Registry metadata access
+currently supports public images only. Template
+identity includes the image reference, resources, and agent installation; use
+`--force-build` to pick up changes behind a mutable image tag.
+
+To check the backend against real E2B sandboxes, set `E2B_API_KEY` and run:
+
+```bash
+uv run python scripts/verify_e2b.py --image ubuntu:24.04
+uv run python scripts/verify_e2b.py --image ubuntu:24.04 --template-mode required
+```
+
+These opt-in checks cover command results, file transfers, pause/TTL recovery,
+timeout and cancellation cleanup, and sandbox deletion. They retain the reusable
+template; the second run requires that template to exist.
 
 ## Agent runtime configuration
 

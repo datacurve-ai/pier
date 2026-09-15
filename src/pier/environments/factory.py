@@ -27,8 +27,7 @@ class _EnvEntry(NamedTuple):
 
 
 # Registry of built-in environment types. Modules are imported lazily so optional
-# vendor SDKs are only loaded when that environment is requested. Pier only ships
-# Docker and Modal; other Pier environment implementations are not included.
+# vendor SDKs are only loaded when that environment is requested.
 _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
     EnvironmentType.DOCKER: _EnvEntry(
         "pier.environments.docker.docker",
@@ -44,6 +43,11 @@ _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
         "pier.environments.daytona",
         "DaytonaEnvironment",
         "daytona",
+    ),
+    EnvironmentType.E2B: _EnvEntry(
+        "pier.environments.e2b",
+        "E2BEnvironment",
+        "e2b",
     ),
 }
 
