@@ -65,11 +65,11 @@ raise it only within your provider quotas and budget. Per-backend behavior —
 image and Dockerfile semantics, template/layer caching, and command retries —
 lives in each environment class's docstring.
 
-For E2B, prefer a prebuilt task image: set `[environment].docker_image` in
+E2B requires a prebuilt task image: set `[environment].docker_image` in
 `task.toml` to a published Linux amd64 image, ideally pinned by digest. Pier
 uses `Template().from_image()` and adds the agent installation as cached template
-steps; the task's local Dockerfile is ignored. For a separate verifier with a
-published image, set `[verifier.environment].docker_image` too.
+steps; the task's local Dockerfile is ignored. Separate verifiers also require
+`[verifier.environment].docker_image`, with their tests baked into that image.
 
 ```bash
 pier run -p path/to/task --agent oracle --env e2b --env-file .env
@@ -78,12 +78,22 @@ pier run -p path/to/task --agent oracle --env e2b --env-file .env \
   --ek template_mode=required
 ```
 
-Without a prebuilt image, E2B supports a limited single-stage Dockerfile
-conversion. Multi-stage builds and variable-dependent `ENV`, `WORKDIR`, or
-`USER` instructions require building and publishing the image with Docker
-first. Registry metadata access currently supports public images only. Template
+Build and publish Dockerfile-only tasks with Docker before running them on E2B.
+Pier does not parse or convert Dockerfiles for E2B. Registry metadata access
+currently supports public images only. Template
 identity includes the image reference, resources, and agent installation; use
 `--force-build` to pick up changes behind a mutable image tag.
+
+To check the backend against real E2B sandboxes, set `E2B_API_KEY` and run:
+
+```bash
+uv run python scripts/verify_e2b.py --image ubuntu:24.04
+uv run python scripts/verify_e2b.py --image ubuntu:24.04 --template-mode required
+```
+
+These opt-in checks cover command results, file transfers, pause/TTL recovery,
+timeout and cancellation cleanup, and sandbox deletion. They retain the reusable
+template; the second run requires that template to exist.
 
 ## Agent runtime configuration
 

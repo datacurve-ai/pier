@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Literal
 
 from tenacity import (
@@ -51,6 +51,7 @@ try:
         SandboxNetworkOpts,
         Template,
         TemplateBuildStatus,
+        TimeoutException as E2BTimeoutException,
     )
 
     _API_RETRYABLE: tuple[type[BaseException], ...] = (
@@ -83,7 +84,13 @@ try:
         httpx.PoolTimeout,
         RateLimitException,
     )
-    _COMMAND_STREAM_RETRYABLE: tuple[type[BaseException], ...] = (RpcConnectError,)
+    # The SDK translates pause/proxy UNAVAILABLE and CANCELED responses to
+    # TimeoutException. These are stream failures, distinct from the caller's
+    # asyncio deadline, and can be recovered by reconnecting to the same PID.
+    _COMMAND_STREAM_RETRYABLE: tuple[type[BaseException], ...] = (
+        RpcConnectError,
+        E2BTimeoutException,
+    )
     _HAS_E2B = True
 except ImportError:
     _API_RETRYABLE = ()
@@ -92,15 +99,14 @@ except ImportError:
     _HAS_E2B = False
 
 
-# v5: agent installs default to root and Docker context fingerprints include
-# filesystem metadata that affects COPY semantics.
+# Template schema identifies the metadata and agent markers baked into images.
 _TEMPLATE_SCHEMA_VERSION = "pier-e2b-v5"
 _AGENT_FINGERPRINT_PATH = "/etc/pier/agent-install-fingerprint"
 _IMAGE_CONFIG_PATH = "/etc/pier/image-config.json"
 # E2B template names (alias included) are capped at 128 characters.
 _TEMPLATE_NAME_MAX_LEN = 128
 _TEMPLATE_LOCKS: dict[str, asyncio.Lock] = {}
-_IMAGE_ENV_CACHE: dict[str, dict[str, str]] = {}
+_IMAGE_ENV_CACHE: dict[str, dict] = {}
 _IMAGE_ENV_LOCKS: dict[str, asyncio.Lock] = {}
 # E2B enforces a team-wide cap on concurrent template builds -- 20 is default
 _BUILD_CONCURRENCY = int(os.environ.get("PIER_E2B_MAX_CONCURRENT_BUILDS", "20"))
@@ -121,112 +127,6 @@ def _template_lock(name: str) -> asyncio.Lock:
 
 def _image_env_lock(ref: str) -> asyncio.Lock:
     return _IMAGE_ENV_LOCKS.setdefault(ref, asyncio.Lock())
-
-
-def _join_continuations(dockerfile_text: str) -> str:
-    """Fold backslash line continuations so each instruction is one line."""
-    return re.sub(r"\\\s*\n", " ", dockerfile_text)
-
-
-_DOCKER_ENV_REF = re.compile(
-    r"(?<!\\)\$(?:"
-    r"\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:(?P<operator>:-|:\+)(?P<word>[^}]*))?\}"
-    r"|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
-)
-_ESCAPED_DOLLAR = "\ue000"
-
-
-def _interpolate_docker_value(value: str, resolved: dict[str, str]) -> str:
-    """Expand the Dockerfile variable forms used by ENV/WORKDIR/USER/FROM."""
-
-    def replace(match: re.Match[str]) -> str:
-        name = match.group("braced") or match.group("plain")
-        current = resolved.get(name, "")
-        operator = match.group("operator")
-        word = match.group("word") or ""
-        if operator == ":-":
-            return current or _interpolate_docker_value(word, resolved)
-        if operator == ":+":
-            return _interpolate_docker_value(word, resolved) if current else ""
-        return current
-
-    return _DOCKER_ENV_REF.sub(replace, value).replace(r"\$", "$")
-
-
-def _parse_dockerfile(
-    dockerfile_text: str,
-) -> tuple[str | None, list[str], str | None, str | None]:
-    """Return (base image, ENV lines, last WORKDIR, last USER) of a single-stage Dockerfile.
-
-    Multi-stage Dockerfiles are rejected up front in ``_validate_definition``
-    because E2B's ``from_dockerfile`` does not support them.
-    """
-    base: str | None = None
-    env_lines: list[str] = []
-    workdir: str | None = None
-    user: str | None = None
-    args: dict[str, str] = {}
-    resolved_env: dict[str, str] = {}
-    for raw in _join_continuations(dockerfile_text).splitlines():
-        line = raw.strip()
-        upper = line.upper()
-        if upper.startswith("ARG "):
-            assignment = line.split(None, 1)[1]
-            key, separator, value = assignment.partition("=")
-            if separator:
-                args[key.strip()] = _interpolate_docker_value(
-                    value.strip(), {**args, **resolved_env}
-                )
-        elif upper.startswith("FROM "):
-            tokens = [t for t in line.split()[1:] if not t.startswith("--")]
-            if tokens:
-                base = _interpolate_docker_value(tokens[0], args) or None
-        elif upper.startswith("ENV "):
-            assignment = line[4:]
-            env_lines.append(assignment)
-            resolved_env.update(_parse_env_assignments(assignment, resolved_env))
-        elif upper.startswith("WORKDIR "):
-            value = _interpolate_docker_value(
-                line.split(None, 1)[1].strip("\"'"),
-                {**args, **resolved_env},
-            )
-            if value.startswith("/") or workdir is None:
-                workdir = value
-            else:
-                workdir = str(PurePosixPath(workdir) / value)
-        elif upper.startswith("USER "):
-            user = _interpolate_docker_value(
-                line.split(None, 1)[1].strip("\"'"),
-                {**args, **resolved_env},
-            )
-    return base, env_lines, workdir, user
-
-
-def _resolve_from_instruction(dockerfile_text: str, base_image: str | None) -> str:
-    """Replace an ARG-backed single-stage FROM with its resolved image."""
-    if base_image is None:
-        raise ValueError("E2B could not resolve the Dockerfile's FROM image.")
-    return re.sub(
-        r"(?im)^(?P<prefix>[ \t]*FROM[ \t]+(?:--[^ \t]+[ \t]+)*)[^ \t\n]+",
-        lambda match: f"{match.group('prefix')}{base_image}",
-        dockerfile_text,
-        count=1,
-    )
-
-
-def _strip_boot_instructions(dockerfile_text: str) -> str:
-    """Drop CMD/ENTRYPOINT so E2B's ``from_dockerfile`` does not turn the
-    task boot command into a template start command (run and snapshotted
-    during template creation, plus a readiness delay). Pier's Docker backend
-    likewise overrides the task command with ``sleep infinity``."""
-    # Continuation lines (ending in a backslash) are consumed first, then the
-    # final line of the instruction.
-    return re.sub(
-        r"(?im)^[ \t]*(?:CMD|ENTRYPOINT)\b(?:[^\n]*\\[ \t]*\n)*[^\n]*\n?",
-        "",
-        dockerfile_text,
-    )
 
 
 def _is_retryable_registry_error(exc: BaseException) -> bool:
@@ -266,34 +166,6 @@ def _template_command_as_user(command: str, user: str | int) -> tuple[str, str]:
         f'exec su -m "$__pier_user" -s /bin/bash -c {shlex.quote(command)}'
     )
     return wrapped, "root"
-
-
-def _parse_env_assignments(text: str, resolved: dict[str, str]) -> dict[str, str]:
-    """Parse Dockerfile ENV assignments, interpolating against ``resolved``."""
-    parsed: dict[str, str] = {}
-
-    try:
-        tokens = shlex.split(text.replace(r"\$", _ESCAPED_DOLLAR))
-    except ValueError:
-        tokens = text.replace(r"\$", _ESCAPED_DOLLAR).split()
-    if tokens and "=" not in tokens[0]:
-        # Legacy `ENV key value` form: everything after the key is the value.
-        key = tokens[0]
-        value = " ".join(tokens[1:])
-        parsed[key] = _interpolate_docker_value(value, resolved).replace(
-            _ESCAPED_DOLLAR, "$"
-        )
-        return parsed
-    for token in tokens:
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        # Docker expands every value against the environment as it existed
-        # before this ENV instruction, not against sibling assignments.
-        parsed[key] = _interpolate_docker_value(value, resolved).replace(
-            _ESCAPED_DOLLAR, "$"
-        )
-    return parsed
 
 
 def _parse_image_ref(image_ref: str) -> tuple[str, str, str]:
@@ -422,7 +294,7 @@ def _egress_rules(domains: list[str]) -> list[str]:
 class E2BEnvironment(BaseEnvironment):
     """Pier execution environment backed by reusable E2B templates.
 
-    Template identity includes the task image/context, requested resources,
+    Template identity includes the task image, requested resources,
     integration schema, and Pier's agent-install fingerprint, so repeated
     trials of the same task+agent reuse a prepared template instead of
     installing the coding agent inside every billable sandbox. Changing any of
@@ -432,10 +304,10 @@ class E2BEnvironment(BaseEnvironment):
     Pin task images, or pass ``force_build`` to rebuild (which also refetches
     the image config).
 
-    Prefer a published task ``docker_image``: it is imported directly with
-    ``from_image`` and the local Dockerfile is ignored. The fallback converter
-    accepts single-stage Dockerfiles without variable-dependent ENV, WORKDIR,
-    or USER instructions. Build more complex task images with Docker first.
+    A published task ``docker_image`` is required and imported directly with
+    ``from_image``. Local Dockerfiles and build contexts are not read. Separate
+    verifiers also require a published image with their tests baked in, matching
+    Pier's separate-verifier contract. Build task images with Docker first.
 
     Keyword args (via ``environment.kwargs``):
 
@@ -469,11 +341,8 @@ class E2BEnvironment(BaseEnvironment):
     ``_load_image_config``, and ``_export_prefix``. Registry access is
     anonymous-pull only, and only needed when a template is first built.
 
-    Task Dockerfile CMD/ENTRYPOINT instructions are ignored: E2B would otherwise
-    run them while creating the reusable template and snapshot their state.
-    Pier's Docker backend similarly overrides the boot command with
-    ``sleep infinity``, though it leaves image ENTRYPOINTs in place — tasks
-    must not rely on CMD/ENTRYPOINT side effects under E2B.
+    E2B starts its sandbox service rather than the image CMD/ENTRYPOINT, so
+    tasks must not depend on container entrypoint side effects.
 
     ``PIER_E2B_MAX_CONCURRENT_BUILDS`` caps concurrent template builds per
     Pier process (default 20, matching E2B's default team-wide concurrent
@@ -557,42 +426,15 @@ class E2BEnvironment(BaseEnvironment):
     def template_name(self) -> str:
         return self._template_name
 
-    @property
-    def _environment_definition_path(self) -> Path:
-        return self.environment_dir / "Dockerfile"
-
     def _validate_definition(self) -> None:
         if (self.environment_dir / "docker-compose.yaml").exists():
             raise ValueError("E2B does not support Docker Compose task environments.")
-        if self.task_env_config.docker_image:
-            return
-        if not self._environment_definition_path.exists():
-            raise FileNotFoundError(
-                f"{self._environment_definition_path} not found. "
-                "E2B supports a prebuilt docker_image or a single Dockerfile task."
-            )
-        dockerfile = _join_continuations(self._environment_definition_path.read_text())
-        for line in dockerfile.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) != 2:
-                continue
-            instruction, value = parts
-            if instruction.upper() in {"ENV", "WORKDIR", "USER"} and "$" in value:
-                raise ValueError(
-                    "E2B Dockerfile conversion does not support variable-dependent "
-                    "ENV, WORKDIR, or USER instructions. Build and publish the task "
-                    "with Docker, then set a prebuilt docker_image in task.toml."
-                )
-        from_count = sum(
-            1
-            for line in dockerfile.splitlines()
-            if line.split() and line.split()[0].upper() == "FROM"
-        )
-        if from_count > 1:
-            # Fail fast: E2B's from_dockerfile rejects multi-stage builds,
-            # but only once the template build starts.
+        if not self.task_env_config.docker_image:
             raise ValueError(
-                "E2B does not support multi-stage Dockerfile task environments."
+                "E2B requires a published docker_image. Build the task Dockerfile "
+                "with Docker and set [environment].docker_image in task.toml. "
+                "Separate verifiers require [verifier.environment].docker_image "
+                "with their tests baked in."
             )
 
     def _template_fingerprint(self) -> str:
@@ -608,24 +450,7 @@ class E2BEnvironment(BaseEnvironment):
             ).encode()
         )
 
-        if self.task_env_config.docker_image:
-            digest.update(f"image={self.task_env_config.docker_image}\0".encode())
-        else:
-            for path in sorted(self.environment_dir.rglob("*")):
-                relative = path.relative_to(self.environment_dir).as_posix()
-                digest.update(f"path={relative}\0".encode())
-                metadata = path.lstat()
-                digest.update(f"mode={stat.S_IMODE(metadata.st_mode):o}\0".encode())
-                if stat.S_ISLNK(metadata.st_mode):
-                    digest.update(f"symlink={os.readlink(path)}\0".encode())
-                elif stat.S_ISREG(metadata.st_mode):
-                    digest.update(b"file\0")
-                    digest.update(path.read_bytes())
-                elif stat.S_ISDIR(metadata.st_mode):
-                    digest.update(b"directory\0")
-                else:
-                    digest.update(f"type={stat.S_IFMT(metadata.st_mode):o}\0".encode())
-                digest.update(b"\0")
+        digest.update(f"image={self.task_env_config.docker_image}\0".encode())
 
         if self.agent_install_spec is not None:
             digest.update(f"agent={self.agent_install_spec.fingerprint()}\0".encode())
@@ -648,21 +473,7 @@ class E2BEnvironment(BaseEnvironment):
             refresh=refresh_image_config
         )
 
-        if self.task_env_config.docker_image:
-            definition = Template().from_image(self.task_env_config.docker_image)
-        else:
-            # CMD/ENTRYPOINT are stripped: E2B's from_dockerfile would turn
-            # them into a template start command, running the task boot
-            # command during template creation (see _strip_boot_instructions).
-            dockerfile_text = _strip_boot_instructions(
-                self._environment_definition_path.read_text()
-            )
-            base_image, _, _, _ = _parse_dockerfile(dockerfile_text)
-            # Validation limits this fallback to the supported Dockerfile
-            # subset. Published task images bypass conversion entirely.
-            definition = Template(
-                file_context_path=str(self.environment_dir)
-            ).from_dockerfile(_resolve_from_instruction(dockerfile_text, base_image))
+        definition = Template().from_image(self.task_env_config.docker_image)
 
         # Bake the docker-exec-equivalent ENV/WORKDIR into the template:
         # install steps below then run with the image env (docker build
@@ -837,15 +648,6 @@ class E2BEnvironment(BaseEnvironment):
                 create_task.cancel()
             raise
 
-    def _runtime_image_ref(
-        self,
-    ) -> tuple[str | None, list[str], str | None, str | None]:
-        """The image whose config governs runtime commands, plus any ENV
-        lines, WORKDIR, and USER the task Dockerfile layers on top of it."""
-        if self.task_env_config.docker_image:
-            return self.task_env_config.docker_image, [], None, None
-        return _parse_dockerfile(self._environment_definition_path.read_text())
-
     @retry(
         stop=stop_after_attempt(6),
         wait=wait_random_exponential(multiplier=1, max=30),
@@ -864,11 +666,8 @@ class E2BEnvironment(BaseEnvironment):
         precedence), defaults the cwd to the image WORKDIR, and runs as the
         image USER for backend equivalence. Called at template build time
         only; the result is baked into the template."""
-        image_ref, env_lines, dockerfile_workdir, dockerfile_user = (
-            self._runtime_image_ref()
-        )
-        if image_ref is None:
-            return {}, dockerfile_workdir, _normalize_user(dockerfile_user)
+        image_ref = self.task_env_config.docker_image
+        assert image_ref is not None  # Checked before any sandbox/build calls.
         async with _image_env_lock(image_ref):
             if refresh or image_ref not in _IMAGE_ENV_CACHE:
                 try:
@@ -883,14 +682,7 @@ class E2BEnvironment(BaseEnvironment):
                         "E2B sandbox commands."
                     ) from exc
         cached = _IMAGE_ENV_CACHE[image_ref]
-        env = dict(cached["env"])
-        for line in env_lines:
-            env.update(_parse_env_assignments(line, env))
-        user = _normalize_user(dockerfile_user) or cached.get("user")
-        workdir = dockerfile_workdir or cached["workdir"]
-        if workdir and not workdir.startswith("/"):
-            workdir = str(PurePosixPath(cached["workdir"] or "/") / workdir)
-        return env, workdir, user
+        return dict(cached["env"]), cached["workdir"], cached.get("user")
 
     @retry(
         stop=stop_after_attempt(5),

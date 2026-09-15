@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -90,41 +89,6 @@ def test_template_name_is_deterministic_and_agent_sensitive(tmp_path):
     assert len(first.template_name) <= 128
 
 
-def test_template_name_tracks_context_mode_and_symlink_target(tmp_path):
-    env_dir = tmp_path / "environment"
-    env_dir.mkdir()
-    script = env_dir / "run.sh"
-    script.write_text("#!/bin/sh\necho ok\n")
-    (env_dir / "target-a").write_text("same\n")
-    (env_dir / "target-b").write_text("same\n")
-    link = env_dir / "linked"
-    link.symlink_to("target-a")
-    (env_dir / "Dockerfile").write_text(
-        "FROM ubuntu:24.04\nCOPY run.sh linked /usr/local/bin/\n"
-    )
-    trial_paths = TrialPaths(trial_dir=tmp_path / "trial")
-    trial_paths.mkdir()
-
-    def make_env() -> E2BEnvironment:
-        return E2BEnvironment(
-            environment_dir=env_dir,
-            environment_name="task",
-            session_id="s",
-            trial_paths=trial_paths,
-            task_env_config=EnvironmentConfig(),
-        )
-
-    os.chmod(script, 0o644)
-    original = make_env().template_name
-    os.chmod(script, 0o755)
-    assert make_env().template_name != original
-
-    os.chmod(script, 0o644)
-    link.unlink()
-    link.symlink_to("target-b")
-    assert make_env().template_name != original
-
-
 def test_compose_tasks_are_rejected(tmp_path):
     env_dir = tmp_path / "environment"
     env_dir.mkdir(parents=True)
@@ -141,56 +105,6 @@ def test_compose_tasks_are_rejected(tmp_path):
             trial_paths=trial_paths,
             task_env_config=EnvironmentConfig(docker_image="ubuntu:24.04"),
         )
-
-
-def test_multi_stage_dockerfiles_are_rejected(tmp_path):
-    env_dir = tmp_path / "environment"
-    env_dir.mkdir(parents=True)
-    (env_dir / "Dockerfile").write_text(
-        "FROM golang:1.22 AS builder\nRUN go build\nFROM ubuntu:24.04\n"
-    )
-    trial_paths = TrialPaths(trial_dir=tmp_path / "trial")
-    trial_paths.mkdir()
-
-    with pytest.raises(ValueError, match="multi-stage"):
-        E2BEnvironment(
-            environment_dir=env_dir,
-            environment_name="task",
-            session_id="s",
-            trial_paths=trial_paths,
-            task_env_config=EnvironmentConfig(),
-        )
-
-
-def test_dockerfile_runtime_config_handles_arg_env_and_relative_workdir():
-    dockerfile = r"""
-ARG BASE=ubuntu:24.04
-FROM ${BASE}
-ENV BAR=wrong BAR_SUFFIX=right
-ENV GREETING "Hello World"
-ENV TARGET=$BAR_SUFFIX LITERAL=\$PATH
-ENV FALLBACK=${MISSING:-default}
-WORKDIR /app
-WORKDIR src
-USER 1000
-"""
-
-    base, env_lines, workdir, user = e2b_module._parse_dockerfile(dockerfile)
-    resolved = {}
-    for line in env_lines:
-        resolved.update(e2b_module._parse_env_assignments(line, resolved))
-
-    assert base == "ubuntu:24.04"
-    assert resolved == {
-        "BAR": "wrong",
-        "BAR_SUFFIX": "right",
-        "GREETING": "Hello World",
-        "TARGET": "right",
-        "LITERAL": "$PATH",
-        "FALLBACK": "default",
-    }
-    assert workdir == "/app/src"
-    assert user == "1000"
 
 
 def test_parse_image_ref_handles_tags_digests_and_registries():
@@ -293,34 +207,6 @@ async def test_numeric_default_user_is_resolved_during_template_build(tmp_path):
 
     assert "getent passwd 1000" in serialized
     assert "su -m" in serialized
-
-
-@pytest.mark.asyncio
-async def test_dockerfile_cmd_is_not_turned_into_start_command(tmp_path):
-    env = _make_env(tmp_path, docker_image=None)
-    (tmp_path / "environment" / "Dockerfile").write_text(
-        'FROM ubuntu:24.04\nENTRYPOINT ["/init"]\nCMD ["bash", "-l"]\n'
-    )
-
-    with _mock_image_config():
-        serialized = Template.to_json(await env._template_definition())
-
-    assert "startCmd" not in serialized
-    assert "/init" not in serialized
-
-
-@pytest.mark.asyncio
-async def test_arg_backed_from_is_resolved_for_e2b_builder(tmp_path):
-    env = _make_env(tmp_path, docker_image=None)
-    (tmp_path / "environment" / "Dockerfile").write_text(
-        "ARG BASE=ubuntu:24.04\nFROM ${BASE}\n"
-    )
-
-    with _mock_image_config():
-        serialized = Template.to_json(await env._template_definition())
-
-    assert '"fromImage": "ubuntu:24.04"' in serialized
-    assert '"fromImage": "${BASE}"' not in serialized
 
 
 @pytest.mark.asyncio
@@ -580,7 +466,9 @@ def test_docker_hub_aliases_use_registry_api(ref):
 @pytest.mark.asyncio
 async def test_prebuilt_image_ignores_multistage_dockerfile(tmp_path):
     env = _make_env(tmp_path)
-    env._environment_definition_path.write_text("FROM scratch AS build\nFROM build\n")
+    (env.environment_dir / "Dockerfile").write_text(
+        "FROM scratch AS build\nFROM build\n"
+    )
     env._validate_definition()
     with (
         _mock_image_config(),
@@ -649,17 +537,6 @@ async def test_upload_dir_rejects_missing_source(tmp_path):
         await env.upload_dir(tmp_path / "absent", "/target")
 
 
-@pytest.mark.parametrize("separator", [" ", "\t"])
-def test_variable_dependent_dockerfile_requires_prebuilt_image(tmp_path, separator):
-    env = _make_env(tmp_path, docker_image=None)
-    env._environment_definition_path.write_text(
-        "FROM ubuntu:24.04\nARG APP_DIR=/opt/app\n"
-        f"ENV{separator}APP_DIR=${{APP_DIR}}\nWORKDIR{separator}${{APP_DIR}}\n"
-    )
-    with pytest.raises(ValueError, match="prebuilt docker_image"):
-        env._validate_definition()
-
-
 @pytest.mark.asyncio
 async def test_cancellation_during_dispatch_captures_handle_for_cleanup(tmp_path):
     env = _make_env(tmp_path)
@@ -712,3 +589,104 @@ async def test_capture_wrapper_stops_nested_children_on_term(tmp_path):
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+@pytest.mark.parametrize(
+    "dockerfile", [None, "FROM ubuntu:24.04\n", "FROM base AS builder\nFROM builder\n"]
+)
+def test_task_requires_prebuilt_image(tmp_path, dockerfile):
+    env_dir = tmp_path / "environment"
+    env_dir.mkdir()
+    if dockerfile is not None:
+        (env_dir / "Dockerfile").write_text(dockerfile)
+    paths = TrialPaths(trial_dir=tmp_path / "trial")
+    paths.mkdir()
+    with pytest.raises(ValueError, match="docker_image"):
+        E2BEnvironment(
+            environment_dir=env_dir,
+            environment_name="task",
+            session_id="s",
+            trial_paths=paths,
+            task_env_config=EnvironmentConfig(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["CANCELED", "UNAVAILABLE"])
+async def test_sdk_pause_errors_reconnect_without_redispatch(tmp_path, code):
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+    from e2b import AsyncCommandHandle
+
+    async def interrupted_events():
+        raise ConnectError(getattr(Code, code), "sandbox paused during command")
+        yield  # Make this an async event iterator like the SDK transport.
+
+    env = _make_env(tmp_path)
+    handle = AsyncCommandHandle(
+        pid=42, handle_kill=AsyncMock(), events=interrupted_events()
+    )
+    resumed = MagicMock(pid=42)
+    resumed.wait = AsyncMock(return_value=MagicMock(exit_code=0))
+    env._sandbox = MagicMock()
+    env._sandbox.commands.connect = AsyncMock(return_value=resumed)
+    captured = ExecResult(stdout="before\nafter\n", stderr="", return_code=0)
+    with (
+        patch.object(
+            env, "_dispatch_command", new=AsyncMock(return_value=handle)
+        ) as dispatch,
+        patch.object(
+            env, "_read_command_capture", new=AsyncMock(side_effect=[None, captured])
+        ),
+        patch.object(env, "_cleanup_command_capture", new=AsyncMock()),
+        patch.object(env, "_terminate_command", new=AsyncMock()) as terminate,
+        patch("pier.environments.e2b.asyncio.sleep", new=AsyncMock()),
+    ):
+        assert (
+            await env.exec("printf before; sleep 1; printf after", timeout_sec=10)
+            == captured
+        )
+    dispatch.assert_awaited_once()
+    env._sandbox.commands.connect.assert_awaited_once_with(42, timeout=0)
+    terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_template_ignores_local_context(tmp_path):
+    env = _make_env(tmp_path)
+    name = env.template_name
+    (env.environment_dir / "Dockerfile").unlink()
+    env._validate_definition()
+    with _mock_image_config():
+        assert (
+            json.loads(Template.to_json(await env._template_definition()))["fromImage"]
+            == "ubuntu:24.04"
+        )
+    (env.environment_dir / "Dockerfile").write_bytes(b"unreadable Dockerfile \xff")
+    assert env._build_template_name() == name
+    changed = _make_env(tmp_path / "changed", docker_image="ubuntu:22.04")
+    assert changed.template_name != name
+
+
+@pytest.mark.asyncio
+async def test_pause_recovery_cannot_extend_command_deadline(tmp_path):
+    from e2b import TimeoutException
+
+    env = _make_env(tmp_path)
+    handle = MagicMock(pid=42)
+    handle.wait = AsyncMock(side_effect=TimeoutException("sandbox paused"))
+    with (
+        patch.object(
+            env, "_dispatch_command", new=AsyncMock(return_value=handle)
+        ) as dispatch,
+        patch.object(env, "_read_command_capture", new=AsyncMock(return_value=None)),
+        patch.object(env, "_cleanup_command_capture", new=AsyncMock()),
+        patch.object(env, "_terminate_command", new=AsyncMock()) as terminate,
+    ):
+        guard = asyncio.timeout(1)
+        async with guard:
+            with pytest.raises(TimeoutError):
+                await env.exec("sleep 60", timeout_sec=0.02)
+        assert not guard.expired()
+    dispatch.assert_awaited_once()
+    terminate.assert_awaited_once_with(handle)
