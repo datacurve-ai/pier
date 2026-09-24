@@ -371,14 +371,10 @@ def convert_mini_swe_agent_to_atif(
         if role == "user":
             response = (message.get("extra") or {}).get("response")
             if isinstance(response, dict):
-                choices = response.get("choices") or []
-                captured = (
-                    response
-                    if response.get("object") == "response"
-                    else choices[0].get("message")
-                    if choices
-                    else None
-                )
+                captured = response
+                if response.get("object") != "response":
+                    choices = response.get("choices") or []
+                    captured = choices[0].get("message") if choices else None
                 if isinstance(captured, dict) and (
                     captured.get("role") == "assistant"
                     or captured.get("object") == "response"
@@ -447,15 +443,14 @@ def convert_mini_swe_agent_to_atif(
                     message=content,
                     reasoning_content=reasoning,
                     tool_calls=tool_calls,
-                    observation=(
-                        Observation(results=[ObservationResult(content=feedback)])
-                        if feedback is not None
-                        else None
-                    ),
                     metrics=metrics,
                     llm_call_count=1,
                 )
             )
+            if feedback is not None:
+                _add_observation_to_last_agent_step(
+                    steps, feedback, _logger, i, timestamp
+                )
             step_id += 1
 
         elif message.get("type") == "function_call_output":
