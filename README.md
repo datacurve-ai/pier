@@ -56,6 +56,8 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
 
+For environments without mounted logs, Pier attempts to copy `/logs/verifier/` into the trial's `verifier/` directory even when verification fails or times out. A failed copy is logged without replacing the original execution error.
+
 ## Agent runtime configuration
 
 Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes.
@@ -135,6 +137,8 @@ through your env file.
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
 
 **mini-swe-agent** picks a native adapter from the model-name prefix: `openai/...` → `litellm_response` (OpenAI Responses end-to-end), `openrouter/...` → `openrouter` (BYOK costs from `cost_details.upstream_inference_cost`), everything else → LiteLLM auto.
+
+ATIF conversion retains responses rejected by the agent's format validation as agent steps, with their raw content, reasoning, usage, and validation feedback. These responses remain counted once in the token totals.
 
 For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Gemini API default high/dynamic thinking level, but it does not request readable thought summaries. Set `kwargs.reasoning_effort: high` explicitly when you want LiteLLM to send `includeThoughts` and preserve returned summaries as reasoning content.
 
