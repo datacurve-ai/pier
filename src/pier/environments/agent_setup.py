@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import shlex
+from collections.abc import Iterable
 from pathlib import Path
 
 from pier.models.agent.install import AgentInstallSpec, InstallStep
@@ -78,16 +79,21 @@ def write_agent_dockerfile(
 
 
 def proxy_environment(
-    token: str, host: str, port: int = EGRESS_PROXY_PORT
+    token: str,
+    host: str,
+    port: int = EGRESS_PROXY_PORT,
+    *,
+    no_proxy_hosts: Iterable[str] = (),
 ) -> dict[str, str]:
     proxy_url = f"http://agent:{token}@{host}:{port}"
+    no_proxy = ",".join(dict.fromkeys(["localhost", "127.0.0.1", *no_proxy_hosts]))
     return {
         "HTTP_PROXY": proxy_url,
         "HTTPS_PROXY": proxy_url,
         "http_proxy": proxy_url,
         "https_proxy": proxy_url,
-        "NO_PROXY": "localhost,127.0.0.1",
-        "no_proxy": "localhost,127.0.0.1",
+        "NO_PROXY": no_proxy,
+        "no_proxy": no_proxy,
     }
 
 
@@ -147,6 +153,8 @@ def write_docker_proxy_compose(
     proxy_dir: Path,
     allowlist: NetworkAllowlist,
     token: str,
+    compose_proxy_dir: str | None = None,
+    main_networks: Iterable[str] = (),
 ) -> Path:
     proxy_dir.mkdir(parents=True, exist_ok=True)
     (proxy_dir / "Dockerfile").write_text(
@@ -168,7 +176,9 @@ def write_docker_proxy_compose(
     compose = {
         "services": {
             "main": {
-                "networks": ["pier-egress-internal"],
+                "networks": list(
+                    dict.fromkeys([*main_networks, "pier-egress-internal"])
+                ),
                 "depends_on": {
                     EGRESS_PROXY_SERVICE: {
                         "condition": "service_healthy",
@@ -176,7 +186,9 @@ def write_docker_proxy_compose(
                 },
             },
             EGRESS_PROXY_SERVICE: {
-                "build": {"context": str(proxy_dir.resolve().absolute())},
+                "build": {
+                    "context": compose_proxy_dir or str(proxy_dir.resolve().absolute())
+                },
                 "environment": proxy_policy_env(allowlist, token),
                 "healthcheck": {
                     "test": ["CMD-SHELL", "bash -lc '</dev/tcp/127.0.0.1/8080'"],
@@ -184,13 +196,14 @@ def write_docker_proxy_compose(
                     "timeout": "1s",
                     "retries": 30,
                 },
-                "networks": ["pier-egress-internal", "default"],
+                "networks": ["pier-egress-internal", "pier-egress-external"],
             },
         },
         "networks": {
             "pier-egress-internal": {
                 "internal": True,
             },
+            "pier-egress-external": {},
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
