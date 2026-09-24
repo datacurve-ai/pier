@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from pier.agents.installed.mini_swe_agent import (
     MiniSweAgent,
     convert_mini_swe_agent_to_atif,
@@ -194,9 +196,7 @@ def test_convert_chat_message_keeps_reasoning_separate_from_visible_content():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.01, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "anthropic/claude-opus-4-7"}
-                },
+                "config": {"model": {"model_name": "anthropic/claude-opus-4-7"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
@@ -241,9 +241,7 @@ def test_convert_openrouter_byok_uses_upstream_cost_details():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.0, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "moonshotai/kimi-k2.6"}
-                },
+                "config": {"model": {"model_name": "moonshotai/kimi-k2.6"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
@@ -288,3 +286,97 @@ def test_convert_openrouter_byok_uses_upstream_cost_details():
     agent_steps = [step for step in trajectory.steps if step.source == "agent"]
     assert agent_steps[0].metrics is not None
     assert agent_steps[0].metrics.cost_usd == 0.00123
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Answer without a tool call",
+                        "reasoning_content": "Rejected response reasoning",
+                    }
+                }
+            ],
+        },
+        {
+            "object": "response",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"text": "Answer without a tool call"}],
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"text": "Rejected response reasoning"}],
+                },
+            ],
+        },
+    ],
+)
+def test_format_feedback_retains_rejected_response_as_its_own_step(response):
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 40,
+        "prompt_tokens_details": {"cached_tokens": 25},
+        "completion_tokens_details": {"reasoning_tokens": 30},
+        "cost": 0.01,
+    }
+    native = {
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "Earlier response"},
+            {"role": "tool", "content": "Earlier result"},
+            {
+                "role": "user",
+                "content": "Every response must include a tool call",
+                "extra": {
+                    "interrupt_type": "FormatError",
+                    "response": {**response, "usage": usage},
+                },
+            },
+            {"role": "assistant", "content": "Next response"},
+        ],
+    }
+
+    trajectory = convert_mini_swe_agent_to_atif(native, "session")
+
+    agents = [step for step in trajectory.steps if step.source == "agent"]
+    assert [step.message for step in agents] == [
+        "Earlier response",
+        "Answer without a tool call",
+        "Next response",
+    ]
+    assert [result.content for result in agents[0].observation.results] == [
+        "Earlier result"
+    ]
+    rejected = agents[1]
+    assert rejected.reasoning_content == "Rejected response reasoning"
+    assert rejected.tool_calls is None
+    assert rejected.llm_call_count == 1
+    assert [result.content for result in rejected.observation.results] == [
+        "Every response must include a tool call"
+    ]
+    assert (
+        rejected.metrics.prompt_tokens
+        == trajectory.final_metrics.total_prompt_tokens
+        == 100
+    )
+    assert (
+        rejected.metrics.completion_tokens
+        == trajectory.final_metrics.total_completion_tokens
+        == 40
+    )
+    assert (
+        rejected.metrics.cached_tokens
+        == trajectory.final_metrics.total_cached_tokens
+        == 25
+    )
+    assert rejected.metrics.cost_usd == trajectory.final_metrics.total_cost_usd == 0.01
+    assert rejected.metrics.extra["completion_tokens_details"]["reasoning_tokens"] == 30
+    assert native["messages"][4]["role"] == "user"

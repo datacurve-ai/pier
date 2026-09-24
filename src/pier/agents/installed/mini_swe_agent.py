@@ -367,6 +367,27 @@ def convert_mini_swe_agent_to_atif(
         total_reasoning_tokens += reasoning_tokens
         total_text_tokens += text_tokens or 0
 
+        feedback = None
+        if role == "user":
+            response = (message.get("extra") or {}).get("response")
+            if isinstance(response, dict):
+                choices = response.get("choices") or []
+                captured = (
+                    response
+                    if response.get("object") == "response"
+                    else choices[0].get("message")
+                    if choices
+                    else None
+                )
+                if isinstance(captured, dict) and (
+                    captured.get("role") == "assistant"
+                    or captured.get("object") == "response"
+                ):
+                    feedback = content
+                    message = captured
+                    role = message.get("role")
+                    content = _normalize_content(message.get("content"))
+
         if role == "system":
             steps.append(
                 Step(
@@ -397,9 +418,14 @@ def convert_mini_swe_agent_to_atif(
         elif role == "tool":
             _add_observation_to_last_agent_step(steps, content, _logger, i, timestamp)
 
-        elif role == "assistant":
-            tool_calls = _parse_tool_calls(message, step_id)
-            reasoning = _reasoning_from_message(message)
+        elif role == "assistant" or message.get("object") == "response":
+            if message.get("object") == "response":
+                content, reasoning, tool_calls = (
+                    _response_output_text_reasoning_and_tool_calls(message, step_id)
+                )
+            else:
+                tool_calls = _parse_tool_calls(message, step_id)
+                reasoning = _reasoning_from_message(message)
 
             metrics = _build_step_metrics(
                 prompt_tokens=prompt_tokens,
@@ -421,39 +447,11 @@ def convert_mini_swe_agent_to_atif(
                     message=content,
                     reasoning_content=reasoning,
                     tool_calls=tool_calls,
-                    metrics=metrics,
-                    llm_call_count=1,
-                )
-            )
-            step_id += 1
-
-        elif message.get("object") == "response":
-            (
-                response_content,
-                reasoning,
-                tool_calls,
-            ) = _response_output_text_reasoning_and_tool_calls(message, step_id)
-
-            metrics = _build_step_metrics(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cached_tokens=cached_tokens,
-                prompt_tokens_details=prompt_tokens_details,
-                completion_tokens_details=completion_tokens_details,
-                total_cost_usd=total_cost_usd,
-                total_completion_tokens=total_completion_tokens,
-                step_cost_usd=step_cost_usd,
-            )
-
-            steps.append(
-                Step(
-                    step_id=step_id,
-                    timestamp=timestamp,
-                    source="agent",
-                    model_name=model_name,
-                    message=response_content,
-                    reasoning_content=reasoning,
-                    tool_calls=tool_calls,
+                    observation=(
+                        Observation(results=[ObservationResult(content=feedback)])
+                        if feedback is not None
+                        else None
+                    ),
                     metrics=metrics,
                     llm_call_count=1,
                 )

@@ -11,18 +11,22 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from pier.environments.base import ExecResult
 from pier.models.task.config import TaskOS
-from pier.models.trial.config import TaskConfig as TrialTaskConfig
+from pier.models.task.task import Task
 from pier.models.trial.config import (
     AgentConfig,
     EnvironmentConfig,
     TrialConfig,
     VerifierConfig,
 )
-from pier.models.trial.paths import EnvironmentPaths
+from pier.models.trial.config import TaskConfig as TrialTaskConfig
+from pier.models.trial.paths import EnvironmentPaths, TrialPaths
 from pier.models.trial.result import AgentInfo
 from pier.trial.trial import Trial
+from pier.verifier.verifier import DownloadVerifierDirError, Verifier
 
 
 def run_async(fn):
@@ -113,6 +117,56 @@ def _mock_agent() -> MagicMock:
         install_spec=lambda: None,
         network_allowlist=lambda: None,
     )
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("download_fails", [False, True])
+@run_async
+async def test_failed_verifier_retains_output_and_original_error(
+    tmp_path, caplog, cancel, download_fails
+):
+    task = Task(_task_with_configured_artifacts(tmp_path))
+    paths = TrialPaths(tmp_path / "trial")
+    paths.mkdir()
+    environment = _make_env(mounted=False)
+    started = asyncio.Event()
+
+    async def execute(command, **kwargs):
+        if command.startswith("chmod"):
+            return ExecResult(stdout="", stderr="", return_code=0)
+        started.set()
+        if cancel:
+            await asyncio.Future()
+        raise RuntimeError("verifier execution failed")
+
+    async def download(source_dir, target_dir):
+        if download_fails:
+            raise OSError("sandbox unavailable")
+        (Path(target_dir) / "test-stdout.txt").write_text("last verifier output")
+
+    environment.exec.side_effect = execute
+    environment.download_dir.side_effect = download
+    pending = asyncio.create_task(Verifier(task, paths, environment).verify())
+    await started.wait()
+    if cancel:
+        pending.cancel()
+    with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+        await pending
+    if download_fails:
+        assert "sandbox unavailable" in caplog.text
+    else:
+        assert paths.test_stdout_path.read_text() == "last verifier output"
+
+
+@run_async
+async def test_completed_verifier_reports_output_download_failure(tmp_path):
+    task = Task(_task_with_configured_artifacts(tmp_path))
+    paths = TrialPaths(tmp_path / "trial")
+    paths.mkdir()
+    environment = _make_env(mounted=False)
+    environment.download_dir.side_effect = OSError("sandbox unavailable")
+    with pytest.raises(DownloadVerifierDirError):
+        await Verifier(task, paths, environment).verify()
 
 
 def _make_factory_recorder(
