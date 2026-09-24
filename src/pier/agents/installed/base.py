@@ -1,5 +1,6 @@
 import functools
 import os
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,7 @@ class CliFlag:
     default: Any = None
     env_fallback: str | None = None
     format: str | None = None
+    quote: bool = False
 
 
 @dataclass
@@ -207,10 +209,15 @@ class BaseInstalledAgent(BaseAgent, ABC):
             if value is None:
                 continue
             if flag.format is not None:
-                parts.append(flag.format.format(value=value))
+                formatted = flag.format.format(
+                    value=shlex.quote(str(value)) if flag.quote else value
+                )
+                parts.append(formatted)
             elif flag.type == "bool":
                 if value:
                     parts.append(flag.cli)
+            elif flag.quote:
+                parts.append(f"{flag.cli} {shlex.quote(str(value))}")
             else:
                 parts.append(f"{flag.cli} {value}")
         return " ".join(parts)
