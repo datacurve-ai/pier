@@ -130,6 +130,7 @@ async def test_failed_verifier_retains_output_and_original_error(
     paths.mkdir()
     environment = _make_env(mounted=False)
     started = asyncio.Event()
+    original_error = RuntimeError("verifier execution failed")
 
     async def execute(command, **kwargs):
         if command.startswith("chmod"):
@@ -137,7 +138,7 @@ async def test_failed_verifier_retains_output_and_original_error(
         started.set()
         if cancel:
             await asyncio.Future()
-        raise RuntimeError("verifier execution failed")
+        raise original_error
 
     async def download(source_dir, target_dir):
         if download_fails:
@@ -150,8 +151,10 @@ async def test_failed_verifier_retains_output_and_original_error(
     await started.wait()
     if cancel:
         pending.cancel()
-    with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+    with pytest.raises(asyncio.CancelledError if cancel else RuntimeError) as caught:
         await pending
+    if not cancel:
+        assert caught.value is original_error
     if download_fails:
         assert "sandbox unavailable" in caplog.text
     else:
