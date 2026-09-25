@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shlex
 from pathlib import Path, PurePosixPath
@@ -8,6 +9,7 @@ import toml
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
+    NonZeroAgentExitCodeError,
     with_prompt_template,
 )
 from pier.agents.network import allowlist_from_urls, collect_url_values
@@ -35,6 +37,44 @@ from pier.utils.trajectory_metrics import (
 from pier.utils.trajectory_utils import format_trajectory_json
 
 _COMPACTION_DROP_TOKEN_THRESHOLD = 10_000
+_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model."
+_MODEL_CAPACITY_RETRY_DELAYS = (30, 60, 120)
+
+
+def _iter_jsonl_events(output: str):
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def _is_model_capacity_failure(output: str) -> bool:
+    for event in _iter_jsonl_events(output):
+        if (
+            event.get("type") == "error"
+            and event.get("message") == _MODEL_CAPACITY_MESSAGE
+        ):
+            return True
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
+            if (
+                isinstance(error, dict)
+                and error.get("message") == _MODEL_CAPACITY_MESSAGE
+            ):
+                return True
+    return False
+
+
+def _root_thread_id(output: str) -> str | None:
+    for event in _iter_jsonl_events(output):
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
+    return None
 
 
 class Codex(BaseInstalledAgent):
@@ -1054,6 +1094,76 @@ class Codex(BaseInstalledAgent):
 
         return None
 
+    async def _run_with_capacity_resume(
+        self,
+        environment: BaseEnvironment,
+        initial_command: str,
+        resume_command_prefix: str,
+        env: dict[str, str],
+    ) -> None:
+        output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
+
+        try:
+            await self.exec_as_agent(environment, command=initial_command, env=env)
+            return
+        except NonZeroAgentExitCodeError as error:
+            last_error = error
+
+        tail_result = await self.exec_as_agent(
+            environment,
+            command=f"tail -n 20 {shlex.quote(output_path)} 2>/dev/null || true",
+            env=env,
+        )
+        if not _is_model_capacity_failure(tail_result.stdout or ""):
+            raise last_error
+
+        thread_result = await self.exec_as_agent(
+            environment,
+            command=f"head -n 100 {shlex.quote(output_path)} 2>/dev/null || true",
+            env=env,
+        )
+        thread_id = _root_thread_id(thread_result.stdout or "")
+        if thread_id is None:
+            raise last_error
+
+        continuation = shlex.quote(
+            "Continue the task from where you stopped. Verify the remaining work and "
+            "finish the task."
+        )
+        for attempt, delay in enumerate(_MODEL_CAPACITY_RETRY_DELAYS, start=1):
+            self.logger.warning(
+                "Codex model capacity failure; resuming root thread %s in %ss "
+                "(attempt %s/%s)",
+                thread_id,
+                delay,
+                attempt,
+                len(_MODEL_CAPACITY_RETRY_DELAYS),
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=(
+                        f"{resume_command_prefix}{shlex.quote(thread_id)} "
+                        f"{continuation} 2>&1 </dev/null | tee -a "
+                        f"{shlex.quote(output_path)}"
+                    ),
+                    env=env,
+                )
+                return
+            except NonZeroAgentExitCodeError as error:
+                last_error = error
+
+            tail_result = await self.exec_as_agent(
+                environment,
+                command=f"tail -n 20 {shlex.quote(output_path)} 2>/dev/null || true",
+                env=env,
+            )
+            if not _is_model_capacity_failure(tail_result.stdout or ""):
+                raise last_error
+
+        raise last_error
+
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
@@ -1145,24 +1255,29 @@ class Codex(BaseInstalledAgent):
                 command=setup_command,
                 env=env,
             )
+        codex_command_prefix = (
+            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; codex exec "
+        )
+        codex_options = (
+            "--dangerously-bypass-approvals-and-sandbox "
+            "--skip-git-repo-check "
+            f"--model {shlex.quote(model)} "
+            "--json "
+            "--enable unified_exec "
+            f"{cli_flags_arg}"
+        )
+        output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
+        initial_command = (
+            f"{codex_command_prefix}{codex_options}-- {escaped_instruction} "
+            f"2>&1 </dev/null | tee {shlex.quote(output_path)}"
+        )
+        resume_command_prefix = f"{codex_command_prefix}resume {codex_options}"
+
         try:
-            await self.exec_as_agent(
+            await self._run_with_capacity_resume(
                 environment,
-                command=(
-                    "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                    "codex exec "
-                    "--dangerously-bypass-approvals-and-sandbox "
-                    "--skip-git-repo-check "
-                    f"--model {model} "
-                    "--json "
-                    "--enable unified_exec "
-                    f"{cli_flags_arg}"
-                    "-- "  # end of flags
-                    f"{escaped_instruction} "
-                    f"2>&1 </dev/null | tee {
-                        EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
-                    }"
-                ),
+                initial_command=initial_command,
+                resume_command_prefix=resume_command_prefix,
                 env=env,
             )
         finally:
