@@ -73,7 +73,9 @@ def write_agent_dockerfile(
     )
     dockerfile.extend(dockerfile_install_commands(install, user=user))
     dockerfile.append("")
-    dockerfile_path.write_text("\n".join(dockerfile))
+    # Force LF: this Dockerfile is COPY'd into a Linux container, and Windows
+    # text mode would otherwise translate \n to \r\n.
+    dockerfile_path.write_text("\n".join(dockerfile), newline="\n")
     return dockerfile_path
 
 
@@ -162,9 +164,15 @@ def write_docker_proxy_compose(
                 'CMD ["bash", "/usr/local/bin/start-squid.sh"]',
                 "",
             ]
-        )
+        ),
+        newline="\n",
     )
-    (proxy_dir / "start-squid.sh").write_text(squid_bootstrap_command())
+    # Force LF. This script is COPY'd into a Linux container and executed by
+    # bash; with CRLF line endings `set -eu` becomes `set -eu\r` and dies with
+    # "set: -: invalid option", so the egress proxy never binds its port. The
+    # proxy is a `depends_on: service_healthy` dependency of `main`, so every
+    # `network_mode = "no-network"` trial fails before the agent starts.
+    (proxy_dir / "start-squid.sh").write_text(squid_bootstrap_command(), newline="\n")
     compose = {
         "services": {
             "main": {
