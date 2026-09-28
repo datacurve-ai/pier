@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -8,17 +9,21 @@ import socket
 from abc import abstractmethod
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from pier.environments.agent_setup import (
     EGRESS_PROXY_PORT,
+    EGRESS_PROXY_SERVICE,
     dockerfile_install_commands,
     new_proxy_token,
     proxy_environment,
     proxy_policy_env,
     squid_bootstrap_command,
+    write_agent_dockerfile,
+    write_docker_proxy_compose,
 )
 from pier.environments.base import BaseEnvironment, ExecResult
 from pier.environments.capabilities import (
@@ -135,6 +140,9 @@ class _ModalStrategy:
         """Terminate the sandbox and reset references."""
         env = self._env
         if not env._sandbox:
+            env._app = None
+            env._image = None
+            await env._teardown_egress_proxy()
             return
         try:
             await env._terminate_sandbox()
@@ -200,7 +208,10 @@ class _ModalDirect(_ModalStrategy):
         )
 
         await env._ensure_egress_proxy()
-        env._sandbox = await env._create_sandbox()
+        experimental = (
+            {"vm_runtime": True} if getattr(env, "_vm_runtime", False) else None
+        )
+        env._sandbox = await env._create_sandbox(experimental_options=experimental)
 
         await env._sandbox.filesystem.make_directory.aio(
             str(EnvironmentPaths.agent_dir), create_parents=True
@@ -244,13 +255,19 @@ class _ModalDirect(_ModalStrategy):
 class _ModalDinD(_ModalStrategy):
     """Docker-in-Docker compose strategy for multi-container tasks.
 
-    Uses Modal's ``experimental_options={"enable_docker": True}`` to run
-    a Docker daemon inside the sandbox.
+    Two sandbox runtimes are supported:
+
+    * **gVisor DinD** (default): ``experimental_options={"enable_docker": True}``
+      on Modal's managed DinD image. gVisor lacks iptables/netlink for veth
+      pairs, so Pier forces ``network_mode: host`` and ``bridge: none``.
+    * **VM runtime** (``vm_runtime=True``): a real Linux kernel with Ubuntu +
+      dockerd. Native Docker bridge networking works, so compose DNS aliases
+      and inter-container networking behave like a normal Linux host.
 
     Topology:
         Local machine (pier CLI)
-          └── Modal Sandbox (DinD, enable_docker=True)
-                ├── dockerd (Docker daemon, managed by Modal)
+          └── Modal Sandbox (DinD / VM + dockerd)
+                ├── dockerd
                 └── docker compose
                       ├── main        ← agent runs here, exec/upload/download target
                       ├── sidecar     ← additional services
@@ -258,15 +275,26 @@ class _ModalDinD(_ModalStrategy):
     """
 
     # Max iterations when polling for Docker daemon readiness.
-    # Each iteration sleeps 2s, so worst-case wall-clock time is ~60s.
-    _DOCKER_DAEMON_POLL_LIMIT = 30
+    # Each iteration sleeps 2s; worst-case wall clock time is ~160s.
+    _DOCKER_DAEMON_POLL_LIMIT = 80
     _COMPOSE_DIR = "/pier/compose"
     _ENVIRONMENT_DIR = "/pier/environment"
     _LOGS_DIR = "/pier/logs"
+    _HOST_NETWORK_COMPOSE = "docker-compose-host-network.yaml"
+    _MOUNTS_COMPOSE = "docker-compose-mounts.yaml"
+    _VM_NETWORK_COMPOSE = "docker-compose-vm-network.yaml"
+    _EGRESS_PROXY_COMPOSE = "docker-compose-egress-proxy.json"
+    _BASE_IMAGE_COMPOSE = "docker-compose-main-base.yaml"
+    _AGENT_IMAGE_COMPOSE = "docker-compose-main-agent.yaml"
+    _AGENT_BUILD_DIR = "/pier/compose/agent-build"
+    _EGRESS_PROXY_DIR = "/pier/compose/egress-proxy"
 
     def __init__(self, env: "ModalEnvironment"):
         super().__init__(env)
         self._use_prebuilt = False
+        self._base_image_overlay_ready = False
+        self._agent_image_overlay_ready = False
+        self._egress_proxy_overlay_ready = False
 
         self._resolved_task_env: dict[str, str] = {}
         pier_keys = set(self._infra_env_vars().keys())
@@ -303,12 +331,24 @@ class _ModalDinD(_ModalStrategy):
 
         compose_path = environment_dir / "docker-compose.yaml"
         services: dict[str, bool] = {}  # name -> has_build
+        aliases: dict[str, list[str]] = {}  # name -> network aliases
         if compose_path.exists():
             doc = yaml.safe_load(compose_path.read_text())
             if doc and "services" in doc:
                 for name, cfg in doc["services"].items():
                     has_build = isinstance(cfg, dict) and "build" in cfg
                     services[name] = has_build
+                    # Collect network aliases (records.example.internal, …):
+                    # under host networking the compose network DNS is gone, so
+                    # they must ride extra_hosts alongside the service names.
+                    svc_aliases: list[str] = []
+                    nets = cfg.get("networks") if isinstance(cfg, dict) else None
+                    if isinstance(nets, dict):
+                        for net_cfg in nets.values():
+                            if isinstance(net_cfg, dict):
+                                svc_aliases.extend(net_cfg.get("aliases") or [])
+                    if svc_aliases:
+                        aliases[name] = svc_aliases
 
         # Fallback if parsing fails
         if not services:
@@ -329,13 +369,32 @@ class _ModalDinD(_ModalStrategy):
                 lines.append("    build:")
                 lines.append("      network: host")
             lines.append("    network_mode: host")
+            if svc == "main":
+                # The docker environment injects these via its mounts overlay;
+                # DinD must add them itself or /logs/{agent,verifier,artifacts}
+                # never exist inside main and every agent setup fails.
+                # (staticmethod: hardcode _LOGS_DIR = /pier/logs)
+                lines.append("    volumes:")
+                lines.append("      - /pier/logs/agent:/logs/agent")
+                lines.append("      - /pier/logs/verifier:/logs/verifier")
+                lines.append("      - /pier/logs/artifacts:/logs/artifacts")
+            # Task compose files may attach services to named networks, which
+            # is mutually exclusive with network_mode — reset the key so the
+            # host-network override wins.
+            lines.append("    networks: !reset []")
             # Map all other service names to localhost so Docker DNS
             # hostnames work under host networking.
             others = [s for s in service_names if s != svc]
-            if others:
+            other_hosts: list[str] = []
+            for other in others:
+                other_hosts.append(other)
+                other_hosts.extend(aliases.get(other, []))
+            # A service's own aliases must also resolve (self-referencing URLs)
+            other_hosts.extend(aliases.get(svc, []))
+            if other_hosts:
                 lines.append("    extra_hosts:")
-                for other in others:
-                    lines.append(f'      - "{other}:127.0.0.1"')
+                for host in other_hosts:
+                    lines.append(f'      - "{host}:127.0.0.1"')
             # NOTE: Do NOT add environment: here — it replaces (not merges)
             # the service's entire environment block from the base compose
             # file, wiping out AGENT_ID, API keys, etc.
@@ -347,11 +406,15 @@ class _ModalDinD(_ModalStrategy):
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
-        shell: str = "sh",
+        shell: str | None = None,
     ) -> ExecResult:
-        """Run a command on the DinD sandbox VM (defaults to sh for Alpine)."""
+        """Run a command on the DinD sandbox VM."""
         return await self._env._sdk_exec(
-            command, cwd=cwd, env=env, timeout_sec=timeout_sec, shell=shell
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            shell=shell or self._env._default_shell,
         )
 
     def _compose_referenced_env_vars(self) -> dict[str, str]:
@@ -411,7 +474,17 @@ class _ModalDinD(_ModalStrategy):
             env_vars.update(self._env._persistent_env)
         return env_vars
 
-    def _compose_file_flags(self) -> list[str]:
+    @property
+    def _use_vm_runtime(self) -> bool:
+        return bool(getattr(self._env, "_vm_runtime", False))
+
+    def _compose_file_flags(
+        self,
+        *,
+        include_base_image: bool = False,
+        include_agent_image: bool = True,
+        include_vm_networking: bool = True,
+    ) -> list[str]:
         """Return -f flag pairs for all compose files as a flat list."""
         build_or_prebuilt = (
             "docker-compose-prebuilt.yaml"
@@ -423,23 +496,356 @@ class _ModalDinD(_ModalStrategy):
             f"{self._COMPOSE_DIR}/{build_or_prebuilt}",
             f"{self._ENVIRONMENT_DIR}/docker-compose.yaml",
         ]
-        if not self._env.task_env_config.allow_internet:
-            files.append(f"{self._COMPOSE_DIR}/docker-compose-no-network.yaml")
-
-        # Modal sandboxes lack netlink permissions for creating veth pairs,
-        # so all services must use the host network namespace.
-        files.append(f"{self._COMPOSE_DIR}/docker-compose-host-network.yaml")
+        if self._use_vm_runtime:
+            files.append(f"{self._COMPOSE_DIR}/{self._MOUNTS_COMPOSE}")
+            if include_vm_networking:
+                files.append(f"{self._COMPOSE_DIR}/{self._VM_NETWORK_COMPOSE}")
+                if self._egress_proxy_overlay_ready:
+                    files.append(f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}")
+            if include_base_image and self._base_image_overlay_ready:
+                files.append(f"{self._COMPOSE_DIR}/{self._BASE_IMAGE_COMPOSE}")
+            if include_agent_image and self._agent_image_overlay_ready:
+                files.append(f"{self._COMPOSE_DIR}/{self._AGENT_IMAGE_COMPOSE}")
+        else:
+            if not self._env.task_env_config.allow_internet:
+                files.append(f"{self._COMPOSE_DIR}/docker-compose-no-network.yaml")
+            # gVisor DinD lacks netlink for veth pairs — force host networking.
+            files.append(f"{self._COMPOSE_DIR}/{self._HOST_NETWORK_COMPOSE}")
 
         flags: list[str] = []
         for f in files:
             flags.extend(["-f", f])
         return flags
 
+    def _build_mounts_overlay(self) -> str:
+        """Bind Pier log dirs into the main service under native networking."""
+        return (
+            "services:\n"
+            "  main:\n"
+            "    volumes:\n"
+            f"      - {self._LOGS_DIR}/agent:/logs/agent\n"
+            f"      - {self._LOGS_DIR}/verifier:/logs/verifier\n"
+            f"      - {self._LOGS_DIR}/artifacts:/logs/artifacts\n"
+        )
+
+    @staticmethod
+    def _service_network_names(service: dict[str, Any]) -> list[str]:
+        networks = service.get("networks") or {}
+        if isinstance(networks, dict):
+            return list(networks)
+        if isinstance(networks, list):
+            return [name for name in networks if isinstance(name, str)]
+        return []
+
+    def _build_vm_network_overlay(self, config: dict[str, Any]) -> str:
+        """Apply task-level internet policy without opening sidecar networks."""
+        import yaml
+
+        services = config.get("services") or {}
+        networks = config.get("networks") or {}
+        main = services.get("main") or {}
+
+        if EGRESS_PROXY_SERVICE in services:
+            raise ValueError(
+                f"Compose service name {EGRESS_PROXY_SERVICE!r} is reserved by Pier."
+            )
+        reserved_networks = {
+            "pier-egress-internal",
+            "pier-egress-external",
+            "pier-main-internet",
+        }
+        collisions = reserved_networks.intersection(networks)
+        if collisions:
+            raise ValueError(
+                "Compose network names reserved by Pier: "
+                + ", ".join(sorted(collisions))
+            )
+
+        if self._env.task_env_config.allow_internet:
+            if isinstance(main, dict) and main.get("network_mode"):
+                return "networks: {}\n"
+            main_networks = self._service_network_names(main)
+            overlay = {
+                "services": {
+                    "main": {
+                        "networks": list(
+                            dict.fromkeys([*main_networks, "pier-main-internet"])
+                        )
+                    }
+                },
+                "networks": {"pier-main-internet": {}},
+            }
+            return yaml.safe_dump(overlay, sort_keys=False)
+
+        bypass_network_services = {
+            name: cfg.get("network_mode")
+            for name, cfg in services.items()
+            if isinstance(cfg, dict)
+            and cfg.get("network_mode")
+            and cfg.get("network_mode") != "none"
+        }
+        if bypass_network_services:
+            details = ", ".join(
+                f"{name}={mode}"
+                for name, mode in sorted(bypass_network_services.items())
+            )
+            raise ValueError(
+                "allow_internet=False cannot isolate compose services with "
+                f"network_mode: {details}"
+            )
+
+        external_networks = [
+            name
+            for name, cfg in networks.items()
+            if isinstance(cfg, dict) and cfg.get("external")
+        ]
+        if external_networks:
+            raise ValueError(
+                "allow_internet=False cannot isolate external compose networks: "
+                + ", ".join(sorted(external_networks))
+            )
+
+        if (
+            isinstance(main, dict)
+            and main.get("network_mode") == "none"
+            and self._env.network_allowlist.domains
+        ):
+            raise ValueError(
+                "Filtered inference egress is incompatible with main "
+                "network_mode=none. Use an internal compose network instead."
+            )
+
+        isolated_networks = {name: {"internal": True} for name in networks.keys()}
+        isolated_networks.setdefault("default", {"internal": True})
+        overlay = {"networks": isolated_networks}
+        return yaml.safe_dump(overlay, sort_keys=False)
+
+    def _validate_vm_network_isolation(self, config: dict[str, Any]) -> None:
+        """Fail before startup if any task service retains unrestricted egress."""
+        if self._env.task_env_config.allow_internet:
+            return
+
+        services = config.get("services") or {}
+        networks = config.get("networks") or {}
+        violations: list[str] = []
+
+        for service_name, service in services.items():
+            if service_name == EGRESS_PROXY_SERVICE or not isinstance(service, dict):
+                continue
+            network_mode = service.get("network_mode")
+            if network_mode == "none":
+                continue
+            if network_mode:
+                violations.append(f"{service_name} uses network_mode={network_mode}")
+                continue
+            for network_name in self._service_network_names(service):
+                network = networks.get(network_name)
+                if not isinstance(network, dict) or not network.get("internal"):
+                    violations.append(
+                        f"{service_name} is attached to non-internal network "
+                        f"{network_name}"
+                    )
+
+        if violations:
+            raise RuntimeError(
+                "allow_internet=False network isolation failed: "
+                + "; ".join(sorted(violations))
+            )
+
+    def _main_image_name(self, suffix: str) -> str:
+        install = self._env.agent_install_spec
+        fingerprint = install.fingerprint() if install else "none"
+        return _sanitize_docker_image_name(
+            f"hb__{self._env.environment_name}__{suffix}-{fingerprint}"
+        )
+
+    async def _upload_text(self, filename: str, content: str) -> None:
+        path = self._env.trial_paths.trial_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        await self._env._sdk_upload_file(path, f"{self._COMPOSE_DIR}/{filename}")
+
+    async def _prepare_vm_networking(self) -> None:
+        source_config = await self._resolve_compose_config(include_vm_networking=False)
+        network_overlay = self._build_vm_network_overlay(source_config)
+        await self._upload_text(self._VM_NETWORK_COMPOSE, network_overlay)
+
+        allowlist = self._env.network_allowlist
+        if not self._env.task_env_config.allow_internet and allowlist.domains:
+            token = new_proxy_token()
+            self._env._egress_proxy_env = proxy_environment(
+                token,
+                EGRESS_PROXY_SERVICE,
+                EGRESS_PROXY_PORT,
+                no_proxy_hosts=self._compose_no_proxy_hosts(source_config),
+            )
+            local_proxy_dir = self._env.trial_paths.trial_dir / "modal-egress-proxy"
+            local_compose_path = (
+                self._env.trial_paths.trial_dir / self._EGRESS_PROXY_COMPOSE
+            )
+            main = source_config.get("services", {}).get("main") or {}
+            write_docker_proxy_compose(
+                path=local_compose_path,
+                proxy_dir=local_proxy_dir,
+                compose_proxy_dir=self._EGRESS_PROXY_DIR,
+                allowlist=allowlist,
+                token=token,
+                main_networks=self._service_network_names(main),
+            )
+            await self._env._sdk_upload_dir(local_proxy_dir, self._EGRESS_PROXY_DIR)
+            await self._env._sdk_upload_file(
+                local_compose_path,
+                f"{self._COMPOSE_DIR}/{self._EGRESS_PROXY_COMPOSE}",
+            )
+            self._egress_proxy_overlay_ready = True
+
+        resolved_config = await self._resolve_compose_config()
+        self._validate_vm_network_isolation(resolved_config)
+
+    def _compose_no_proxy_hosts(self, config: dict[str, Any]) -> list[str]:
+        """Names that must keep using task-internal compose networking."""
+        services = config.get("services") or {}
+        hosts: set[str] = set(services.keys())
+
+        for config in services.values():
+            if not isinstance(config, dict):
+                continue
+            for key in ("hostname", "container_name"):
+                value = config.get(key)
+                if isinstance(value, str) and value:
+                    hosts.add(value)
+
+            networks = config.get("networks") or {}
+            if isinstance(networks, dict):
+                for network in networks.values():
+                    if isinstance(network, dict):
+                        hosts.update(network.get("aliases") or [])
+
+            extra_hosts = config.get("extra_hosts") or {}
+            if isinstance(extra_hosts, dict):
+                hosts.update(extra_hosts.keys())
+            elif isinstance(extra_hosts, list):
+                for entry in extra_hosts:
+                    if isinstance(entry, str):
+                        hosts.add(entry.split("=", 1)[0].split(":", 1)[0])
+
+        for server in self._env.task_env_config.mcp_servers:
+            if server.url and (hostname := urlparse(server.url).hostname):
+                hosts.add(hostname)
+
+        return sorted(host for host in hosts if isinstance(host, str) and host)
+
+    async def _resolve_compose_config(
+        self, *, include_vm_networking: bool = True
+    ) -> dict[str, Any]:
+        result = await self._compose_exec(
+            ["config", "--format", "json"],
+            include_agent_image=False,
+            include_vm_networking=include_vm_networking,
+            timeout_sec=30,
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"docker compose config failed: {result.stdout} {result.stderr}"
+            )
+        try:
+            config = json.loads(result.stdout or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("docker compose config returned invalid JSON") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError("docker compose config did not return a mapping")
+        return config
+
+    async def _resolve_main_compose_config(self) -> dict[str, Any]:
+        config = await self._resolve_compose_config()
+        try:
+            main = config["services"]["main"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "docker compose config did not define service 'main'"
+            ) from exc
+        if not isinstance(main, dict):
+            raise RuntimeError("docker compose service 'main' is not a mapping")
+        return main
+
+    async def _prepare_agent_base_image(self) -> str | None:
+        install = self._env.agent_install_spec
+        if install is None:
+            return None
+
+        main = await self._resolve_main_compose_config()
+        if main.get("build"):
+            base_image = self._main_image_name("base")
+            await self._upload_text(
+                self._BASE_IMAGE_COMPOSE,
+                f"services:\n  main:\n    image: {base_image}\n",
+            )
+            self._base_image_overlay_ready = True
+            return base_image
+
+        image = main.get("image")
+        if not isinstance(image, str) or not image:
+            raise RuntimeError(
+                "Cannot preinstall the agent: compose service 'main' has "
+                "neither a build definition nor an image."
+            )
+        return image
+
+    async def _build_agent_image(
+        self, base_image: str | None, *, force_build: bool
+    ) -> None:
+        install = self._env.agent_install_spec
+        if install is None:
+            return
+        if not base_image:
+            raise RuntimeError("Missing base image for agent preinstallation")
+
+        local_build_dir = self._env.trial_paths.trial_dir / "modal-agent-build"
+        write_agent_dockerfile(
+            build_dir=local_build_dir,
+            source_environment_dir=local_build_dir,
+            prebuilt_image_name=base_image,
+            install=install,
+            user=self._env._resolve_user(None),
+        )
+        await self._env._sdk_upload_dir(local_build_dir, self._AGENT_BUILD_DIR)
+
+        agent_image = self._main_image_name("agent")
+        command = ["docker", "build", "-t", agent_image]
+        if force_build:
+            command.append("--no-cache")
+        command.append(self._AGENT_BUILD_DIR)
+        result = await self._vm_exec(
+            shlex.join(command),
+            timeout_sec=round(self._env.task_env_config.build_timeout_sec),
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"agent image build failed: {result.stdout} {result.stderr}"
+            )
+
+        await self._upload_text(
+            self._AGENT_IMAGE_COMPOSE,
+            "services:\n"
+            "  main:\n"
+            f"    image: {agent_image}\n"
+            "    build: !reset null\n"
+            "    pull_policy: never\n",
+        )
+        self._agent_image_overlay_ready = True
+
     @property
     def _project_name(self) -> str:
         return self._env.session_id.lower().replace(".", "-")
 
-    def _compose_cmd(self, subcommand: list[str]) -> str:
+    def _compose_cmd(
+        self,
+        subcommand: list[str],
+        *,
+        include_base_image: bool = False,
+        include_agent_image: bool = True,
+        include_vm_networking: bool = True,
+    ) -> str:
         """Build a fully shell-escaped docker compose command string."""
         parts = [
             "docker",
@@ -448,7 +854,11 @@ class _ModalDinD(_ModalStrategy):
             self._project_name,
             "--project-directory",
             self._ENVIRONMENT_DIR,
-            *self._compose_file_flags(),
+            *self._compose_file_flags(
+                include_base_image=include_base_image,
+                include_agent_image=include_agent_image,
+                include_vm_networking=include_vm_networking,
+            ),
             *subcommand,
         ]
         return shlex.join(parts)
@@ -457,10 +867,19 @@ class _ModalDinD(_ModalStrategy):
         self,
         subcommand: list[str],
         timeout_sec: int | None = None,
+        *,
+        include_base_image: bool = False,
+        include_agent_image: bool = True,
+        include_vm_networking: bool = True,
     ) -> ExecResult:
         """Run a docker compose subcommand on the sandbox."""
         return await self._vm_exec(
-            self._compose_cmd(subcommand),
+            self._compose_cmd(
+                subcommand,
+                include_base_image=include_base_image,
+                include_agent_image=include_agent_image,
+                include_vm_networking=include_vm_networking,
+            ),
             env=self._compose_env_vars(),
             timeout_sec=timeout_sec,
         )
@@ -496,39 +915,72 @@ class _ModalDinD(_ModalStrategy):
 
     async def start(self, force_build: bool) -> None:
         env = self._env
+        use_vm = self._use_vm_runtime
 
-        dind_image: str = env._kwargs.get("dind_image", "docker:28.3.3-dind")
-        # Pre-configure dockerd for Modal sandboxes which lack iptables kernel
-        # modules and netlink permissions for creating veth pairs.  Disabling
-        # iptables and the default bridge avoids both issues.  All compose
-        # services must use network_mode: host (handled by a compose overlay).
-        env._image = Image.from_registry(dind_image).dockerfile_commands(
-            "RUN mkdir -p /etc/docker "
-            '&& echo \'{"iptables": false, "bridge": "none"}\' '
-            "> /etc/docker/daemon.json"
-        )
+        if use_vm:
+            # Modal's recommended Docker-in-Sandbox path: real Linux kernel +
+            # stock dockerd (not gVisor enable_docker). Native bridge/iptables
+            # work, so we can keep task compose networks instead of host-net.
+            # https://modal.com/docs/guide/vm-sandboxes
+            env._image = (
+                Image.from_registry("ubuntu:24.04")
+                .env({"DEBIAN_FRONTEND": "noninteractive"})
+                .apt_install(
+                    [
+                        "ca-certificates",
+                        "curl",
+                        "docker-buildx",
+                        "docker-compose-v2",
+                        "docker.io",
+                    ]
+                )
+                .run_commands(
+                    "mkdir -p /pier/compose /pier/environment /pier/logs /etc/docker",
+                )
+            )
+            experimental_options = {"vm_runtime": True}
+            sandbox_command: tuple[str, ...] | None = ("/usr/bin/dockerd", "-D")
+        else:
+            dind_image: str = env._kwargs.get("dind_image", "docker:28.3.3-dind")
+            # Pre-configure dockerd for gVisor sandboxes which lack iptables
+            # kernel modules and netlink permissions for creating veth pairs.
+            # Disabling iptables and the default bridge avoids both issues.
+            # All compose services must use network_mode: host.
+            env._image = Image.from_registry(dind_image).dockerfile_commands(
+                "RUN mkdir -p /etc/docker "
+                '&& echo \'{"iptables": false, "bridge": "none"}\' '
+                "> /etc/docker/daemon.json"
+            )
+            experimental_options = {"enable_docker": True}
+            sandbox_command = None
 
         env._app = await App.lookup.aio(
             name=env._app_name,
             create_if_missing=True,
         )
 
-        # DinD sandbox needs network for Docker daemon and image pulls
+        # DinD / VM sandbox needs network for Docker daemon and image pulls
         env._sandbox = await env._create_sandbox(
             block_network=False,
-            experimental_options={"enable_docker": True},
-            sandbox_command=None,
+            experimental_options=experimental_options,
+            sandbox_command=sandbox_command,
         )
 
         # Wait for Docker daemon to be ready inside the sandbox
         await self._wait_for_docker_daemon()
 
-        env.logger.debug(
-            "DinD mode uses host networking: no port isolation between "
-            "services, no Docker DNS service discovery (extra_hosts entries "
-            "map service names to 127.0.0.1 instead), and no network "
-            "namespace isolation."
-        )
+        if use_vm:
+            env.logger.info(
+                "Modal VM runtime: using native Docker bridge networking "
+                "(no host-network overlay)."
+            )
+        else:
+            env.logger.debug(
+                "DinD mode uses host networking: no port isolation between "
+                "services, no Docker DNS service discovery (extra_hosts entries "
+                "map service names to 127.0.0.1 instead), and no network "
+                "namespace isolation."
+            )
 
         # Upload Pier compose files to the sandbox
         for path in (
@@ -554,25 +1006,53 @@ class _ModalDinD(_ModalStrategy):
         # Build and start compose services
         self._use_prebuilt = not force_build and bool(env.task_env_config.docker_image)
 
-        overlay = self._build_host_network_overlay(
-            env.environment_dir, use_prebuilt=self._use_prebuilt
-        )
-        await self._vm_exec(
-            f"cat > /pier/compose/docker-compose-host-network.yaml << 'YAML'\n"
-            f"{overlay}\n"
-            f"YAML",
-            timeout_sec=10,
-        )
+        if use_vm:
+            mounts = self._build_mounts_overlay()
+            await self._upload_text(self._MOUNTS_COMPOSE, mounts)
+            await self._prepare_vm_networking()
+        else:
+            # Under host networking every service shares the sandbox netns,
+            # where non-root users can't bind ports <1024 (unlike a private
+            # container netns). Hardened services that expose 443 need this.
+            sysctl = await self._vm_exec(
+                "sysctl -w net.ipv4.ip_unprivileged_port_start=0 || true",
+                timeout_sec=10,
+            )
+            if "= 0" not in (sysctl.stdout or ""):
+                env.logger.warning(
+                    "Could not lower ip_unprivileged_port_start; services binding "
+                    f"privileged ports as non-root will fail: {sysctl.stderr}"
+                )
+
+            overlay = self._build_host_network_overlay(
+                env.environment_dir, use_prebuilt=self._use_prebuilt
+            )
+            await self._vm_exec(
+                f"cat > {self._COMPOSE_DIR}/{self._HOST_NETWORK_COMPOSE} << 'YAML'\n"
+                f"{overlay}\n"
+                f"YAML",
+                timeout_sec=10,
+            )
+
+        agent_base_image = await self._prepare_agent_base_image() if use_vm else None
 
         env.logger.debug("Building compose services inside DinD sandbox...")
+        build_command = ["build"]
+        if force_build:
+            build_command.append("--no-cache")
         result = await self._compose_exec(
-            ["build"],
+            build_command,
             timeout_sec=round(env.task_env_config.build_timeout_sec),
+            include_base_image=use_vm,
+            include_agent_image=False,
         )
         if result.return_code != 0:
             raise RuntimeError(
                 f"docker compose build failed: {result.stdout} {result.stderr}"
             )
+
+        if use_vm:
+            await self._build_agent_image(agent_base_image, force_build=force_build)
 
         env.logger.debug("Starting compose services inside DinD sandbox...")
         result = await self._compose_exec(["up", "-d"], timeout_sec=120)
@@ -816,6 +1296,7 @@ class ModalEnvironment(BaseEnvironment):
         proxy_environment_name: str | None = None,
         sandbox_timeout_secs: int = 60 * 60 * 24,
         sandbox_idle_timeout_secs: int | None = None,
+        vm_runtime: bool = False,
         *args,
         **kwargs,
     ):
@@ -852,16 +1333,22 @@ class ModalEnvironment(BaseEnvironment):
                 sandbox will be automatically terminated. None means no idle
                 timeout (default). See Modal sandbox docs:
                 https://modal.com/docs/reference/modal.Sandbox#create
+            vm_runtime: If True, create Modal VM Sandboxes
+                (``experimental_options={{"vm_runtime": True}}``) with a real
+                Linux kernel. For compose tasks this replaces gVisor
+                ``enable_docker`` DinD and enables native Docker networking.
+                See https://modal.com/docs/guide/vm-sandboxes. CPU-only.
         """
         # Detect compose mode *before* super().__init__ which calls
         # _validate_definition
         self._compose_mode = (environment_dir / "docker-compose.yaml").exists()
-        # DinD mode requires host networking — cannot enforce network isolation.
+        self._vm_runtime = bool(vm_runtime)
+        isolated_runtime = not self._compose_mode or self._vm_runtime
         self._capabilities = EnvironmentCapabilities(
-            gpus=True,
-            disable_internet=not self._compose_mode,
-            filtered_egress=not self._compose_mode,
-            preinstall_agents=not self._compose_mode,
+            gpus=not self._vm_runtime,  # Modal VM sandboxes are CPU-only today
+            disable_internet=isolated_runtime,
+            filtered_egress=isolated_runtime,
+            preinstall_agents=isolated_runtime,
             docker_compose=True,
         )
         self._kwargs = kwargs
@@ -905,15 +1392,22 @@ class ModalEnvironment(BaseEnvironment):
         self._strategy: _ModalStrategy = (
             _ModalDinD(self) if self._compose_mode else _ModalDirect(self)
         )
-        self.logger.debug(f"Selected strategy: {self._strategy.__class__.__name__}")
+        self.logger.debug(
+            "Selected strategy: %s (vm_runtime=%s)",
+            self._strategy.__class__.__name__,
+            self._vm_runtime,
+        )
 
     @property
     def _default_shell(self) -> str:
         """Shell available on the sandbox VM.
 
-        Alpine-based DinD images only have ``sh``; standard images have ``bash``.
+        Alpine-based gVisor DinD images only have ``sh``; Ubuntu VM images and
+        standard single-container images have ``bash``.
         """
-        return "sh" if self._compose_mode else "bash"
+        if self._compose_mode and not self._vm_runtime:
+            return "sh"
+        return "bash"
 
     def _cpu_config(self) -> int | float | tuple[int | float, int] | None:
         """Resolve CPU configuration for sandbox creation.
@@ -1050,6 +1544,8 @@ class ModalEnvironment(BaseEnvironment):
 
     async def _teardown_egress_proxy(self) -> None:
         if self._egress_proxy_sandbox is None:
+            self._egress_proxy_env = {}
+            self._egress_cidr_allowlist = None
             return
         try:
             await self._egress_proxy_sandbox.terminate.aio()
@@ -1102,7 +1598,7 @@ class ModalEnvironment(BaseEnvironment):
         if (gpu := self._gpu_config()) is not None:
             kwargs["gpu"] = gpu
 
-        return await Sandbox.create.aio(
+        sandbox = await Sandbox.create.aio(
             *sandbox_args,
             app=self._app,
             image=self._image,
@@ -1116,6 +1612,8 @@ class ModalEnvironment(BaseEnvironment):
             proxy=self._proxy,
             **kwargs,
         )
+        self.logger.info("Modal sandbox created: %s", sandbox.object_id)
+        return sandbox
 
     @retry(
         stop=stop_after_attempt(2),
@@ -1286,7 +1784,15 @@ class ModalEnvironment(BaseEnvironment):
                 tg.create_task(_download_one(p))
 
     async def start(self, force_build: bool) -> None:
-        return await self._strategy.start(force_build)
+        try:
+            await self._strategy.start(force_build)
+        except BaseException:
+            cleanup = asyncio.create_task(self._strategy._teardown_sandbox())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+            raise
 
     async def stop(self, delete: bool):
         return await self._strategy.stop(delete)
@@ -1301,6 +1807,15 @@ class ModalEnvironment(BaseEnvironment):
     ) -> ExecResult:
         user = self._resolve_user(user)
         env = self._merge_env(env)
+        effective_cwd = cwd or self.task_env_config.workdir
+
+        if isinstance(self._strategy, _ModalDinD):
+            # docker compose exec supports -u natively. Never su-wrap here:
+            # compose exec runs as the image's (possibly non-root) default
+            # user, and `su` upward to root prompts for a password and hangs.
+            return await self._strategy.exec(
+                command, cwd=effective_cwd, env=env, timeout_sec=timeout_sec, user=user
+            )
 
         if user is not None:
             # Modal doesn't support user= on exec; wrap with su.
@@ -1310,7 +1825,6 @@ class ModalEnvironment(BaseEnvironment):
                 user_arg = shlex.quote(str(user))
             command = f"su -m {user_arg} -s /bin/bash -c {shlex.quote(command)}"
 
-        effective_cwd = cwd or self.task_env_config.workdir
         return await self._strategy.exec(
             command, cwd=effective_cwd, env=env, timeout_sec=timeout_sec
         )
