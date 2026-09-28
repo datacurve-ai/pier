@@ -127,10 +127,8 @@ def _uncached_input(n_input: int | None, n_cache: int | None) -> int | None:
     ``AgentContext.n_input_tokens`` is documented to include cached tokens,
     so the "uncached" portion the viewer surfaces is total minus cached.
     """
-    if n_input is None:
+    if n_input is None or n_cache is None:
         return None
-    if n_cache is None:
-        return n_input
     return max(0, n_input - n_cache)
 
 
@@ -2713,7 +2711,9 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
                 ),
                 avg_cost_usd=average("total_cost_usd", "cost_usd_count", stats),
                 total_cost_usd=(
-                    stats["total_cost_usd"] if stats["cost_usd_count"] > 0 else None
+                    stats["total_cost_usd"]
+                    if stats["cost_usd_count"] == stats["n_trials"]
+                    else None
                 ),
                 avg_peak_context_tokens=average(
                     "total_peak_context_tokens", "peak_context_tokens_count", stats

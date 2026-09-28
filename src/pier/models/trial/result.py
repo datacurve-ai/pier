@@ -8,6 +8,7 @@ from pier.models.agent.context import AgentContext
 from pier.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
 from pier.models.trial.config import TrialConfig
 from pier.models.verifier.result import VerifierResult
+from pier.utils.trajectory_metrics import sum_known
 
 
 class TimingInfo(BaseModel):
@@ -112,7 +113,7 @@ class TrialResult(BaseModel):
     def compute_token_cost_totals(
         self,
     ) -> tuple[int | None, int | None, int | None, float | None]:
-        """Sum (n_input_tokens, n_cache_tokens, n_output_tokens, cost_usd)."""
+        """Sum usage per field only when every agent context reports that field."""
         if self.agent_result is not None:
             contexts = [self.agent_result]
         elif self.step_results:
@@ -124,21 +125,9 @@ class TrialResult(BaseModel):
         else:
             contexts = []
 
-        if not contexts:
-            return None, None, None, None
-
-        n_input: int | None = None
-        n_cache: int | None = None
-        n_output: int | None = None
-        cost: float | None = None
-        for ctx in contexts:
-            if ctx.n_input_tokens is not None:
-                n_input = (n_input or 0) + ctx.n_input_tokens
-            if ctx.n_cache_tokens is not None:
-                n_cache = (n_cache or 0) + ctx.n_cache_tokens
-            if ctx.n_output_tokens is not None:
-                n_output = (n_output or 0) + ctx.n_output_tokens
-            if ctx.cost_usd is not None:
-                cost = (cost or 0.0) + ctx.cost_usd
-
-        return n_input, n_cache, n_output, cost
+        return (
+            sum_known(ctx.n_input_tokens for ctx in contexts),
+            sum_known(ctx.n_cache_tokens for ctx in contexts),
+            sum_known(ctx.n_output_tokens for ctx in contexts),
+            sum_known(ctx.cost_usd for ctx in contexts),
+        )

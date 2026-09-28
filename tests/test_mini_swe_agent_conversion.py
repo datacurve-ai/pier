@@ -362,21 +362,197 @@ def test_format_feedback_retains_rejected_response_as_its_own_step(response):
     assert [result.content for result in rejected.observation.results] == [
         "Every response must include a tool call"
     ]
-    assert (
-        rejected.metrics.prompt_tokens
-        == trajectory.final_metrics.total_prompt_tokens
-        == 100
-    )
-    assert (
-        rejected.metrics.completion_tokens
-        == trajectory.final_metrics.total_completion_tokens
-        == 40
-    )
-    assert (
-        rejected.metrics.cached_tokens
-        == trajectory.final_metrics.total_cached_tokens
-        == 25
-    )
-    assert rejected.metrics.cost_usd == trajectory.final_metrics.total_cost_usd == 0.01
+    assert rejected.metrics.prompt_tokens == 100
+    assert rejected.metrics.completion_tokens == 40
+    assert rejected.metrics.cached_tokens == 25
+    assert rejected.metrics.cost_usd == 0.01
+    assert trajectory.final_metrics.total_prompt_tokens is None
+    assert trajectory.final_metrics.total_completion_tokens is None
+    assert trajectory.final_metrics.total_cached_tokens is None
+    assert trajectory.final_metrics.total_cost_usd is None
     assert rejected.metrics.extra["completion_tokens_details"]["reasoning_tokens"] == 30
     assert native["messages"][4]["role"] == "user"
+
+
+@pytest.mark.parametrize(
+    "usage, expected",
+    [
+        (None, (None, None, None, None, None)),
+        ({}, (None, None, None, None, None)),
+        ({"prompt_tokens": 100}, (100, None, None, None, None)),
+        ({"completion_tokens": 40}, (None, 40, None, None, None)),
+        ({"prompt_tokens_details": {"cached_tokens": 0}}, (None, None, 0, None, None)),
+        (
+            {"completion_tokens_details": {"reasoning_tokens": 0}},
+            (None, None, None, 0, None),
+        ),
+        (
+            {
+                "completion_tokens": 40,
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+            (None, 40, None, 0, 40),
+        ),
+        (
+            {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "prompt_tokens_details": {"cached_tokens": None},
+                "completion_tokens_details": {"reasoning_tokens": None},
+            },
+            (None, None, None, None, None),
+        ),
+        (
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+            (0, 0, 0, 0, 0),
+        ),
+    ],
+)
+def test_usage_presence_is_preserved_in_steps_and_totals(usage, expected):
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "extra": {"response": {"usage": usage}},
+                }
+            ]
+        },
+        "session",
+    )
+
+    step = trajectory.steps[0]
+    metrics = step.metrics.model_dump() if step.metrics else {}
+    extra = metrics.get("extra") or {}
+    assert (
+        metrics.get("prompt_tokens"),
+        metrics.get("completion_tokens"),
+        metrics.get("cached_tokens"),
+        extra.get("completion_tokens_details", {}).get("reasoning_tokens"),
+        extra.get("text_tokens"),
+    ) == expected
+    final = trajectory.final_metrics
+    assert (
+        final.total_prompt_tokens,
+        final.total_completion_tokens,
+        final.total_cached_tokens,
+        (final.extra or {}).get("total_reasoning_tokens"),
+        (final.extra or {}).get("total_text_tokens"),
+    ) == expected
+    assert step.llm_call_count == final.total_steps == 1
+
+
+@pytest.mark.parametrize("response", [{}, {"usage": None}, {"usage": {}}])
+def test_captured_response_does_not_fall_back_to_unrelated_usage(response):
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "extra": {"response": response},
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 40},
+                }
+            ]
+        },
+        "session",
+    )
+
+    assert trajectory.final_metrics.total_prompt_tokens is None
+    assert trajectory.final_metrics.total_completion_tokens is None
+
+
+def test_explicit_zero_does_not_fall_back_to_an_alias():
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "input_tokens": 100,
+                        "completion_tokens": 0,
+                        "output_tokens": 40,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "cache_read_input_tokens": 25,
+                    },
+                }
+            ]
+        },
+        "session",
+    )
+
+    metrics = trajectory.steps[0].metrics
+    assert (
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+        metrics.cached_tokens,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("missing_first", [False, True])
+def test_mixed_usage_keeps_only_complete_totals(missing_first):
+    complete = {
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "input_tokens_details": {"cached_tokens": 25},
+        "output_tokens_details": {"reasoning_tokens": 30},
+    }
+    partial = {**complete, "output_tokens": None, "output_tokens_details": {}}
+    usages = [partial, complete] if missing_first else [complete, partial]
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "messages": [
+                {"role": "assistant", "content": "answer", "usage": usages[0]},
+                {"role": "tool", "content": "result", "usage": complete},
+                {"role": "assistant", "content": "answer", "usage": usages[1]},
+            ]
+        },
+        "session",
+    )
+
+    final = trajectory.final_metrics
+    assert final.total_prompt_tokens == 200
+    assert final.total_cached_tokens == 50
+    assert final.total_completion_tokens is None
+    assert final.extra.get("total_reasoning_tokens") is None
+    assert final.extra.get("total_text_tokens") is None
+    assert final.total_steps == 2
+    assert [step.llm_call_count for step in trajectory.steps] == [1, 1]
+    assert trajectory.steps[0].observation.results[0].content == "result"
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [{"cost": 0}, {"cost_details": {"upstream_inference_cost": 0}}],
+)
+def test_explicit_zero_cost_survives_conversion(usage):
+    trajectory = convert_mini_swe_agent_to_atif(
+        {"messages": [{"role": "assistant", "content": "answer", "usage": usage}]},
+        "session",
+    )
+
+    assert trajectory.steps[0].metrics.cost_usd == 0
+    assert trajectory.final_metrics.total_cost_usd == 0
+    assert trajectory.final_metrics.total_prompt_tokens is None
+
+
+@pytest.mark.parametrize("cost, expected", [(0, 0), (None, None), (-1, None)])
+def test_run_cost_presence_survives_conversion(cost, expected):
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "info": {"model_stats": {"instance_cost": cost}},
+            "messages": [{"role": "assistant", "content": "answer"}],
+        },
+        "session",
+    )
+
+    assert trajectory.final_metrics.total_cost_usd == expected
+    assert trajectory.final_metrics.total_prompt_tokens is None

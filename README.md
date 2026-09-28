@@ -140,6 +140,8 @@ through your env file.
 
 ATIF conversion retains responses rejected by the agent's format validation as agent steps, with their raw content, reasoning, usage, and validation feedback. These responses remain counted once in the token totals.
 
+`mini-swe-agent` token counts and costs preserve missing values as `null` and recorded zeros as `0`. Per-field totals require usage from every agent turn, trial context, and completed trial. A reported run cost can supply the total when per-turn costs are missing. Retrying a trial updates usage completeness along with its contribution. The viewer leaves uncached input unknown when cache usage is missing, and averages still use the trials that reported each metric.
+
 For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Gemini API default high/dynamic thinking level, but it does not request readable thought summaries. Set `kwargs.reasoning_effort: high` explicitly when you want LiteLLM to send `includeThoughts` and preserve returned summaries as reasoning content.
 
 ```yaml

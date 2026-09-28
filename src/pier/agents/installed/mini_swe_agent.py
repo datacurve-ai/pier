@@ -35,6 +35,7 @@ from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
     peak_context_tokens_from_steps,
     populate_context_from_final_metrics,
+    sum_known,
 )
 
 
@@ -115,32 +116,32 @@ def _add_observation_to_last_agent_step(
 
 
 def _build_step_metrics(
-    prompt_tokens: int,
-    completion_tokens: int,
-    cached_tokens: int,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    cached_tokens: int | None,
     prompt_tokens_details: dict[str, Any],
     completion_tokens_details: dict[str, Any],
-    total_cost_usd: float,
-    total_completion_tokens: int,
     step_cost_usd: float | None = None,
 ) -> Metrics | None:
     """Build metrics for an individual step."""
-    if prompt_tokens == 0 and completion_tokens == 0:
+    if (
+        prompt_tokens is None
+        and completion_tokens is None
+        and cached_tokens is None
+        and step_cost_usd is None
+        and not prompt_tokens_details
+        and not completion_tokens_details
+    ):
         return None
 
-    step_cost = step_cost_usd
-    if (
-        step_cost is None
-        and total_cost_usd > 0
-        and total_completion_tokens > 0
-        and completion_tokens > 0
-    ):
-        step_cost = (completion_tokens / total_completion_tokens) * total_cost_usd
-
     extra_metrics: dict[str, Any] = {}
-    reasoning_tokens = completion_tokens_details.get("reasoning_tokens") or 0
+    reasoning_tokens = completion_tokens_details.get("reasoning_tokens")
     text_tokens = completion_tokens_details.get("text_tokens")
-    if text_tokens is None and completion_tokens > 0 and reasoning_tokens > 0:
+    if (
+        text_tokens is None
+        and completion_tokens is not None
+        and reasoning_tokens is not None
+    ):
         text_tokens = max(0, completion_tokens - reasoning_tokens)
     if prompt_tokens_details:
         extra_metrics["prompt_tokens_details"] = prompt_tokens_details
@@ -152,8 +153,8 @@ def _build_step_metrics(
     return Metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens if cached_tokens > 0 else None,
-        cost_usd=step_cost if step_cost and step_cost > 0 else None,
+        cached_tokens=cached_tokens,
+        cost_usd=step_cost_usd,
         extra=extra_metrics if extra_metrics else None,
     )
 
@@ -206,8 +207,12 @@ def _reasoning_from_message(message: dict[str, Any]) -> str | None:
 
 def _usage_from_message(message: dict[str, Any]) -> dict[str, Any]:
     extra = message.get("extra") or {}
-    response_data = extra.get("response") or {}
-    usage = response_data.get("usage") or message.get("usage") or {}
+    response_data = extra.get("response")
+    usage = (
+        response_data.get("usage")
+        if isinstance(response_data, dict)
+        else message.get("usage")
+    )
     return usage if isinstance(usage, dict) else {}
 
 
@@ -217,11 +222,12 @@ def _cost_from_usage(usage: dict[str, Any]) -> float | None:
         return float(cost)
 
     cost_details = usage.get("cost_details")
-    if not isinstance(cost_details, dict):
-        return None
-    upstream_cost = cost_details.get("upstream_inference_cost")
-    if isinstance(upstream_cost, int | float) and upstream_cost > 0:
-        return float(upstream_cost)
+    if isinstance(cost_details, dict):
+        upstream_cost = cost_details.get("upstream_inference_cost")
+        if isinstance(upstream_cost, int | float) and upstream_cost >= 0:
+            return float(upstream_cost)
+    if isinstance(cost, int | float) and cost >= 0:
+        return float(cost)
     return None
 
 
@@ -305,25 +311,12 @@ def convert_mini_swe_agent_to_atif(
     steps: list[Step] = []
     step_id = 1
 
-    # Track cumulative token counts
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    total_cached_tokens = 0
-    total_reasoning_tokens = 0
-    total_text_tokens = 0
-    total_cost_usd = (info.get("model_stats") or {}).get("instance_cost") or 0.0
-    total_usage_cost = 0.0
-
-    # First pass: count total completion tokens for cost apportioning
-    for message in messages:
-        usage = _usage_from_message(message)
-        total_completion_tokens += (
-            usage.get("completion_tokens") or usage.get("output_tokens") or 0
-        )
-        total_usage_cost += _cost_from_usage(usage) or 0.0
-
-    if total_cost_usd <= 0 and total_usage_cost > 0:
-        total_cost_usd = total_usage_cost
+    reported_cost = (info.get("model_stats") or {}).get("instance_cost")
+    total_cost_usd = (
+        reported_cost
+        if isinstance(reported_cost, int | float) and reported_cost >= 0
+        else None
+    )
 
     # Process messages
     for i, message in enumerate(messages):
@@ -333,39 +326,23 @@ def convert_mini_swe_agent_to_atif(
 
         # Extract token usage
         usage = _usage_from_message(message)
-        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-        completion_tokens = (
-            usage.get("completion_tokens") or usage.get("output_tokens") or 0
-        )
+        prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
         prompt_tokens_details = (
-            usage.get("prompt_tokens_details")
-            or usage.get("input_tokens_details")
-            or {}
+            usage.get("prompt_tokens_details", usage.get("input_tokens_details")) or {}
         )
         if not isinstance(prompt_tokens_details, dict):
             prompt_tokens_details = {}
         completion_tokens_details = (
-            usage.get("completion_tokens_details")
-            or usage.get("output_tokens_details")
+            usage.get("completion_tokens_details", usage.get("output_tokens_details"))
             or {}
         )
         if not isinstance(completion_tokens_details, dict):
             completion_tokens_details = {}
-        cached_tokens = (
-            prompt_tokens_details.get("cached_tokens")
-            or usage.get("cache_read_input_tokens")
-            or 0
+        cached_tokens = prompt_tokens_details.get(
+            "cached_tokens", usage.get("cache_read_input_tokens")
         )
-        reasoning_tokens = completion_tokens_details.get("reasoning_tokens") or 0
-        text_tokens = completion_tokens_details.get("text_tokens")
-        if text_tokens is None and completion_tokens > 0 and reasoning_tokens > 0:
-            text_tokens = max(0, completion_tokens - reasoning_tokens)
         step_cost_usd = _cost_from_usage(usage)
-
-        total_prompt_tokens += prompt_tokens
-        total_cached_tokens += cached_tokens
-        total_reasoning_tokens += reasoning_tokens
-        total_text_tokens += text_tokens or 0
 
         feedback = None
         if role == "user":
@@ -429,8 +406,6 @@ def convert_mini_swe_agent_to_atif(
                 cached_tokens=cached_tokens,
                 prompt_tokens_details=prompt_tokens_details,
                 completion_tokens_details=completion_tokens_details,
-                total_cost_usd=total_cost_usd,
-                total_completion_tokens=total_completion_tokens,
                 step_cost_usd=step_cost_usd,
             )
 
@@ -459,11 +434,55 @@ def convert_mini_swe_agent_to_atif(
                 output = _normalize_content(output)
             _add_observation_to_last_agent_step(steps, output, _logger, i, timestamp)
 
-    # Build final metrics
+    # Aggregate converted agent turns, including rejected provider responses.
+    agent_metrics = [step.metrics for step in steps if step.source == "agent"]
+    total_prompt_tokens = sum_known(
+        metric.prompt_tokens if metric else None for metric in agent_metrics
+    )
+    total_completion_tokens = sum_known(
+        metric.completion_tokens if metric else None for metric in agent_metrics
+    )
+    total_cached_tokens = sum_known(
+        metric.cached_tokens if metric else None for metric in agent_metrics
+    )
+    total_reasoning_tokens = sum_known(
+        (metric.extra or {})
+        .get("completion_tokens_details", {})
+        .get("reasoning_tokens")
+        if metric
+        else None
+        for metric in agent_metrics
+    )
+    total_text_tokens = sum_known(
+        (metric.extra or {}).get("text_tokens") if metric else None
+        for metric in agent_metrics
+    )
+    total_usage_cost = sum_known(
+        metric.cost_usd if metric else None for metric in agent_metrics
+    )
+    if (total_cost_usd is None or total_cost_usd == 0) and total_usage_cost is not None:
+        total_cost_usd = total_usage_cost
+    if (
+        total_cost_usd is not None
+        and total_cost_usd > 0
+        and total_completion_tokens is not None
+        and total_completion_tokens > 0
+    ):
+        for metric in agent_metrics:
+            if (
+                metric
+                and metric.cost_usd is None
+                and metric.completion_tokens is not None
+                and metric.completion_tokens > 0
+            ):
+                metric.cost_usd = (
+                    metric.completion_tokens / total_completion_tokens
+                ) * total_cost_usd
+
     final_extra: dict[str, Any] = {}
-    if total_reasoning_tokens > 0:
+    if total_reasoning_tokens is not None:
         final_extra["total_reasoning_tokens"] = total_reasoning_tokens
-    if total_text_tokens > 0:
+    if total_text_tokens is not None:
         final_extra["total_text_tokens"] = total_text_tokens
     final_extra = extra_with_context_metrics(
         final_extra if final_extra else None,
@@ -474,8 +493,8 @@ def convert_mini_swe_agent_to_atif(
     final_metrics = FinalMetrics(
         total_prompt_tokens=total_prompt_tokens,
         total_completion_tokens=total_completion_tokens,
-        total_cached_tokens=total_cached_tokens if total_cached_tokens > 0 else None,
-        total_cost_usd=total_cost_usd if total_cost_usd > 0 else None,
+        total_cached_tokens=total_cached_tokens,
+        total_cost_usd=total_cost_usd,
         total_steps=len(steps),
         extra=final_extra,
     )
