@@ -213,6 +213,7 @@ trials/
 tasks/
 datasets/
 !examples/tasks/
+!examples/jobs/
 *.code-workspace
 ignore/
 !src/pier/tasks/
