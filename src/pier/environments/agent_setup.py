@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shlex
 from pathlib import Path
@@ -11,6 +12,14 @@ from pier.models.agent.network import NetworkAllowlist
 AGENT_INSTALL_DIR = ".pier-agent-install"
 EGRESS_PROXY_SERVICE = "pier-egress-proxy"
 EGRESS_PROXY_PORT = 8080
+
+
+def _docker_cmd() -> str:
+    return os.environ.get("PIER_DOCKER_CMD", "docker")
+
+
+def _is_podman() -> bool:
+    return os.path.basename(_docker_cmd()).startswith("podman")
 
 
 def docker_run_command(script: str) -> str:
@@ -193,6 +202,12 @@ def write_docker_proxy_compose(
             },
         },
     }
+    if _is_podman():
+        # podman-compose raises "missing networks: default" because the egress
+        # proxy service references ["pier-egress-internal", "default"] but only
+        # pier-egress-internal is declared top-level. Docker auto-creates the
+        # default network, so this is podman-only to keep docker output identical.
+        compose["networks"]["default"] = {}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(compose, indent=2))
     return path
