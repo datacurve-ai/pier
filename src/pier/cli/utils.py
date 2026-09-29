@@ -1,9 +1,50 @@
 import asyncio
 import json
+import os
+import subprocess
 import sys
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any, Coroutine, TypeVar
 
+from pier.utils.logger import logger
+
 T = TypeVar("T")
+
+
+@contextmanager
+def prevent_system_sleep() -> Iterator[None]:
+    """Keep the host awake while a CLI job is running.
+
+    macOS ships ``caffeinate`` as part of the operating system. Running it with
+    ``-w`` also makes the assertion self-cleaning if Pier exits unexpectedly.
+    Other platforms currently remain a no-op.
+    """
+    process: subprocess.Popen[bytes] | None = None
+    if sys.platform == "darwin":
+        try:
+            process = subprocess.Popen(
+                ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            logger.getChild(__name__).warning(
+                "Could not prevent host sleep while the Pier job is running: %s",
+                exc,
+            )
+
+    try:
+        yield
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def run_async(coro: Coroutine[Any, Any, T]) -> T:

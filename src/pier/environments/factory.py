@@ -76,6 +76,28 @@ def _load_environment_class(env_type: EnvironmentType) -> type[BaseEnvironment]:
 
 class EnvironmentFactory:
     @classmethod
+    def supports_exec_stdin(
+        cls,
+        type: EnvironmentType | None,
+        import_path: str | None = None,
+    ) -> bool:
+        """Return whether the configured environment supports streamed stdin."""
+        environment_class: type[BaseEnvironment] | None = None
+        if import_path is not None and ":" in import_path:
+            module_path, class_name = import_path.split(":", 1)
+            try:
+                environment_class = getattr(
+                    importlib.import_module(module_path), class_name
+                )
+            except (ImportError, AttributeError):
+                return False
+        elif type is not None and type in _ENVIRONMENT_REGISTRY:
+            environment_class = _load_environment_class(type)
+        return bool(
+            environment_class is not None and environment_class.supports_exec_stdin()
+        )
+
+    @classmethod
     def create_environment(
         cls,
         type: EnvironmentType,

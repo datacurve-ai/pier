@@ -33,6 +33,13 @@ class AgentFactory:
     }
 
     @classmethod
+    def supports_request_throttling(cls, config: AgentConfig) -> bool:
+        if config.name not in AgentName.values():
+            return False
+        agent_class = cls._AGENT_MAP.get(AgentName(config.name))
+        return agent_class is not None and agent_class.SUPPORTS_REQUEST_THROTTLING
+
+    @classmethod
     def create_agent_from_name(
         cls,
         name: AgentName,

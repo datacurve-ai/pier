@@ -15,7 +15,7 @@ from uuid import uuid4
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from pier.environments.agent_setup import dockerfile_install_commands
-from pier.environments.base import BaseEnvironment, ExecResult
+from pier.environments.base import BaseEnvironment, ExecOutputCallback, ExecResult
 from pier.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -250,6 +250,24 @@ class _DaytonaStrategy:
         user: str | int | None = None,
     ) -> ExecResult: ...
 
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        result = await self.exec(
+            command, cwd=cwd, env=env, timeout_sec=timeout_sec, user=user
+        )
+        if result.stdout:
+            await on_output("stdout", result.stdout)
+        if result.stderr:
+            await on_output("stderr", result.stderr)
+        return result
+
     @abstractmethod
     async def upload_file(self, source_path: Path | str, target_path: str) -> None: ...
 
@@ -382,6 +400,24 @@ class _DaytonaDirect(_DaytonaStrategy):
     ) -> ExecResult:
         return await self._env._sandbox_exec(
             command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        return await self._env._sandbox_exec_stream(
+            command,
+            on_output=on_output,
             cwd=cwd,
             env=env,
             timeout_sec=timeout_sec,
@@ -701,6 +737,32 @@ class _DaytonaDinD(_DaytonaStrategy):
             parts.extend(["-u", str(user)])
         parts.extend(["main", "bash", "-c", command])
         return await self._compose_exec(parts, timeout_sec=timeout_sec)
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        parts: list[str] = ["exec", "-T"]
+        if cwd:
+            parts.extend(["-w", cwd])
+        if env:
+            for key, value in env.items():
+                parts.extend(["-e", f"{key}={value}"])
+        if user is not None:
+            parts.extend(["-u", str(user)])
+        parts.extend(["main", "bash", "-c", command])
+        return await self._env._sandbox_exec_stream(
+            self._compose_cmd(parts),
+            on_output=on_output,
+            env=self._compose_env_vars(),
+            timeout_sec=timeout_sec,
+            shell="sh -c",
+        )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         temp = f"/tmp/pier_{uuid4().hex}"
@@ -1168,6 +1230,80 @@ class DaytonaEnvironment(BaseEnvironment):
             raise RuntimeError("Cannot find command ID.")
         return await self._poll_response(session_id, response.cmd_id)
 
+    async def _sandbox_exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        shell: str = "bash -c",
+        user: str | int | None = None,
+    ) -> ExecResult:
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please build the environment first.")
+
+        session_id = str(uuid4())
+        await self._sandbox.process.create_session(session_id)
+        command = f"{shell} {shlex.quote(command)}"
+        if env:
+            env_args = " ".join(
+                f"{key}={shlex.quote(value)}" for key, value in env.items()
+            )
+            command = f"env {env_args} {command}"
+        if timeout_sec:
+            command = f"timeout {timeout_sec} {command}"
+        if cwd:
+            command = f"cd {shlex.quote(cwd)} && {command}"
+        if user is not None:
+            if isinstance(user, int):
+                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+            else:
+                user_arg = shlex.quote(str(user))
+            command = f"su {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+
+        response = await self._sandbox.process.execute_session_command(
+            session_id,
+            SessionExecuteRequest(command=command, run_async=True),
+            timeout=timeout_sec,
+        )
+        if response.cmd_id is None:
+            raise RuntimeError("Cannot find command ID.")
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        async def stdout_callback(chunk: str) -> None:
+            stdout_chunks.append(chunk)
+            await on_output("stdout", chunk)
+
+        async def stderr_callback(chunk: str) -> None:
+            stderr_chunks.append(chunk)
+            await on_output("stderr", chunk)
+
+        log_task = asyncio.create_task(
+            self._sandbox.process.get_session_command_logs_async(
+                session_id,
+                response.cmd_id,
+                stdout_callback,
+                stderr_callback,
+            )
+        )
+        command_status = await self._get_session_command_with_retry(
+            session_id, response.cmd_id
+        )
+        while command_status.exit_code is None:
+            await asyncio.sleep(0.5)
+            command_status = await self._get_session_command_with_retry(
+                session_id, response.cmd_id
+            )
+        await log_task
+        return ExecResult(
+            stdout="".join(stdout_chunks) or None,
+            stderr="".join(stderr_chunks) or None,
+            return_code=int(command_status.exit_code),
+        )
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -1273,6 +1409,27 @@ class DaytonaEnvironment(BaseEnvironment):
         effective_cwd = cwd or self.task_env_config.workdir
         return await self._strategy.exec(
             command,
+            cwd=effective_cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+        effective_cwd = cwd or self.task_env_config.workdir
+        return await self._strategy.exec_stream(
+            command,
+            on_output=on_output,
             cwd=effective_cwd,
             env=env,
             timeout_sec=timeout_sec,

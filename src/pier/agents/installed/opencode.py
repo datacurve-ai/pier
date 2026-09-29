@@ -537,6 +537,7 @@ class OpenCode(BaseInstalledAgent):
                 f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/opencode.txt"
             ),
             env=env,
+            telemetry=True,
         )
 
         if messages := self._error_messages():

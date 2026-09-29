@@ -11,12 +11,15 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
+    Task,
     TaskID,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.text import Text
 
 from pier.environments.factory import EnvironmentFactory
 from pier.metrics.base import BaseMetric
@@ -31,6 +34,7 @@ from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats
 from pier.models.trial.config import TaskConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
 from pier.models.trial.result import TrialResult
+from pier.telemetry import TelemetrySnapshot
 from pier.trial.hooks import HookCallback, TrialEvent, TrialHookEvent
 from pier.trial.queue import TrialQueue
 from pier.utils.logger import logger
@@ -38,6 +42,40 @@ from pier.utils.pass_at_k import compute_pass_at_k_by_evals
 
 
 CANCELLED_ERROR_TYPE = "CancelledError"
+
+
+class _ConcurrencyColumn(ProgressColumn):
+    """Render live running/capacity state"""
+
+    def __init__(self, queue: TrialQueue) -> None:
+        super().__init__()
+        self._queue = queue
+
+    @staticmethod
+    def _group_label(snapshot) -> str:
+        parts = [snapshot.provider, snapshot.model, snapshot.effort]
+        return "/".join(part for part in parts if part) or "unknown"
+
+    def render(self, task: Task) -> Text:
+        snapshots = self._queue.concurrency_snapshots()
+        if not self._queue.optimize_concurrency:
+            snapshot = snapshots[0]
+            return Text(
+                f"Concurrency: running={snapshot.running} "
+                f"capacity={snapshot.capacity} queued={snapshot.queued} "
+                f"paused={snapshot.paused}",
+                style="cyan",
+            )
+        if not snapshots:
+            return Text("Concurrency: starting", style="cyan")
+
+        groups = " | ".join(
+            f"{self._group_label(snapshot)} "
+            f"running={snapshot.running} capacity={snapshot.capacity} "
+            f"queued={snapshot.queued} paused={snapshot.paused}"
+            for snapshot in snapshots
+        )
+        return Text(f"Concurrency: {groups}", style="cyan")
 
 
 class Job:
@@ -101,6 +139,8 @@ class Job:
 
         self._trial_queue = TrialQueue(
             n_concurrent=self.config.n_concurrent_trials,
+            optimize_concurrency=self.config.optimize_concurrency,
+            telemetry=TelemetrySnapshot(self.job_dir / "logs" / "telemetry.json"),
             retry_config=self.config.retry,
         )
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)
@@ -631,6 +671,7 @@ class Job:
             loading_progress = Progress(
                 SpinnerColumn(),
                 MofNCompleteColumn(),
+                _ConcurrencyColumn(self._trial_queue),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TimeElapsedColumn(),
@@ -685,7 +726,9 @@ class Job:
                 )
 
                 if trial_result.verifier_result is not None:
-                    final_rewards[evals_key].append(trial_result.verifier_result.rewards)
+                    final_rewards[evals_key].append(
+                        trial_result.verifier_result.rewards
+                    )
                 else:
                     final_rewards[evals_key].append(None)
 
@@ -801,8 +844,12 @@ class Job:
 
         coros = self._trial_queue.submit_batch(self._remaining_trial_configs)
 
-        async with asyncio.TaskGroup() as tg:
-            tasks = [tg.create_task(coro) for coro in coros]
+        await self._trial_queue.start()
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(coro) for coro in coros]
+        finally:
+            await self._trial_queue.stop()
 
         return [t.result() for t in tasks]
 
