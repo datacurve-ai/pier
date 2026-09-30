@@ -319,12 +319,43 @@ class Trial:
         finally:
             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
 
+    async def _reset_shared_verifier_dirs(self) -> None:
+        """Clear the verifier/tests dirs the agent's container has been holding.
+
+        ``/logs/verifier`` is created and chmod 777'd at environment start, so
+        for a shared verifier it is writable for the whole agent phase. Without
+        this reset a file left there — a stale reward from an earlier attempt,
+        or one the agent wrote itself — survives into verification and is read
+        as the trial's score. ``_run_steps`` already resets per step; this is
+        the single-step equivalent.
+
+        No-op in separate mode: that verifier gets a fresh environment (which
+        ``_verify_with_separate_environment`` empties itself), and the agent
+        environment may already be stopped by this point.
+        """
+        if (
+            resolve_task_verifier_mode(self._task.config)
+            == VerifierEnvironmentMode.SEPARATE
+        ):
+            return
+
+        env_paths = self._environment.env_paths
+        await self._environment.reset_dirs(
+            remove_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
+            create_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
+            chmod_dirs=[env_paths.verifier_dir],
+        )
+
     async def _run_verification(self) -> None:
         await self._invoke_hooks(TrialEvent.VERIFICATION_START)
 
         self.result.verifier = TimingInfo(started_at=datetime.now(timezone.utc))
 
         try:
+            # Must happen outside _verify_with_retry: that retries on
+            # VerifierTimeoutError, and resetting per attempt would discard a
+            # reward the retried run had already written.
+            await self._reset_shared_verifier_dirs()
             await self._verify_with_retry()
         finally:
             self.result.verifier.finished_at = datetime.now(timezone.utc)
