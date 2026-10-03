@@ -12,6 +12,7 @@ class AgentName(str, Enum):
     MINI_SWE_AGENT = "mini-swe-agent"
     SWE_AGENT = "swe-agent"
     OPENCODE = "opencode"
+    CLINE = "cline"
 
     @classmethod
     def values(cls) -> set[str]:

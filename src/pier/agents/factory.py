@@ -4,6 +4,7 @@ from pathlib import Path
 from pier.agents.base import BaseAgent
 from pier.agents.installed.antigravity_sdk import AntigravitySDK
 from pier.agents.installed.claude_code import ClaudeCode
+from pier.agents.installed.cline import Cline
 from pier.agents.installed.codex import Codex
 from pier.agents.installed.cursor_cli import CursorCli
 from pier.agents.installed.gemini_cli import GeminiCli
@@ -22,6 +23,7 @@ class AgentFactory:
         OracleAgent,
         AntigravitySDK,
         ClaudeCode,
+        Cline,
         Codex,
         CursorCli,
         GeminiCli,
