@@ -512,6 +512,9 @@ class TaskConfig(BaseModel):
         Before this resolution existed, pier silently IGNORED network_mode and
         fell back to allow_internet's default of True.
         """
+        # Import after model definitions to avoid the resolver's config import cycle.
+        from pier.models.task.verifier_mode import resolve_effective_verifier_env_config
+
         task_mode = self.environment.network_mode
 
         agent_mode = self.agent.network_mode or task_mode
@@ -519,19 +522,19 @@ class TaskConfig(BaseModel):
             self.environment.network_mode = agent_mode
             self.environment.allow_internet = agent_mode == NetworkMode.PUBLIC
 
-        def _resolve_verifier(verifier: VerifierConfig) -> None:
+        def _resolve_verifier(
+            verifier: VerifierConfig, separate_environment: EnvironmentConfig | None
+        ) -> None:
             mode = verifier.network_mode or task_mode
             if mode is None:
                 return
             if (
                 verifier.environment is None
                 and verifier.network_mode is not None
-                and verifier.environment_mode == VerifierEnvironmentMode.SEPARATE
+                and separate_environment is not None
             ):
-                # An explicit [verifier] override with environment_mode =
-                # 'separate' but no spelled-out [verifier.environment] would be
-                # lost when the runtime materializes the fresh copy — do it now.
-                verifier.environment = self.environment.model_copy(deep=True)
+                # Preserve inherited verifier settings without changing other steps.
+                verifier.environment = separate_environment.model_copy(deep=True)
             if verifier.environment is not None:
                 verifier.environment.network_mode = mode
                 verifier.environment.allow_internet = mode == NetworkMode.PUBLIC
@@ -549,9 +552,13 @@ class TaskConfig(BaseModel):
                     "to give the verifier its own network policy."
                 )
 
-        _resolve_verifier(self.verifier)
+        _resolve_verifier(
+            self.verifier, resolve_effective_verifier_env_config(self, None)
+        )
         for step in self.steps or []:
-            _resolve_verifier(step.verifier)
+            _resolve_verifier(
+                step.verifier, resolve_effective_verifier_env_config(self, step)
+            )
         return self
 
     @classmethod
