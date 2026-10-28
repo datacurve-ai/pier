@@ -127,10 +127,8 @@ def _uncached_input(n_input: int | None, n_cache: int | None) -> int | None:
     ``AgentContext.n_input_tokens`` is documented to include cached tokens,
     so the "uncached" portion the viewer surfaces is total minus cached.
     """
-    if n_input is None:
+    if n_input is None or n_cache is None:
         return None
-    if n_cache is None:
-        return n_input
     return max(0, n_input - n_cache)
 
 
@@ -148,8 +146,8 @@ def _extract_reasoning_effort(result: TrialResult) -> str | None:
 
     Effort is not a first-class field; it lives inside the agent's free-form
     ``kwargs``, with agent/provider-specific shapes:
-      - top-level ``reasoning_effort`` (claude-code, codex, gemini-cli, mini-swe
-        on Gemini)
+      - top-level ``reasoning_effort`` (antigravity-sdk, claude-code, codex,
+        gemini-cli, mini-swe on Gemini)
       - ``model_kwargs.output_config.effort`` (mini-swe on Anthropic)
       - ``model_kwargs.reasoning.effort`` (mini-swe on OpenAI)
       - ``model_kwargs.thinkingConfig.thinkingLevel`` (mini-swe on Vertex Gemini)
@@ -2713,7 +2711,9 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
                 ),
                 avg_cost_usd=average("total_cost_usd", "cost_usd_count", stats),
                 total_cost_usd=(
-                    stats["total_cost_usd"] if stats["cost_usd_count"] > 0 else None
+                    stats["total_cost_usd"]
+                    if stats["cost_usd_count"] == stats["n_trials"]
+                    else None
                 ),
                 avg_peak_context_tokens=average(
                     "total_peak_context_tokens", "peak_context_tokens_count", stats

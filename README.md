@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -55,6 +55,8 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 ```
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
+
+For environments without mounted logs, Pier attempts to copy `/logs/verifier/` into the trial's `verifier/` directory even when verification fails or times out. A failed copy is logged without replacing the original execution error.
 
 ## Agent runtime configuration
 
@@ -104,6 +106,22 @@ A few things we've learned plumbing this through Respan and OpenRouter:
     GOOGLE_GEMINI_BASE_URL: https://endpoint.respan.ai/api/google/vertexai/
 ```
 
+**Antigravity SDK** runs Google's Python SDK with its platform-specific local
+harness in an isolated Python 3.12 environment with hash-verified, fully locked
+dependencies. It supports Pier skills, stdio and streamable-HTTP MCP servers,
+and live ATIF checkpoints. `reasoning_effort` accepts `minimal`, `low`, `medium`,
+or `high`; `None` uses `medium`. SSE MCP servers are not supported by
+google-antigravity 0.1.9.
+
+```yaml
+- name: antigravity-sdk
+  model_name: google/gemini-3.6-flash
+  env:
+    GEMINI_API_KEY: ${GEMINI_API_KEY}
+  kwargs:
+    reasoning_effort: high
+```
+
 **Cursor CLI** uses the installed `cursor-agent` binary, so it fits the same
 inside-the-sandbox path as Claude Code, Codex, Gemini CLI, and OpenCode. Use
 `cursor/composer-2.5` for Composer 2.5 trial metadata and pass `CURSOR_API_KEY`
@@ -119,6 +137,10 @@ through your env file.
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
 
 **mini-swe-agent** picks a native adapter from the model-name prefix: `openai/...` → `litellm_response` (OpenAI Responses end-to-end), `openrouter/...` → `openrouter` (BYOK costs from `cost_details.upstream_inference_cost`), everything else → LiteLLM auto.
+
+ATIF conversion retains responses rejected by the agent's format validation as agent steps, with their raw content, reasoning, usage, and validation feedback. These responses remain counted once in the token totals.
+
+`mini-swe-agent` token counts and costs preserve missing values as `null` and recorded zeros as `0`. Per-field totals require usage from every agent turn, trial context, and completed trial. A reported run cost can supply the total when per-turn costs are missing. Retrying a trial updates usage completeness along with its contribution. The viewer leaves uncached input unknown when cache usage is missing, and averages still use the trials that reported each metric.
 
 For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Gemini API default high/dynamic thinking level, but it does not request readable thought summaries. Set `kwargs.reasoning_effort: high` explicitly when you want LiteLLM to send `includeThoughts` and preserve returned summaries as reasoning content.
 

@@ -1,9 +1,9 @@
 from collections import defaultdict
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from pier.models.trial.result import TrialResult
 
@@ -39,6 +39,10 @@ class JobStats(BaseModel):
     n_cache_tokens: int | None = None
     n_output_tokens: int | None = None
     cost_usd: float | None = None
+    # Retain observed sums and counts for retries. Resume rebuilds these from trials.
+    _usage_totals: dict[str, tuple[int | float, int]] = PrivateAttr(
+        default_factory=dict
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -158,15 +162,7 @@ class JobStats(BaseModel):
             if trial_result.exception_info.exception_type == "CancelledError":
                 self.n_cancelled_trials += 1
 
-        n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
-        if n_input is not None:
-            self.n_input_tokens = (self.n_input_tokens or 0) + n_input
-        if n_cache is not None:
-            self.n_cache_tokens = (self.n_cache_tokens or 0) + n_cache
-        if n_output is not None:
-            self.n_output_tokens = (self.n_output_tokens or 0) + n_output
-        if cost is not None:
-            self.cost_usd = (self.cost_usd or 0.0) + cost
+        self._update_usage_totals(trial_result, 1)
 
     def remove_trial(self, trial_result: TrialResult) -> None:
         """Remove a trial's contributions from stats."""
@@ -202,15 +198,27 @@ class JobStats(BaseModel):
             if exception_type == "CancelledError":
                 self.n_cancelled_trials -= 1
 
-        n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
-        if n_input is not None and self.n_input_tokens is not None:
-            self.n_input_tokens = max(0, self.n_input_tokens - n_input)
-        if n_cache is not None and self.n_cache_tokens is not None:
-            self.n_cache_tokens = max(0, self.n_cache_tokens - n_cache)
-        if n_output is not None and self.n_output_tokens is not None:
-            self.n_output_tokens = max(0, self.n_output_tokens - n_output)
-        if cost is not None and self.cost_usd is not None:
-            self.cost_usd = max(0.0, self.cost_usd - cost)
+        self._update_usage_totals(trial_result, -1)
+
+    def _update_usage_totals(
+        self, trial_result: TrialResult, change: Literal[-1, 1]
+    ) -> None:
+        previous_count = self.n_completed_trials - change
+        fields = ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+        for field, value in zip(fields, trial_result.compute_token_cost_totals()):
+            current = getattr(self, field)
+            total, count = self._usage_totals.get(
+                field, (current or 0, previous_count if current is not None else 0)
+            )
+            if value is not None:
+                total = max(0, total + change * value)
+                count += change
+            if self.n_completed_trials == 0:
+                total, count = 0, 0
+            self._usage_totals[field] = total, count
+            setattr(
+                self, field, total if count == self.n_completed_trials > 0 else None
+            )
 
     def update_trial(
         self,
@@ -264,7 +272,8 @@ class JobResult(BaseModel):
 
         stats = data.get("stats", {}) or {}
         if isinstance(stats, JobStats):
-            stats = stats.model_dump()
+            data["stats"] = stats
+            return data
         elif isinstance(stats, dict):
             stats = stats.copy()
         else:

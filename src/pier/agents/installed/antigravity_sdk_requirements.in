@@ -1,0 +1,7 @@
+# Direct dependencies for the isolated Antigravity SDK runner.
+# Regenerate antigravity_sdk_requirements.lock with the command in its header.
+cryptography==46.0.7
+fastapi==0.141.1
+google-antigravity==0.1.9
+mcp==1.27.2
+protobuf==7.35.1

@@ -1,6 +1,6 @@
 [project]
 name = "datacurve-pier"
-version = "0.3.0"
+version = "0.3.1"
 description = "A framework for running coding agents in sandboxed environments and keeping full trajectories for analysis."
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,7 +29,7 @@ dependencies = [
     "litellm>=1.83.0",
     "loguru>=0.7.3",
     "mcp>=1.27.0",
-    "modal>=1.4.2",
+    "modal>=1.5.3",
     "pydantic>=2.13.3",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",

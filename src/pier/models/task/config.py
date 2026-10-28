@@ -27,6 +27,53 @@ class VerifierEnvironmentMode(str, Enum):
     SEPARATE = "separate"
 
 
+class NetworkMode(str, Enum):
+    """Network access policy for agent and verifier execution.
+
+    Mirrors Harbor's ``NetworkMode`` (harbor.models.task.config): tasks authored
+    against Harbor >= 0.18 declare network policy via ``network_mode`` (at
+    [environment] scope, with optional [agent]/[verifier] phase overrides)
+    instead of the legacy ``allow_internet`` boolean. Values must stay in sync
+    with Harbor so the same task.toml parses identically in both harnesses.
+    """
+
+    NO_NETWORK = "no-network"
+    PUBLIC = "public"
+    ALLOWLIST = "allowlist"
+
+
+class NetworkPolicyFieldsMixin(BaseModel):
+    """``network_mode`` field shared by the [environment] scope and the
+    [agent]/[verifier] phase overrides (Harbor's PhaseNetworkPolicyConfig
+    equivalent). Pier currently enforces 'no-network' and 'public' only;
+    'allowlist' (and its 'allowed_hosts' companion) is rejected at parse time
+    rather than silently mis-enforced."""
+
+    network_mode: NetworkMode | None = Field(
+        default=None,
+        description="Network access policy ('no-network' or 'public'). On "
+        "[agent]/[verifier] this is an explicit phase override; on "
+        "[environment] it applies to both phases. When unset everywhere, the "
+        "legacy 'allow_internet' boolean applies.",
+    )
+    allowed_hosts: list[str] | None = Field(
+        default=None,
+        description="Unsupported (Harbor allowlist-mode companion field); "
+        "declared only so its presence fails loudly instead of being ignored.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_network_policy(self) -> "NetworkPolicyFieldsMixin":
+        if self.network_mode == NetworkMode.ALLOWLIST:
+            raise ValueError(
+                "network_mode='allowlist' is not supported by pier yet; "
+                "use 'no-network' or 'public'."
+            )
+        if self.allowed_hosts is not None:
+            raise ValueError("allowed_hosts is not supported by pier yet.")
+        return self
+
+
 class Author(BaseModel):
     """Author information for a package or dataset."""
 
@@ -79,7 +126,61 @@ class PackageInfo(BaseModel):
         return self.name.split("/")[1]
 
 
-class VerifierConfig(BaseModel):
+MAIN_SERVICE_NAME = "main"
+
+_COMPOSE_SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def _validate_compose_service_name(value: str | None) -> str | None:
+    if value is None:
+        return value
+    value = value.strip()
+    if not _COMPOSE_SERVICE_NAME_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid Docker Compose service name: {value!r}. Service names "
+            "must start with an alphanumeric character and contain only "
+            "alphanumeric characters, hyphens, underscores, and dots."
+        )
+    return value
+
+
+class VerifierCollectConfig(BaseModel):
+    """A command run inside a compose service after the agent phase ends.
+
+    Collect hooks let tasks snapshot runtime state into files before the
+    environment is torn down, so the files can be declared as artifacts and
+    read by a separate verifier (e.g. capture the agent's change set as
+    ``/logs/artifacts/model.patch``). Mirrors Harbor's ``[[verifier.collect]]``
+    blocks. Pier only runs hooks targeting the main service; hooks targeting
+    compose sidecar services are skipped with a warning.
+    """
+
+    command: str = Field(..., description="Shell command to run in the service.")
+    service: str = Field(
+        default=MAIN_SERVICE_NAME,
+        description="Compose service to run the command in. Defaults to main. "
+        "Pier only runs hooks targeting main (the agent's container).",
+    )
+    timeout_sec: float = Field(
+        default=60.0,
+        description="Timeout in seconds for the collect command.",
+    )
+    user: str | int | None = Field(
+        default=None,
+        description="Username or UID to run the command as. None uses the "
+        "service container's default user.",
+    )
+
+    @field_validator("service")
+    @classmethod
+    def _validate_service(cls, value: str) -> str:
+        validated = _validate_compose_service_name(value)
+        if validated is None:
+            raise ValueError("Collect hook service must not be empty.")
+        return validated
+
+
+class VerifierConfig(NetworkPolicyFieldsMixin):
     timeout_sec: float = 600.0
     env: dict[str, str] = Field(default_factory=dict)
     user: str | int | None = Field(
@@ -106,6 +207,15 @@ class VerifierConfig(BaseModel):
             "[environment] is used. Conflicts with environment_mode='shared'."
         ),
     )
+    collect: list[VerifierCollectConfig] = Field(
+        default_factory=list,
+        description=(
+            "Commands run in the agent environment after the agent phase ends "
+            "and before artifact collection ([[verifier.collect]] blocks in "
+            "task.toml). Use these to snapshot runtime state into files that "
+            "artifact entries can then collect."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_mode_env_consistency(self) -> "VerifierConfig":
@@ -125,7 +235,7 @@ class SolutionConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
-class AgentConfig(BaseModel):
+class AgentConfig(NetworkPolicyFieldsMixin):
     timeout_sec: float | None = None
     user: str | int | None = Field(
         default=None,
@@ -164,7 +274,7 @@ class HealthcheckConfig(BaseModel):
     )
 
 
-class EnvironmentConfig(BaseModel):
+class EnvironmentConfig(NetworkPolicyFieldsMixin):
     build_timeout_sec: float = 600.0  # 10 minutes default
     docker_image: str | None = None
     os: TaskOS = Field(
@@ -185,7 +295,10 @@ class EnvironmentConfig(BaseModel):
     )
     allow_internet: bool = Field(
         default=True,
-        description="Whether to allow internet access in the environment.",
+        description="Whether to allow internet access in the environment. "
+        "Legacy boolean: when 'network_mode' is set (here or as an "
+        "[agent]/[verifier] phase override), the resolved mode wins and this "
+        "field is overwritten at TaskConfig validation time.",
     )
     mcp_servers: list["MCPServerConfig"] = Field(default_factory=list)
     env: dict[str, str] = Field(
@@ -386,6 +499,60 @@ class TaskConfig(BaseModel):
         if isinstance(data, dict) and "version" in data:
             data.setdefault("schema_version", data.pop("version"))
         return data
+
+    @model_validator(mode="after")
+    def resolve_network_modes(self) -> "TaskConfig":
+        """Resolve Harbor-style ``network_mode`` declarations onto the legacy
+        ``allow_internet`` booleans that pier's environments enforce.
+
+        Precedence per phase (mirrors Harbor): explicit [agent]/[verifier]
+        override > [environment] scope > legacy ``allow_internet``. 'public'
+        maps to allow_internet=True; 'no-network' to allow_internet=False.
+
+        Before this resolution existed, pier silently IGNORED network_mode and
+        fell back to allow_internet's default of True.
+        """
+        task_mode = self.environment.network_mode
+
+        agent_mode = self.agent.network_mode or task_mode
+        if agent_mode is not None:
+            self.environment.network_mode = agent_mode
+            self.environment.allow_internet = agent_mode == NetworkMode.PUBLIC
+
+        def _resolve_verifier(verifier: VerifierConfig) -> None:
+            mode = verifier.network_mode or task_mode
+            if mode is None:
+                return
+            if (
+                verifier.environment is None
+                and verifier.network_mode is not None
+                and verifier.environment_mode == VerifierEnvironmentMode.SEPARATE
+            ):
+                # An explicit [verifier] override with environment_mode =
+                # 'separate' but no spelled-out [verifier.environment] would be
+                # lost when the runtime materializes the fresh copy — do it now.
+                verifier.environment = self.environment.model_copy(deep=True)
+            if verifier.environment is not None:
+                verifier.environment.network_mode = mode
+                verifier.environment.allow_internet = mode == NetworkMode.PUBLIC
+            elif (
+                verifier.network_mode is not None
+                and agent_mode is not None
+                and verifier.network_mode != agent_mode
+            ):
+                # Shared-environment verifier: it runs in the agent's container,
+                # so a conflicting explicit override cannot be enforced.
+                raise ValueError(
+                    "[verifier].network_mode conflicts with the agent "
+                    "environment's resolved network policy but the verifier "
+                    "shares that environment; use environment_mode='separate' "
+                    "to give the verifier its own network policy."
+                )
+
+        _resolve_verifier(self.verifier)
+        for step in self.steps or []:
+            _resolve_verifier(step.verifier)
+        return self
 
     @classmethod
     def model_validate_toml(cls, toml_data: str) -> "TaskConfig":
