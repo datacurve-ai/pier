@@ -276,9 +276,9 @@ class EnvironmentFactory:
             **config.kwargs,
             **kwargs,
         }
-        if config.cpu_enforcement_policy == ResourceMode.AUTO:
+        if env_constructor_kwargs["cpu_enforcement_policy"] == ResourceMode.AUTO:
             env_constructor_kwargs.pop("cpu_enforcement_policy")
-        if config.memory_enforcement_policy == ResourceMode.AUTO:
+        if env_constructor_kwargs["memory_enforcement_policy"] == ResourceMode.AUTO:
             env_constructor_kwargs.pop("memory_enforcement_policy")
 
         if config.import_path is not None:
