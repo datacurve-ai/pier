@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `gptme`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -150,4 +150,14 @@ For Gemini 3 via mini-swe-agent/LiteLLM, omitting `reasoning_effort` uses the Ge
   env: { OPENROUTER_API_KEY: ${OPENROUTER_API_KEY} }
   kwargs:
     set_cache_control: default_end
+```
+
+**gptme** runs the gptme CLI in non-interactive JSON mode and converts its
+conversation log to ATIF. It uses the native `@tool(call_id): {json}` format so
+tool calls and results link by call ID.
+
+```yaml
+- name: gptme
+  model_name: openrouter/deepseek/deepseek-v4.1-flash
+  env: { OPENROUTER_API_KEY: ${OPENROUTER_API_KEY} }
 ```

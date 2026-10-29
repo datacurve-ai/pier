@@ -9,6 +9,7 @@ class AgentName(str, Enum):
     CODEX = "codex"
     CURSOR_CLI = "cursor-cli"
     GEMINI_CLI = "gemini-cli"
+    GPTME = "gptme"
     MINI_SWE_AGENT = "mini-swe-agent"
     SWE_AGENT = "swe-agent"
     OPENCODE = "opencode"
