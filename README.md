@@ -25,6 +25,15 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 Pier does not currently resolve or download Harbor registry datasets directly.
 
+## Task network configuration
+
+`network_mode = "public"` allows internet access, and `"no-network"` disables it.
+Step verifiers inherit the task's verifier environment mode and environment settings.
+A step can override the network policy of an inherited separate verifier without
+repeating `environment_mode = "separate"`. The override applies only to that step.
+Shared verifiers run in the agent's environment, so conflicting network overrides
+are rejected.
+
 ## Install
 
 ```bash
