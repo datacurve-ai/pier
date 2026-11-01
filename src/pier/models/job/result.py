@@ -32,6 +32,7 @@ class JobStats(BaseModel):
     n_pending_trials: int = 0
     n_cancelled_trials: int = 0
     n_retries: int = 0
+    n_agent_steps: int | None = None
     evals: dict[str, AgentDatasetStats] = Field(
         default_factory=lambda: defaultdict(AgentDatasetStats)
     )
@@ -164,6 +165,10 @@ class JobStats(BaseModel):
 
         self._update_usage_totals(trial_result, 1)
 
+        steps = trial_result.agent_step_count()
+        if steps is not None:
+            self.n_agent_steps = (self.n_agent_steps or 0) + steps
+
     def remove_trial(self, trial_result: TrialResult) -> None:
         """Remove a trial's contributions from stats."""
         self.n_completed_trials -= 1
@@ -219,6 +224,10 @@ class JobStats(BaseModel):
             setattr(
                 self, field, total if count == self.n_completed_trials > 0 else None
             )
+
+        steps = trial_result.agent_step_count()
+        if steps is not None and self.n_agent_steps is not None:
+            self.n_agent_steps = max(0, self.n_agent_steps - steps)
 
     def update_trial(
         self,
