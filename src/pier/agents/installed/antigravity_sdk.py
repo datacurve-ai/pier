@@ -285,4 +285,5 @@ chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/b
                 f"/logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,
+            telemetry=True,
         )

@@ -20,7 +20,12 @@ from pier.environments.agent_setup import (
     proxy_policy_env,
     squid_bootstrap_command,
 )
-from pier.environments.base import BaseEnvironment, ExecResult
+from pier.environments.base import (
+    BaseEnvironment,
+    ExecInputQueue,
+    ExecOutputCallback,
+    ExecResult,
+)
 from pier.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -87,6 +92,26 @@ class _ModalStrategy:
         timeout_sec: int | None = None,
     ) -> ExecResult:
         """Execute a command in the environment's main container."""
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        if input_queue is not None:
+            raise NotImplementedError(
+                "This Modal strategy does not support streamed stdin"
+            )
+        result = await self.exec(command, cwd=cwd, env=env, timeout_sec=timeout_sec)
+        if result.stdout:
+            await on_output("stdout", result.stdout)
+        if result.stderr:
+            await on_output("stderr", result.stderr)
+        return result
 
     @abstractmethod
     async def attach(self) -> None:
@@ -224,6 +249,24 @@ class _ModalDirect(_ModalStrategy):
     ) -> ExecResult:
         return await self._env._sdk_exec(
             command, cwd=cwd, env=env, timeout_sec=timeout_sec
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        return await self._env._sdk_exec_stream(
+            command,
+            on_output=on_output,
+            input_queue=input_queue,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
         )
 
     async def attach(self) -> None:
@@ -613,6 +656,31 @@ class _ModalDinD(_ModalStrategy):
 
         return await self._compose_exec(parts, timeout_sec=timeout_sec)
 
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        parts: list[str] = ["exec", "-T"]
+        if cwd:
+            parts.extend(["-w", cwd])
+        if env:
+            for key, value in env.items():
+                parts.extend(["-e", f"{key}={value}"])
+        parts.extend(["main", "bash", "-c", command])
+        return await self._env._sdk_exec_stream(
+            self._compose_cmd(parts),
+            on_output=on_output,
+            input_queue=input_queue,
+            env=self._compose_env_vars(),
+            timeout_sec=timeout_sec,
+            shell="sh",
+        )
+
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         """Two-hop upload: SDK → sandbox temp, docker compose cp → main."""
         temp = f"/tmp/pier_{uuid4().hex}"
@@ -779,6 +847,10 @@ class ModalEnvironment(BaseEnvironment):
             memory_request=True,
         )
 
+    @classmethod
+    def supports_exec_stdin(cls) -> bool:
+        return True
+
     @property
     def capabilities(self) -> EnvironmentCapabilities:
         return self._capabilities
@@ -863,6 +935,7 @@ class ModalEnvironment(BaseEnvironment):
             filtered_egress=not self._compose_mode,
             preinstall_agents=not self._compose_mode,
             docker_compose=True,
+            exec_stdin=True,
         )
         self._kwargs = kwargs
         if not _HAS_MODAL:
@@ -1173,6 +1246,94 @@ class ModalEnvironment(BaseEnvironment):
             return_code=return_code,
         )
 
+    async def _sdk_exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        shell: str = "bash",
+        login: bool = False,
+    ) -> ExecResult:
+        env = self._merge_env(env)
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        process = await self._sandbox.exec.aio(
+            shell,
+            "-lc" if login else "-c",
+            command,
+            workdir=cwd,
+            secrets=[Secret.from_dict(env)] if env else [],  # type: ignore
+            timeout=timeout_sec,
+        )
+        # Stream callbacks consume telemetry immediately. Retain only a bounded
+        # diagnostic tail so long-running agents cannot grow coordinator memory
+        # in proportion to the number of telemetry records they emit.
+        capture_limit = 131_072
+        stdout_tail = [""]
+        stderr_tail = [""]
+
+        async def drain(stream, name: str, tail: list[str]) -> None:
+            async for chunk in stream:
+                tail[0] = (tail[0] + chunk)[-capture_limit:]
+                await on_output(name, chunk)
+
+        async def forward_input() -> None:
+            assert input_queue is not None
+            try:
+                while True:
+                    chunk = await input_queue.get()
+                    if chunk is None:
+                        process.stdin.write_eof()
+                        await process.stdin.drain.aio()
+                        return
+                    process.stdin.write(chunk.encode())
+                    await process.stdin.drain.aio()
+            except (BrokenPipeError, ConnectionError):
+                # The agent can exit between the queue read and the remote write.
+                return
+
+        input_task = (
+            asyncio.create_task(forward_input(), name="pier-modal-exec-stdin")
+            if input_queue is not None
+            else None
+        )
+        output_task = asyncio.gather(
+            drain(process.stdout, "stdout", stdout_tail),
+            drain(process.stderr, "stderr", stderr_tail),
+        )
+        wait_task = asyncio.create_task(process.wait.aio(), name="pier-modal-exec-wait")
+
+        try:
+            if input_task is not None:
+                done, _pending = await asyncio.wait(
+                    (wait_task, input_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if input_task in done:
+                    # Propagate control-channel failures instead of leaving a
+                    # fail-closed agent blocked until its outer timeout.
+                    input_task.result()
+            return_code = await wait_task
+            await output_task
+        finally:
+            if input_task is not None:
+                input_task.cancel()
+            wait_task.cancel()
+            output_task.cancel()
+            await asyncio.gather(
+                *(task for task in (input_task, wait_task, output_task) if task),
+                return_exceptions=True,
+            )
+        return ExecResult(
+            stdout=stdout_tail[0] or None,
+            stderr=stderr_tail[0] or None,
+            return_code=return_code,
+        )
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -1313,6 +1474,34 @@ class ModalEnvironment(BaseEnvironment):
         effective_cwd = cwd or self.task_env_config.workdir
         return await self._strategy.exec(
             command, cwd=effective_cwd, env=env, timeout_sec=timeout_sec
+        )
+
+    async def exec_stream(
+        self,
+        command: str,
+        on_output: ExecOutputCallback,
+        input_queue: ExecInputQueue | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        user = self._resolve_user(user)
+        env = self._merge_env(env)
+        if user is not None:
+            if isinstance(user, int):
+                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+            else:
+                user_arg = shlex.quote(str(user))
+            command = f"su -m {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+        effective_cwd = cwd or self.task_env_config.workdir
+        return await self._strategy.exec_stream(
+            command,
+            on_output=on_output,
+            input_queue=input_queue,
+            cwd=effective_cwd,
+            env=env,
+            timeout_sec=timeout_sec,
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str):

@@ -26,6 +26,9 @@ class BaseAgent(ABC):
     # calling setup() and fails fast with a clear error on mismatch.
     SUPPORTS_WINDOWS: bool = False
 
+    # Whether the agent allows immediate throttling of requests when concurrency is reduced
+    SUPPORTS_REQUEST_THROTTLING: bool = False
+
     def __init__(
         self,
         logs_dir: Path,
