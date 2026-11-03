@@ -17,14 +17,16 @@ class UnixOps:
         self._env = env
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await self._env._run_docker_compose_command(
-            ["cp", str(source_path), f"main:{target_path}"],
+        await self._env._cp(
+            str(source_path),
+            f"main:{target_path}",
             check=True,
         )
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await self._env._run_docker_compose_command(
-            ["cp", f"{source_dir}/.", f"main:{target_dir}"],
+        await self._env._cp(
+            f"{source_dir}/.",
+            f"main:{target_dir}",
             check=True,
         )
         # Fix CRLF line endings when the host is Windows: shell scripts with
@@ -45,15 +47,17 @@ class UnixOps:
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         await self._env._chown_to_host_user(source_path)
-        await self._env._run_docker_compose_command(
-            ["cp", f"main:{source_path}", str(target_path)],
+        await self._env._cp(
+            f"main:{source_path}",
+            str(target_path),
             check=True,
         )
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         await self._env._chown_to_host_user(source_dir, recursive=True)
-        await self._env._run_docker_compose_command(
-            ["cp", f"main:{source_dir}/.", str(target_dir)],
+        await self._env._cp(
+            f"main:{source_dir}/.",
+            str(target_dir),
             check=True,
         )
 

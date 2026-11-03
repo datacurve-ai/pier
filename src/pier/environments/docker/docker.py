@@ -38,6 +38,36 @@ from pier.models.trial.paths import EnvironmentPaths, TrialPaths
 from pier.utils.env import resolve_env_vars
 
 
+def _docker_cmd() -> str:
+    """Return the raw ``PIER_DOCKER_CMD`` value (default ``docker``).
+
+    ``PIER_DOCKER_CMD`` names the container *engine*: ``docker`` (default) or
+    ``podman``. Compose is always invoked as ``<engine> compose ...`` — mirroring
+    how the default ``docker`` already uses ``docker compose``. A trailing
+    ``-compose`` is tolerated (``podman-compose`` normalizes to ``podman`` via
+    :func:`_docker_engine`), so both ``podman`` and ``podman-compose`` work.
+    """
+    return os.environ.get("PIER_DOCKER_CMD", "docker")
+
+
+def _docker_engine() -> str:
+    """Return the container-engine binary (``docker`` or ``podman``).
+
+    Used both for native subcommands (``info``/``inspect``/``cp``/``ps``) and as
+    the prefix for ``<engine> compose ...``. A trailing ``-compose`` is stripped
+    so ``podman-compose`` -> ``podman`` and the default ``docker`` -> ``docker``.
+    """
+    base = os.path.basename(_docker_cmd())
+    if base.endswith("-compose"):
+        return base[: -len("-compose")]
+    return base
+
+
+def _is_podman() -> bool:
+    """True iff the configured engine is podman."""
+    return _docker_engine().startswith("podman")
+
+
 def _sanitize_docker_image_name(name: str) -> str:
     """
     Sanitize a name to be a valid Docker image name.
@@ -108,9 +138,11 @@ class DockerEnvironment(BaseEnvironment):
     @staticmethod
     def _detect_daemon_os() -> str | None:
         """Return the Docker daemon's OSType (e.g. 'linux' or 'windows'), or None on error."""
+        engine = _docker_engine()
+        fmt = "{{.Host.OS}}" if _is_podman() else "{{.OSType}}"
         try:
             result = subprocess.run(
-                ["docker", "info", "--format", "{{.OSType}}"],
+                [engine, "info", "--format", fmt],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -134,21 +166,23 @@ class DockerEnvironment(BaseEnvironment):
 
     @classmethod
     def preflight(cls) -> None:
-        if not shutil.which("docker"):
+        engine = _docker_engine()
+        label = "Podman" if _is_podman() else "Docker"
+        if not shutil.which(engine):
             raise SystemExit(
-                "Docker is not installed or not on PATH. "
-                "Please install Docker and try again."
+                f"{label} is not installed or not on PATH. "
+                f"Please install {label} and try again."
             )
         try:
             subprocess.run(
-                ["docker", "info"],
+                [engine, "info"],
                 capture_output=True,
                 timeout=10,
                 check=True,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise SystemExit(
-                "Docker daemon is not running. Please start Docker and try again."
+                f"{label} daemon is not running. Please start {label} and try again."
             )
 
     def __init__(
@@ -252,7 +286,7 @@ class DockerEnvironment(BaseEnvironment):
         return self._env_paths
 
     def _default_log_mounts(self) -> list[ServiceVolumeConfig]:
-        return [
+        mounts: list[ServiceVolumeConfig] = [
             {
                 "type": "bind",
                 "source": self.trial_paths.verifier_dir.resolve().as_posix(),
@@ -269,6 +303,13 @@ class DockerEnvironment(BaseEnvironment):
                 "target": str(self._env_paths.artifacts_dir),
             },
         ]
+        # podman + SELinux: relabel these Pier-managed bind mounts (:Z = private)
+        # so the container can write to them. User-supplied mounts are never
+        # auto-relabeled.
+        if _is_podman():
+            for mount in mounts:
+                mount["bind"] = {"selinux": "Z"}
+        return mounts
 
     @property
     def _uses_compose(self) -> bool:
@@ -473,14 +514,21 @@ class DockerEnvironment(BaseEnvironment):
         self, command: list[str], check: bool = True, timeout_sec: int | None = None
     ) -> ExecResult:
         """Run a docker compose command and return the result."""
+        project_name = _sanitize_docker_compose_project_name(self.session_id)
         full_command = [
-            "docker",
+            _docker_engine(),
             "compose",
             "--project-name",
-            _sanitize_docker_compose_project_name(self.session_id),
-            "--project-directory",
-            str(self.environment_dir.resolve().absolute()),
+            project_name,
         ]
+        if not _is_podman():
+            # podman's compose provider (podman-compose) rejects
+            # --project-directory; podman instead gets COMPOSE_PROJECT_DIR
+            # (honored by both providers) via the env dict injected below.
+            full_command += [
+                "--project-directory",
+                str(self.environment_dir.resolve().absolute()),
+            ]
         for path in self._docker_compose_paths:
             full_command.extend(["-f", str(path.resolve().absolute())])
         full_command.extend(command)
@@ -493,6 +541,17 @@ class DockerEnvironment(BaseEnvironment):
         # Inject after user env so it cannot be accidentally overridden.
         if self._windows_container_name:
             env["PIER_CONTAINER_NAME"] = self._windows_container_name
+        # podman's compose provider has no --project-directory flag;
+        # COMPOSE_PROJECT_DIR makes relative compose paths resolve from the
+        # environment dir.
+        if _is_podman():
+            env["COMPOSE_PROJECT_DIR"] = str(
+                self.environment_dir.resolve().absolute()
+            )
+            # `podman compose` prints an "Executing external compose provider"
+            # banner to stderr on every call; we merge stderr into stdout, so
+            # silence it to keep captured exec/cp output clean.
+            env["PODMAN_COMPOSE_WARNING_LOGS"] = "false"
 
         process = await asyncio.create_subprocess_exec(
             *full_command,
@@ -548,6 +607,13 @@ class DockerEnvironment(BaseEnvironment):
         vice versa), or when a Windows task is launched on a non-Windows
         host.
         """
+        if self._is_windows_container and _is_podman():
+            raise RuntimeError(
+                "Windows containers are not supported under podman "
+                "(PIER_DOCKER_CMD selects podman). "
+                "Use Docker for [environment].os = 'windows' tasks."
+            )
+
         if self._is_windows_container and sys.platform != "win32":
             raise RuntimeError(
                 "Task declares [environment].os = 'windows' but the host is "
@@ -580,7 +646,7 @@ class DockerEnvironment(BaseEnvironment):
         """
         try:
             result = await asyncio.create_subprocess_exec(
-                "docker",
+                _docker_engine(),
                 "inspect",
                 "--format",
                 "{{.Os}}",
@@ -653,7 +719,11 @@ class DockerEnvironment(BaseEnvironment):
         except RuntimeError:
             pass
 
-        await self._run_docker_compose_command(["up", "--detach", "--wait"])
+        up_command = ["up", "--detach", "--wait"]
+        if _is_podman():
+            # podman-compose's --wait can hang indefinitely; bound it.
+            up_command.append("--wait-timeout=300")
+        await self._run_docker_compose_command(up_command)
 
         # Make log directories world-writable so non-root agent/verifier
         # users can write to them.  (No-op for Windows containers which do
@@ -713,12 +783,101 @@ class DockerEnvironment(BaseEnvironment):
     async def upload_dir(self, source_dir: Path | str, target_dir: str):
         await self._platform.upload_dir(source_dir, target_dir)
 
+    async def _resolve_main_container_id(self) -> str:
+        """Return the single container id for the compose `main` service (podman).
+
+        Resolves by the docker-compatible compose labels (set by both the
+        podman-compose and docker-compose providers, so it is provider- and
+        container-name-separator-independent). Asserts exactly one match.
+        """
+        project_name = _sanitize_docker_compose_project_name(self.session_id)
+        proc = await asyncio.create_subprocess_exec(
+            _docker_engine(),
+            "ps",
+            "-q",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+            "--filter",
+            "label=com.docker.compose.service=main",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Failed to resolve 'main' container for project "
+                f"{project_name!r}: "
+                f"{(stderr_bytes or b'').decode(errors='replace')}"
+            )
+        ids = [
+            line.strip()
+            for line in (stdout_bytes or b"").decode(errors="replace").splitlines()
+            if line.strip()
+        ]
+        if len(ids) != 1:
+            raise RuntimeError(
+                f"Expected exactly one 'main' container for project "
+                f"{project_name!r}, found {len(ids)}: {ids}"
+            )
+        return ids[0]
+
+    async def _cp(self, source: str, dest: str, *, check: bool = True) -> ExecResult:
+        """Copy between host and container.
+
+        Docker defers to ``compose cp`` (service-addressed, e.g. ``main:/path``).
+        podman-compose has no usable ``cp``, so we resolve the ``main`` container
+        id by label and run native ``<engine> cp`` with that id substituted for
+        the ``main:`` service prefix.
+        """
+        if not _is_podman():
+            return await self._run_docker_compose_command(
+                ["cp", source, dest], check=check
+            )
+
+        container_id = await self._resolve_main_container_id()
+        native_source = (
+            f"{container_id}:{source[len('main:'):]}"
+            if source.startswith("main:")
+            else source
+        )
+        native_dest = (
+            f"{container_id}:{dest[len('main:'):]}"
+            if dest.startswith("main:")
+            else dest
+        )
+        proc = await asyncio.create_subprocess_exec(
+            _docker_engine(),
+            "cp",
+            native_source,
+            native_dest,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout_bytes, _ = await proc.communicate()
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
+        result = ExecResult(
+            stdout=stdout, stderr=None, return_code=proc.returncode or 0
+        )
+        if check and result.return_code != 0:
+            raise RuntimeError(
+                f"{_docker_engine()} cp failed "
+                f"({native_source} -> {native_dest}): "
+                f"return code {result.return_code}; {stdout}"
+            )
+        return result
+
     async def _chown_to_host_user(self, path: str, recursive: bool = False) -> None:
         """Best-effort chown of a container path to the host user's UID:GID.
 
         No-op on Windows (where os.getuid/os.getgid are unavailable).
         """
         if not hasattr(os, "getuid"):
+            return
+        if _is_podman():
+            # Rootless podman already maps the container's root user to the host
+            # user, so bind-mounted files are host-readable without chowning;
+            # chowning to the host uid here would instead map to an unreadable
+            # subuid. Skip under podman.
             return
         flag = "-R " if recursive else ""
         await self.exec(
@@ -743,6 +902,11 @@ class DockerEnvironment(BaseEnvironment):
         env = self._merge_env(env)
 
         exec_command = ["exec"]
+        if _is_podman():
+            # Captured exec: disable the pseudo-tty so output is plain and the
+            # call doesn't block on a TTY (docker's compose exec here is also
+            # non-interactive).
+            exec_command.append("-T")
 
         effective_cwd = cwd or self.task_env_config.workdir
         if effective_cwd:
@@ -768,10 +932,21 @@ class DockerEnvironment(BaseEnvironment):
                 "Interactive attach is not yet supported for Windows containers."
             )
 
-        variables = " ".join(
+        exports = [
             f"export {k}={shlex.quote(str(v))}"
             for k, v in self._env_vars.to_env_dict(include_os_env=False).items()
-        )
+        ]
+        if _is_podman():
+            # podman's compose provider has no --project-directory; pass the
+            # working dir via COMPOSE_PROJECT_DIR so the exec/down below resolve
+            # relative compose paths (mirrors _run_docker_compose_command).
+            # PODMAN_COMPOSE_WARNING_LOGS silences the provider banner.
+            exports.append(
+                "export COMPOSE_PROJECT_DIR="
+                + shlex.quote(str(self.environment_dir.resolve().absolute()))
+            )
+            exports.append("export PODMAN_COMPOSE_WARNING_LOGS=false")
+        variables = " ".join(exports)
 
         # Build the -f flags for docker compose
         compose_file_args = []
@@ -782,7 +957,7 @@ class DockerEnvironment(BaseEnvironment):
 
         project_name = _sanitize_docker_compose_project_name(self.session_id)
         compose_base = [
-            "docker",
+            _docker_engine(),
             "compose",
             "--project-name",
             project_name,
@@ -794,7 +969,14 @@ class DockerEnvironment(BaseEnvironment):
                 "bash",
                 "-c",
                 f"{variables}; "
-                + " ".join(compose_base + ["exec", "-it", "main", "bash"])
+                + " ".join(
+                    compose_base
+                    + (
+                        ["exec", "main", "bash"]
+                        if _is_podman()
+                        else ["exec", "-it", "main", "bash"]
+                    )
+                )
                 + "; "
                 + " ".join(compose_base + ["down"]),
             ],
