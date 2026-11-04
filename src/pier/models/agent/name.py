@@ -7,6 +7,7 @@ class AgentName(str, Enum):
     CLAUDE_CODE = "claude-code"
     ANTIGRAVITY_SDK = "antigravity-sdk"
     CODEX = "codex"
+    COPILOT_CLI = "copilot-cli"
     CURSOR_CLI = "cursor-cli"
     GEMINI_CLI = "gemini-cli"
     MINI_SWE_AGENT = "mini-swe-agent"

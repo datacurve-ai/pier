@@ -162,9 +162,15 @@ def write_docker_proxy_compose(
                 'CMD ["bash", "/usr/local/bin/start-squid.sh"]',
                 "",
             ]
-        )
+        ),
+        encoding="utf-8",
+        newline="\n",
     )
-    (proxy_dir / "start-squid.sh").write_text(squid_bootstrap_command())
+    (proxy_dir / "start-squid.sh").write_text(
+        squid_bootstrap_command(),
+        encoding="utf-8",
+        newline="\n",
+    )
     compose = {
         "services": {
             "main": {
@@ -194,7 +200,7 @@ def write_docker_proxy_compose(
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(compose, indent=2))
+    path.write_text(json.dumps(compose, indent=2), encoding="utf-8")
     return path
 
 
