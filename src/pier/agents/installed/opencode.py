@@ -70,6 +70,7 @@ class OpenCode(BaseInstalledAgent):
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],
         "mistral": ["api.mistral.ai"],
+        "minimax": ["api.minimax.io", "api.minimaxi.com"],
         "openai": ["api.openai.com"],
         "openrouter": ["openrouter.ai"],
         "xai": ["api.x.ai"],
@@ -427,10 +428,22 @@ class OpenCode(BaseInstalledAgent):
             provider, model_id = self.model_name.split("/", 1)
             provider_config: dict[str, Any] = {"models": {model_id: {}}}
             base_url = self._get_env("OPENAI_BASE_URL")
-            if base_url and provider == "openai":
+            options = provider_config.setdefault("options", {})
+
+            if provider == "minimax":
+                # Coding Plan subscription keys must use the Anthropic-compatible endpoint.
+                # opencode's @ai-sdk/anthropic provider appends `/messages` directly to the
+                # baseURL origin (no implicit `/v1`), so the baseURL must include `/v1`
+                # to land on MiniMax's `/anthropic/v1/messages` route. Verified via direct
+                # curl: /anthropic/messages returns 404, /anthropic/v1/messages returns 401.
+                # Override MINIMAX_BASE_URL for the China region or a custom endpoint.
+                options["baseURL"] = self._get_env("MINIMAX_BASE_URL") or "https://api.minimax.io/anthropic/v1"
+                options["apiKey"] = "{env:MINIMAX_API_KEY}"
+                provider_config["npm"] = "@ai-sdk/anthropic"
+            elif base_url and provider == "openai":
                 # opencode reads baseURL from provider.options, not the provider root.
-                # See: https://github.com/anomalyco/opencode config.ts ProviderConfig schema.
-                provider_config.setdefault("options", {})["baseURL"] = base_url
+                # See: https://github.com/anomalyco/opencode config.ts ProviderConfigSchema.
+                options["baseURL"] = base_url
             config["provider"] = {provider: provider_config}
 
         # Layer: defaults → auto-generated → job-level overrides.
@@ -509,6 +522,8 @@ class OpenCode(BaseInstalledAgent):
             keys.append("XAI_API_KEY")
         elif provider == "openrouter":
             keys.append("OPENROUTER_API_KEY")
+        elif provider == "minimax":
+            keys.append("MINIMAX_API_KEY")
 
         for key in keys:
             if value := self._get_env(key):

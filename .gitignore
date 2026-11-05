@@ -228,3 +228,12 @@ src/pier/viewer/static/
 # Claude Code
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks.json
+
+# Deepwork session scratch (orchestrator-only, not committed)
+.slim/deepwork/
+
+# Worktrees
+.worktrees/
+
+# Serena MCP cache
+.serena/
