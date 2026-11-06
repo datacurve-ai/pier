@@ -7,6 +7,7 @@ from pier.agents.installed.claude_code import ClaudeCode
 from pier.agents.installed.codex import Codex
 from pier.agents.installed.cursor_cli import CursorCli
 from pier.agents.installed.gemini_cli import GeminiCli
+from pier.agents.installed.grok_build import GrokBuild
 from pier.agents.installed.mini_swe_agent import MiniSweAgent
 from pier.agents.installed.opencode import OpenCode
 from pier.agents.nop import NopAgent
@@ -25,6 +26,7 @@ class AgentFactory:
         Codex,
         CursorCli,
         GeminiCli,
+        GrokBuild,
         MiniSweAgent,
         OpenCode,
     ]
