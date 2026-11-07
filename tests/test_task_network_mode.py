@@ -137,3 +137,33 @@ def test_allowed_hosts_rejected():
 def test_unknown_network_mode_rejected():
     with pytest.raises(ValidationError):
         TaskConfig.model_validate_toml("[agent]\nnetwork_mode = \"offline\"\n")
+
+
+def test_lone_shared_verifier_no_network_is_not_silently_dropped():
+    # Issue 47: with no [environment]/[agent] network_mode, a shared verifier's
+    # no-network declaration was parsed and then ignored (allow_internet stayed True).
+    with pytest.raises(ValidationError, match="verifier shares that environment"):
+        TaskConfig.model_validate_toml('[verifier]\nnetwork_mode = "no-network"\n')
+
+
+def test_lone_shared_verifier_matching_legacy_policy_is_accepted():
+    cfg = TaskConfig.model_validate_toml('[verifier]\nnetwork_mode = "public"\n')
+    assert cfg.environment.allow_internet is True
+    cfg = TaskConfig.model_validate_toml(
+        '[environment]\nallow_internet = false\n[verifier]\nnetwork_mode = "no-network"\n'
+    )
+    assert cfg.environment.allow_internet is False
+
+
+def test_lone_shared_verifier_public_against_legacy_no_internet_rejected():
+    with pytest.raises(ValidationError, match="verifier shares that environment"):
+        TaskConfig.model_validate_toml(
+            '[environment]\nallow_internet = false\n[verifier]\nnetwork_mode = "public"\n'
+        )
+
+
+def test_lone_step_verifier_no_network_is_not_silently_dropped():
+    with pytest.raises(ValidationError, match="verifier shares that environment"):
+        TaskConfig.model_validate_toml(
+            '[[steps]]\nname = "s1"\n[steps.verifier]\nnetwork_mode = "no-network"\n'
+        )

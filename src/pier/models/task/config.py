@@ -518,6 +518,14 @@ class TaskConfig(BaseModel):
         if agent_mode is not None:
             self.environment.network_mode = agent_mode
             self.environment.allow_internet = agent_mode == NetworkMode.PUBLIC
+        # The policy the agent environment actually enforces, also when no
+        # network_mode is declared and only allow_internet (or its default)
+        # applies. A shared verifier is checked against this (issue 47).
+        effective_agent_mode = agent_mode or (
+            NetworkMode.PUBLIC
+            if self.environment.allow_internet
+            else NetworkMode.NO_NETWORK
+        )
 
         def _resolve_verifier(verifier: VerifierConfig) -> None:
             mode = verifier.network_mode or task_mode
@@ -537,8 +545,7 @@ class TaskConfig(BaseModel):
                 verifier.environment.allow_internet = mode == NetworkMode.PUBLIC
             elif (
                 verifier.network_mode is not None
-                and agent_mode is not None
-                and verifier.network_mode != agent_mode
+                and verifier.network_mode != effective_agent_mode
             ):
                 # Shared-environment verifier: it runs in the agent's container,
                 # so a conflicting explicit override cannot be enforced.
