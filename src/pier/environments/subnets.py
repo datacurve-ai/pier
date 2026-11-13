@@ -24,7 +24,9 @@ def allocate_trial_subnets(trial_path: Path, pool: str) -> tuple[str, str]:
     try:
         network = ipaddress.ip_network(pool)
     except ValueError as error:
-        raise ValueError(f"Invalid PIER_DOCKER_SUBNET_POOL {pool!r}: {error}") from error
+        raise ValueError(
+            f"Invalid PIER_DOCKER_SUBNET_POOL {pool!r}: {error}"
+        ) from error
     if network.version != 4 or network.prefixlen > 28:
         raise ValueError("Pier Docker subnet pool must be IPv4 /28 or larger")
 
@@ -43,7 +45,8 @@ def allocate_trial_subnets(trial_path: Path, pool: str) -> tuple[str, str]:
                 f"Corrupt Pier Docker subnet state {state_path}: delete it ({error})"
             ) from error
         if key in allocations and all(
-            ipaddress.ip_network(subnet).subnet_of(network) for subnet in allocations[key]
+            ipaddress.ip_network(subnet).subnet_of(network)
+            for subnet in allocations[key]
         ):
             return tuple(allocations[key])  # type: ignore[return-value]
         used = {subnet for pair in allocations.values() for subnet in pair}

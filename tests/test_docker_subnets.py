@@ -15,7 +15,9 @@ POOL = "198.18.0.0/24"  # 32 /29 slots
 
 @pytest.fixture(autouse=True)
 def subnet_state(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("PIER_DOCKER_SUBNET_STATE", str(tmp_path / "state" / "subnets.json"))
+    monkeypatch.setenv(
+        "PIER_DOCKER_SUBNET_STATE", str(tmp_path / "state" / "subnets.json")
+    )
     monkeypatch.delenv("PIER_DOCKER_SUBNET_POOL", raising=False)
 
 
@@ -111,7 +113,9 @@ def test_concurrent_processes_get_disjoint_subnets(tmp_path: Path):
     assert len(set(subnets)) == len(subnets) == 32
 
 
-@pytest.mark.parametrize("pool", ["198.18.0.0/29", "fd00::/64", "198.18.0.1/24", "not-a-pool"])
+@pytest.mark.parametrize(
+    "pool", ["198.18.0.0/29", "fd00::/64", "198.18.0.1/24", "not-a-pool"]
+)
 def test_invalid_pool_is_rejected(tmp_path: Path, pool: str):
     with pytest.raises(ValueError, match="(?i)pool"):
         allocate_trial_subnets(tmp_path / "trial", pool)
@@ -139,6 +143,8 @@ def test_compose_pins_both_networks_with_pool(tmp_path: Path, monkeypatch):
 
     compose = _write_compose(tmp_path)
 
-    internal = compose["networks"]["pier-egress-internal"]["ipam"]["config"][0]["subnet"]
+    internal = compose["networks"]["pier-egress-internal"]["ipam"]["config"][0][
+        "subnet"
+    ]
     egress = compose["networks"]["default"]["ipam"]["config"][0]["subnet"]
     assert (internal, egress) == allocate_trial_subnets(tmp_path / "trial", POOL)

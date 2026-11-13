@@ -6,9 +6,9 @@ import secrets
 import shlex
 from pathlib import Path
 
+from pier.environments.subnets import allocate_trial_subnets
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
-from pier.environments.subnets import allocate_trial_subnets
 
 AGENT_INSTALL_DIR = ".pier-agent-install"
 EGRESS_PROXY_SERVICE = "pier-egress-proxy"
@@ -200,9 +200,7 @@ def write_docker_proxy_compose(
         compose["networks"]["pier-egress-internal"]["ipam"] = {
             "config": [{"subnet": internal}]
         }
-        compose["networks"]["default"] = {
-            "ipam": {"config": [{"subnet": egress}]}
-        }
+        compose["networks"]["default"] = {"ipam": {"config": [{"subnet": egress}]}}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(compose, indent=2))
     return path
