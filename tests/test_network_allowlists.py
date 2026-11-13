@@ -10,21 +10,14 @@ def domains(agent) -> set[str]:
     return set(agent.network_allowlist().domains)
 
 
-def test_codex_reports_only_custom_domain_when_base_url_is_set(tmp_path: Path):
+def test_codex_reports_custom_and_default_openai_domains(tmp_path: Path):
     agent = Codex(
         logs_dir=tmp_path,
         model_name="gpt-5.5",
         extra_env={"OPENAI_BASE_URL": "https://endpoint.respan.ai/api/"},
     )
 
-    # Local-provider patch: a configured base URL replaces the OpenAI default.
-    assert domains(agent) == {"endpoint.respan.ai"}
-
-
-def test_codex_keeps_openai_default_without_base_url(tmp_path: Path):
-    agent = Codex(logs_dir=tmp_path, model_name="gpt-5.5")
-
-    assert "api.openai.com" in domains(agent)
+    assert {"api.openai.com", "endpoint.respan.ai"} <= domains(agent)
 
 
 def test_codex_reports_config_toml_provider_base_url(tmp_path: Path):
@@ -34,7 +27,7 @@ def test_codex_reports_config_toml_provider_base_url(tmp_path: Path):
         config_toml='openai_base_url = "https://gateway.example.com/v1"\n',
     )
 
-    assert domains(agent) == {"gateway.example.com"}
+    assert {"api.openai.com", "gateway.example.com"} <= domains(agent)
 
 
 def test_gemini_cli_reports_custom_respan_base(tmp_path: Path):

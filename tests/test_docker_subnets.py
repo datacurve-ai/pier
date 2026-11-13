@@ -1,5 +1,7 @@
 import ipaddress
 import json
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -42,24 +44,76 @@ def test_trials_never_share_a_subnet(tmp_path: Path):
     assert len(set(seen)) == len(seen) == 32
 
 
-def test_exhausted_pool_raises(tmp_path: Path):
+def test_exhausted_pool_raises_and_names_the_state_file(tmp_path: Path):
     for i in range(16):
         allocate_trial_subnets(tmp_path / f"trial{i}", POOL)
 
-    with pytest.raises(RuntimeError, match="exhausted"):
+    with pytest.raises(RuntimeError, match="exhausted") as error:
         allocate_trial_subnets(tmp_path / "one-too-many", POOL)
+    assert os.environ["PIER_DOCKER_SUBNET_STATE"] in str(error.value)
 
 
-def test_state_is_persisted_and_reused(tmp_path: Path, monkeypatch):
+def test_state_is_persisted_and_reused(tmp_path: Path):
     first = allocate_trial_subnets(tmp_path / "trial", POOL)
-    state = json.loads(Path(__import__("os").environ["PIER_DOCKER_SUBNET_STATE"]).read_text())
+    state = json.loads(Path(os.environ["PIER_DOCKER_SUBNET_STATE"]).read_text())
 
-    assert list(state[str(ipaddress.ip_network(POOL))].values()) == [list(first)]
+    assert list(state.values()) == [list(first)]
 
 
-@pytest.mark.parametrize("pool", ["198.18.0.0/29", "fd00::/64"])
-def test_pool_too_small_or_ipv6_is_rejected(tmp_path: Path, pool: str):
-    with pytest.raises(ValueError):
+def test_state_path_named_like_its_lock_still_works(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PIER_DOCKER_SUBNET_STATE", str(tmp_path / "subnets.lock"))
+    first = allocate_trial_subnets(tmp_path / "a", POOL)
+    second = allocate_trial_subnets(tmp_path / "b", POOL)
+
+    assert not set(first) & set(second)
+    assert allocate_trial_subnets(tmp_path / "a", POOL) == first
+
+
+def test_overlapping_pools_never_share_a_subnet(tmp_path: Path):
+    a = allocate_trial_subnets(tmp_path / "a", "198.18.0.0/24")
+    b = allocate_trial_subnets(tmp_path / "b", "198.18.0.0/16")
+
+    assert not set(a) & set(b)
+
+
+def test_trial_whose_pair_is_outside_the_current_pool_is_reallocated(tmp_path: Path):
+    allocate_trial_subnets(tmp_path / "trial", "198.18.0.0/24")
+
+    pair = allocate_trial_subnets(tmp_path / "trial", "198.19.0.0/24")
+
+    new_pool = ipaddress.ip_network("198.19.0.0/24")
+    assert all(ipaddress.ip_network(subnet).subnet_of(new_pool) for subnet in pair)
+
+
+def test_corrupt_state_names_the_file(tmp_path: Path):
+    state = Path(os.environ["PIER_DOCKER_SUBNET_STATE"])
+    state.parent.mkdir(parents=True)
+    state.write_text("{truncated")
+
+    with pytest.raises(RuntimeError, match=str(state)):
+        allocate_trial_subnets(tmp_path / "trial", POOL)
+
+
+def _allocate_in_process(args: tuple[str, str]) -> list[str]:
+    trial, state = args
+    os.environ["PIER_DOCKER_SUBNET_STATE"] = state
+    return list(allocate_trial_subnets(Path(trial), POOL))
+
+
+def test_concurrent_processes_get_disjoint_subnets(tmp_path: Path):
+    state = os.environ["PIER_DOCKER_SUBNET_STATE"]
+    jobs = [(str(tmp_path / f"trial{i}"), state) for i in range(16)]
+
+    with multiprocessing.get_context("spawn").Pool(8) as pool:
+        pairs = pool.map(_allocate_in_process, jobs)
+
+    subnets = [subnet for pair in pairs for subnet in pair]
+    assert len(set(subnets)) == len(subnets) == 32
+
+
+@pytest.mark.parametrize("pool", ["198.18.0.0/29", "fd00::/64", "198.18.0.1/24", "not-a-pool"])
+def test_invalid_pool_is_rejected(tmp_path: Path, pool: str):
+    with pytest.raises(ValueError, match="(?i)pool"):
         allocate_trial_subnets(tmp_path / "trial", pool)
 
 
