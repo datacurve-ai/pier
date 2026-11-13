@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shlex
 from pathlib import Path
 
+from pier.environments.subnets import allocate_trial_subnets
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
@@ -193,6 +195,12 @@ def write_docker_proxy_compose(
             },
         },
     }
+    if pool := os.environ.get("PIER_DOCKER_SUBNET_POOL"):
+        internal, egress = allocate_trial_subnets(path.parent, pool)
+        compose["networks"]["pier-egress-internal"]["ipam"] = {
+            "config": [{"subnet": internal}]
+        }
+        compose["networks"]["default"] = {"ipam": {"config": [{"subnet": egress}]}}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(compose, indent=2))
     return path
