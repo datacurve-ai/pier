@@ -110,7 +110,9 @@ class Codex(BaseInstalledAgent):
                 parsed = {}
             urls.extend(collect_url_values(parsed))
 
-        return allowlist_from_urls(urls, default_domains=["api.openai.com"])
+        return allowlist_from_urls(
+            urls, default_domains=[] if urls else ["api.openai.com"]
+        )
 
     def install_spec(self) -> AgentInstallSpec:
         version_spec = f"@{self._version}" if self._version else "@latest"
