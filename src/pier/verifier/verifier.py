@@ -5,16 +5,16 @@ from pathlib import Path
 import time
 
 from pier.environments.base import BaseEnvironment
-from pier.utils.scripts import (
-    build_execution_command,
-    needs_chmod,
-    quote_shell_arg,
-)
 from pier.models.task.task import Task
 from pier.models.trial.paths import TrialPaths
 from pier.models.verifier.result import VerifierResult
 from pier.utils.env import resolve_env_vars
 from pier.utils.logger import logger as global_logger
+from pier.utils.scripts import (
+    build_execution_command,
+    needs_chmod,
+    quote_shell_arg,
+)
 
 
 class VerifierTimeoutError(asyncio.TimeoutError):
@@ -263,24 +263,41 @@ class Verifier:
 
         # Runs as ``environment.default_user``, which the caller must set to the
         # effective verifier user (step-level override or task-level fallback).
-        rem = _remaining_sec()
-        if rem is not None and rem <= 0:
-            raise VerifierTestExecutionTimeoutError(
-                f"Candidate test execution timed out (verifier timeout of {timeout_sec}s exhausted)"
-            )
+        completed = False
         try:
-            exec_coro = self._environment.exec(
-                command=command,
-                env=env,
-            )
-            if rem is not None:
-                await asyncio.wait_for(exec_coro, timeout=rem)
-            else:
-                await exec_coro
-        except asyncio.TimeoutError as e:
-            raise VerifierTestExecutionTimeoutError(
-                f"Candidate test execution timed out after {timeout_sec} seconds"
-            ) from e
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierTestExecutionTimeoutError(
+                    f"Candidate test execution timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
+            try:
+                exec_coro = self._environment.exec(
+                    command=command,
+                    env=env,
+                )
+                if rem is not None:
+                    await asyncio.wait_for(exec_coro, timeout=rem)
+                else:
+                    await exec_coro
+            except asyncio.TimeoutError as e:
+                raise VerifierTestExecutionTimeoutError(
+                    f"Candidate test execution timed out after {timeout_sec} seconds"
+                ) from e
+            completed = True
+        finally:
+            # A failed or timed-out run keeps whatever output the verifier wrote,
+            # without replacing the original error.
+            if not completed and not self._environment.capabilities.mounted:
+                try:
+                    await self._environment.download_dir(
+                        source_dir=str(env_paths.verifier_dir),
+                        target_dir=self._trial_paths.verifier_dir,
+                    )
+                except Exception:
+                    self._logger.warning(
+                        "Failed to retain verifier output after execution failed",
+                        exc_info=True,
+                    )
 
         rem = _remaining_sec()
         if rem is not None and rem <= 0:
