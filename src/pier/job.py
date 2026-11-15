@@ -756,10 +756,18 @@ class Job:
 
             async def on_verification_start(event: TrialHookEvent):
                 if event.trial_id in trial_progress_tasks:
+                    attempt_str = ""
+                    if event.result is not None and event.result.verifier_attempt is not None:
+                        max_att = (
+                            event.result.max_verifier_attempts
+                            or getattr(event.config.verifier, "max_attempts", 2)
+                        )
+                        attempt_str = f" (attempt {event.result.verifier_attempt}/{max_att})"
                     running_progress.update(
                         trial_progress_tasks[event.trial_id],
-                        description=f"{event.trial_id}: running verifier...",
+                        description=f"{event.trial_id}: running verifier{attempt_str}...",
                     )
+
 
             async def on_cancel(event: TrialHookEvent):
                 if event.trial_id in trial_progress_tasks:

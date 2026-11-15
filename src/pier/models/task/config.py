@@ -181,8 +181,21 @@ class VerifierCollectConfig(BaseModel):
 
 
 class VerifierConfig(NetworkPolicyFieldsMixin):
-    timeout_sec: float = 600.0
+    timeout_sec: float = Field(
+        default=600.0,
+        description=(
+            "Total verifier timeout in seconds. Note that verifier.timeout_sec "
+            "currently wraps environment startup and test execution together, "
+            "rather than adding to verifier.environment.build_timeout_sec."
+        ),
+    )
+    max_attempts: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of verifier execution attempts (default: 2 in TrialConfig). Set to 1 to disable retries.",
+    )
     env: dict[str, str] = Field(default_factory=dict)
+
     user: str | int | None = Field(
         default=None,
         description="Username or UID to run the verifier as. None uses the environment's default USER (e.g., root).",

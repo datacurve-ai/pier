@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 from pathlib import Path
+import time
 
 from pier.environments.base import BaseEnvironment
 from pier.models.task.task import Task
@@ -13,6 +15,37 @@ from pier.utils.scripts import (
     needs_chmod,
     quote_shell_arg,
 )
+
+
+class VerifierTimeoutError(asyncio.TimeoutError):
+    """Base exception for all verifier timeout errors."""
+    pass
+
+
+class VerifierEnvironmentTimeoutError(VerifierTimeoutError):
+    """Raised when verifier environment startup or build times out."""
+    pass
+
+
+class VerifierArtifactTransferTimeoutError(VerifierTimeoutError):
+    """Raised when artifact transfer, directory setup, or test upload times out."""
+    pass
+
+
+class VerifierTestExecutionTimeoutError(VerifierTimeoutError):
+    """Raised when the candidate test execution command itself times out."""
+    pass
+
+
+class VerifierRewardParseTimeoutError(VerifierTimeoutError):
+    """Raised when downloading or parsing verifier rewards times out."""
+    pass
+
+
+VerifierEnvironmentStartTimeoutError = VerifierEnvironmentTimeoutError
+VerifierInfrastructureTimeoutError = VerifierArtifactTransferTimeoutError
+VerifierRewardTimeoutError = VerifierRewardParseTimeoutError
+VerifierRewardDownloadTimeoutError = VerifierRewardParseTimeoutError
 
 
 class AddTestsDirError(Exception):
@@ -127,23 +160,50 @@ class Verifier:
             f"or {self._task.paths.test_path_for(task_os)}"
         )
 
-    async def verify(self) -> VerifierResult:
+    async def verify(
+        self,
+        *,
+        timeout_sec: float | None = None,
+        deadline: float | None = None,
+    ) -> VerifierResult:
         """
         Grades the agents performance based on the environment.
         Returns:
             (VerifierResult): The result of the verifier.
         """
+        if deadline is None and timeout_sec is not None:
+            deadline = time.monotonic() + timeout_sec
+
+        def _remaining_sec() -> float | None:
+            if deadline is None:
+                return timeout_sec
+            rem = deadline - time.monotonic()
+            return max(0.0, rem)
+
         env_paths = self._environment.env_paths
         task_os = self._task.config.environment.os
         test_source_dirs, tests_source_dir, host_test_path = self._resolve_tests()
 
         if not self._skip_tests_upload:
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier test upload timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
             try:
                 for source_dir in test_source_dirs:
-                    await self._environment.upload_dir(
+                    upload_coro = self._environment.upload_dir(
                         source_dir=source_dir,
                         target_dir=str(env_paths.tests_dir),
                     )
+                    if rem is not None:
+                        await asyncio.wait_for(upload_coro, timeout=rem)
+                    else:
+                        await upload_coro
+            except asyncio.TimeoutError as e:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier test upload timed out after {timeout_sec} seconds"
+                ) from e
             except Exception as e:
                 raise AddTestsDirError(
                     "Failed to add tests directory to environment."
@@ -182,33 +242,87 @@ class Verifier:
         )
 
         if needs_chmod(test_script_path):
-            await self._environment.exec(
-                command=f"chmod +x {quote_shell_arg(test_script_path, task_os)}",
-                user="root",
-            )
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier test chmod timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
+            try:
+                chmod_coro = self._environment.exec(
+                    command=f"chmod +x {quote_shell_arg(test_script_path, task_os)}",
+                    user="root",
+                )
+                if rem is not None:
+                    await asyncio.wait_for(chmod_coro, timeout=rem)
+                else:
+                    await chmod_coro
+            except asyncio.TimeoutError as e:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier test chmod timed out after {timeout_sec} seconds"
+                ) from e
 
         # Runs as ``environment.default_user``, which the caller must set to the
         # effective verifier user (step-level override or task-level fallback).
         completed = False
         try:
-            await self._environment.exec(command=command, env=env)
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierTestExecutionTimeoutError(
+                    f"Candidate test execution timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
+            try:
+                exec_coro = self._environment.exec(
+                    command=command,
+                    env=env,
+                )
+                if rem is not None:
+                    await asyncio.wait_for(exec_coro, timeout=rem)
+                else:
+                    await exec_coro
+            except asyncio.TimeoutError as e:
+                raise VerifierTestExecutionTimeoutError(
+                    f"Candidate test execution timed out after {timeout_sec} seconds"
+                ) from e
             completed = True
         finally:
-            if not self._environment.capabilities.mounted:
+            # A failed or timed-out run keeps whatever output the verifier wrote,
+            # without replacing the original error.
+            if not completed and not self._environment.capabilities.mounted:
                 try:
                     await self._environment.download_dir(
                         source_dir=str(env_paths.verifier_dir),
                         target_dir=self._trial_paths.verifier_dir,
                     )
-                except Exception as e:
-                    if completed:
-                        raise DownloadVerifierDirError(
-                            "Failed to download verifier directory from environment"
-                        ) from e
+                except Exception:
                     self._logger.warning(
                         "Failed to retain verifier output after execution failed",
                         exc_info=True,
                     )
+
+        rem = _remaining_sec()
+        if rem is not None and rem <= 0:
+            raise VerifierRewardParseTimeoutError(
+                f"Verifier reward download or parse timed out (verifier timeout of {timeout_sec}s exhausted)"
+            )
+
+        if not self._environment.capabilities.mounted:
+            try:
+                dl_coro = self._environment.download_dir(
+                    source_dir=str(env_paths.verifier_dir),
+                    target_dir=self._trial_paths.verifier_dir,
+                )
+                if rem is not None:
+                    await asyncio.wait_for(dl_coro, timeout=rem)
+                else:
+                    await dl_coro
+            except asyncio.TimeoutError as e:
+                raise VerifierRewardParseTimeoutError(
+                    f"Verifier reward directory download timed out after {timeout_sec} seconds"
+                ) from e
+            except Exception as e:
+                raise DownloadVerifierDirError(
+                    "Failed to download verifier directory from environment"
+                ) from e
 
         if self._trial_paths.reward_text_path.exists():
             rewards = self._parse_reward_text()
@@ -222,3 +336,4 @@ class Verifier:
             )
 
         return VerifierResult(rewards=rewards)
+

@@ -8,7 +8,8 @@ import traceback
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
+
 
 from tenacity import (
     retry,
@@ -57,12 +58,20 @@ from pier.trial.execution import (
     EnvironmentStartTimeoutError,
     TrialExecution,
 )
+import time
 from pier.utils.logger import logger
-from pier.verifier.verifier import Verifier
-
-
-class VerifierTimeoutError(asyncio.TimeoutError):
-    pass
+from pier.verifier.verifier import (
+    Verifier,
+    VerifierArtifactTransferTimeoutError,
+    VerifierEnvironmentStartTimeoutError,
+    VerifierEnvironmentTimeoutError,
+    VerifierInfrastructureTimeoutError,
+    VerifierRewardDownloadTimeoutError,
+    VerifierRewardParseTimeoutError,
+    VerifierRewardTimeoutError,
+    VerifierTestExecutionTimeoutError,
+    VerifierTimeoutError,
+)
 
 
 __all__ = [
@@ -71,7 +80,16 @@ __all__ = [
     "EnvironmentStartTimeoutError",
     "Trial",
     "VerifierTimeoutError",
+    "VerifierEnvironmentTimeoutError",
+    "VerifierEnvironmentStartTimeoutError",
+    "VerifierArtifactTransferTimeoutError",
+    "VerifierInfrastructureTimeoutError",
+    "VerifierTestExecutionTimeoutError",
+    "VerifierRewardParseTimeoutError",
+    "VerifierRewardTimeoutError",
+    "VerifierRewardDownloadTimeoutError",
 ]
+
 
 
 TrialHookCallback = Callable[[TrialHookEvent], Awaitable[None]]
@@ -201,22 +219,27 @@ class Trial:
         self._log_handler: logging.Handler | None = None
         self._init_logger()
 
-        self._execution = TrialExecution.create(
-            task=self._task,
-            agent_config=config.agent,
-            environment_config=config.environment,
-            trial_paths=self._trial_paths,
-            session_id=self.config.trial_name,
-            logger=self._logger,
-            timeout_multiplier=config.timeout_multiplier,
-            agent_timeout_multiplier=config.agent_timeout_multiplier,
-            agent_setup_timeout_multiplier=config.agent_setup_timeout_multiplier,
-            environment_build_timeout_multiplier=config.environment_build_timeout_multiplier,
-            default_agent_setup_timeout_sec=self._AGENT_SETUP_TIMEOUT_SEC,
-        )
-        self._agent = self._execution.agent
-        self._environment = self._execution.environment
-        self._init_artifact_handler()
+        try:
+            self._execution = TrialExecution.create(
+                task=self._task,
+                agent_config=config.agent,
+                environment_config=config.environment,
+                trial_paths=self._trial_paths,
+                session_id=self.config.trial_name,
+                logger=self._logger,
+                timeout_multiplier=config.timeout_multiplier,
+                agent_timeout_multiplier=config.agent_timeout_multiplier,
+                agent_setup_timeout_multiplier=config.agent_setup_timeout_multiplier,
+                environment_build_timeout_multiplier=config.environment_build_timeout_multiplier,
+                default_agent_setup_timeout_sec=self._AGENT_SETUP_TIMEOUT_SEC,
+            )
+            self._agent = self._execution.agent
+            self._environment = self._execution.environment
+            self._init_artifact_handler()
+        except Exception:
+            self._close_logger_handler()
+            raise
+
 
         self._verifier_timeout_sec = min(
             config.verifier.override_timeout_sec
@@ -228,13 +251,45 @@ class Trial:
             else config.timeout_multiplier
         )
 
+        self._verifier_max_attempts = (
+            config.verifier.max_attempts
+            if config.verifier.max_attempts is not None
+            else getattr(self._task.config.verifier, "max_attempts", None) or 2
+        )
+
         self._result: TrialResult | None = None
+
+    def _write_progress(
+        self,
+        phase: str,
+        *,
+        verifier_attempt: int | None = None,
+        max_verifier_attempts: int | None = None,
+        **extra: Any,
+    ) -> None:
+        """Atomically persist durable progress state to trial_dir/progress.json."""
+        data = {
+            "trial_name": self.config.trial_name,
+            "task_name": self._task.name,
+            "phase": phase,
+            "verifier_attempt": verifier_attempt,
+            "max_verifier_attempts": max_verifier_attempts,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **extra,
+        }
+        try:
+            self._trial_paths.progress_path.write_text(
+                json.dumps(data, indent=4)
+            )
+        except Exception as e:
+            self._logger.debug(f"Failed to write progress.json: {e}")
 
     @property
     def result(self) -> TrialResult:
         if self._result is None:
             raise RuntimeError("Trial result accessed before initialization")
         return self._result
+
 
     def _init_logger(self):
         self._logger = logger.getChild(f"{__name__}.{self.config.trial_name}")
@@ -284,6 +339,7 @@ class Trial:
         return self.config.trials_dir / self.config.trial_name
 
     async def _setup_environment(self) -> None:
+        self._write_progress("environment_setup")
         await self._invoke_hooks(TrialEvent.ENVIRONMENT_START)
 
         self.result.environment_setup = TimingInfo(
@@ -298,6 +354,7 @@ class Trial:
             self.result.environment_setup.finished_at = datetime.now(timezone.utc)
 
     async def _setup_agent(self) -> None:
+        self._write_progress("agent_setup")
         self.result.agent_setup = TimingInfo(started_at=datetime.now(timezone.utc))
         try:
             await self._execution.setup_agent()
@@ -305,6 +362,7 @@ class Trial:
             self.result.agent_setup.finished_at = datetime.now(timezone.utc)
 
     async def _execute_agent(self) -> None:
+        self._write_progress("agent_execution")
         await self._invoke_hooks(TrialEvent.AGENT_START)
 
         self.result.agent_execution = TimingInfo(started_at=datetime.now(timezone.utc))
@@ -319,34 +377,77 @@ class Trial:
         finally:
             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
 
-    async def _run_verification(self) -> None:
-        await self._invoke_hooks(TrialEvent.VERIFICATION_START)
 
-        self.result.verifier = TimingInfo(started_at=datetime.now(timezone.utc))
+    async def _run_verification(self) -> None:
+        self.result.verifier = TimingInfo(
+            started_at=datetime.now(timezone.utc),
+            attempt=1,
+            max_attempts=self._verifier_max_attempts,
+        )
 
         try:
             await self._verify_with_retry()
         finally:
             self.result.verifier.finished_at = datetime.now(timezone.utc)
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(VerifierTimeoutError),
-    )
     async def _verify_with_retry(self) -> None:
-        try:
-            self.result.verifier_result = await asyncio.wait_for(
-                self._verify_once(step_cfg=None),
-                timeout=self._verifier_timeout_sec,
+        max_attempts = self._verifier_max_attempts
+
+        for attempt in range(1, max_attempts + 1):
+            self.result.verifier_attempt = attempt
+            self.result.max_verifier_attempts = max_attempts
+            if self.result.verifier is not None:
+                self.result.verifier.attempt = attempt
+                self.result.verifier.max_attempts = max_attempts
+            self._write_progress(
+                "verifier",
+                verifier_attempt=attempt,
+                max_verifier_attempts=max_attempts,
             )
-        except asyncio.TimeoutError as e:
-            raise VerifierTimeoutError(
-                f"Verifier execution timed out after {
-                    self._verifier_timeout_sec
-                } seconds"
-            ) from e
+            await self._invoke_hooks(TrialEvent.VERIFICATION_START)
+
+            deadline = time.monotonic() + self._verifier_timeout_sec
+            try:
+                self.result.verifier_result = await self._verify_once(
+                    step_cfg=None,
+                    timeout_sec=self._verifier_timeout_sec,
+                    deadline=deadline,
+                )
+                return
+            except VerifierTestExecutionTimeoutError as exc:
+                # Do not retry candidate test-execution timeout by default
+                self._logger.warning(
+                    f"Verifier attempt {attempt}/{max_attempts} failed with candidate "
+                    f"test execution timeout: {exc}. Not retrying candidate test timeout."
+                )
+                raise
+            except (
+                VerifierEnvironmentTimeoutError,
+                VerifierArtifactTransferTimeoutError,
+                EnvironmentStartTimeoutError,
+            ) as exc:
+                self._logger.warning(
+                    f"Verifier attempt {attempt}/{max_attempts} failed with infrastructure "
+                    f"timeout: {exc}"
+                )
+                if attempt < max_attempts:
+                    backoff = min(10.0, 1.0 * (2 ** (attempt - 1)))
+                    self._logger.info(
+                        f"Retrying verifier infrastructure failure in {backoff:.1f}s "
+                        f"(attempt {attempt + 1}/{max_attempts})..."
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    raise
+            except VerifierTimeoutError as exc:
+                self._logger.warning(
+                    f"Verifier attempt {attempt}/{max_attempts} failed with timeout: {exc}"
+                )
+                if attempt < max_attempts and not isinstance(exc, VerifierTestExecutionTimeoutError):
+                    backoff = min(10.0, 1.0 * (2 ** (attempt - 1)))
+                    await asyncio.sleep(backoff)
+                else:
+                    raise
 
     async def _verify_once(
         self,
@@ -354,6 +455,8 @@ class Trial:
         step_cfg: StepConfig | None,
         verifier_env: dict[str, str] | None = None,
         artifacts_dir: Path | None = None,
+        timeout_sec: float | None = None,
+        deadline: float | None = None,
     ) -> VerifierResult:
         separate_env_config = resolve_effective_verifier_env_config(
             self._task.config,
@@ -369,7 +472,7 @@ class Trial:
                 verifier_env=verifier_env,
                 step_name=step_cfg.name if step_cfg is not None else None,
             )
-            return await verifier.verify()
+            return await verifier.verify(timeout_sec=timeout_sec, deadline=deadline)
 
         return await self._verify_with_separate_environment(
             separate_env_config,
@@ -382,6 +485,8 @@ class Trial:
                 else self._trial_paths.artifacts_dir
             ),
             artifacts=step_cfg.artifacts if step_cfg is not None else None,
+            timeout_sec=timeout_sec,
+            deadline=deadline,
         )
 
     async def _verify_with_separate_environment(
@@ -393,7 +498,18 @@ class Trial:
         verifier_env: dict[str, str] | None,
         artifacts_dir: Path,
         artifacts: Sequence[str | ArtifactConfig] | None = None,
+        timeout_sec: float | None = None,
+        deadline: float | None = None,
     ) -> VerifierResult:
+        if deadline is None and timeout_sec is not None:
+            deadline = time.monotonic() + timeout_sec
+
+        def _remaining_sec() -> float | None:
+            if deadline is None:
+                return timeout_sec
+            rem = deadline - time.monotonic()
+            return max(0.0, rem)
+
         env = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment,
             environment_dir=self._verifier_env_build_context(step_cfg),
@@ -412,18 +528,47 @@ class Trial:
             ),
         )
         try:
-            await env.start(force_build=False)
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierEnvironmentTimeoutError(
+                    f"Verifier environment startup timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
+            try:
+                start_coro = env.start(force_build=False)
+                if rem is not None:
+                    await asyncio.wait_for(start_coro, timeout=rem)
+                else:
+                    await start_coro
+            except asyncio.TimeoutError as exc:
+                raise VerifierEnvironmentTimeoutError(
+                    f"Verifier environment startup timed out after {timeout_sec} seconds"
+                ) from exc
+
             env_paths = env.env_paths
 
-            await env.empty_dirs([env_paths.verifier_dir], chmod=True)
-
-            await self._artifact_handler.upload_artifacts(
-                env,
-                artifacts_dir=artifacts_dir,
-                source_artifacts_dir=self._environment.env_paths.artifacts_dir,
-                target_artifacts_dir=env_paths.artifacts_dir,
-                artifacts=artifacts,
-            )
+            rem = _remaining_sec()
+            if rem is not None and rem <= 0:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier artifact transfer timed out (verifier timeout of {timeout_sec}s exhausted)"
+                )
+            try:
+                async def _prep_env():
+                    await env.empty_dirs([env_paths.verifier_dir], chmod=True)
+                    await self._artifact_handler.upload_artifacts(
+                        env,
+                        artifacts_dir=artifacts_dir,
+                        source_artifacts_dir=self._environment.env_paths.artifacts_dir,
+                        target_artifacts_dir=env_paths.artifacts_dir,
+                        artifacts=artifacts,
+                    )
+                if rem is not None:
+                    await asyncio.wait_for(_prep_env(), timeout=rem)
+                else:
+                    await _prep_env()
+            except asyncio.TimeoutError as exc:
+                raise VerifierArtifactTransferTimeoutError(
+                    f"Verifier artifact transfer timed out after {timeout_sec} seconds"
+                ) from exc
 
             verifier = Verifier(
                 task=self._task,
@@ -435,12 +580,13 @@ class Trial:
                 verifier_env=verifier_env,
                 step_name=step_cfg.name if step_cfg is not None else None,
             )
-            return await verifier.verify()
+            return await verifier.verify(timeout_sec=timeout_sec, deadline=deadline)
         finally:
             try:
                 await asyncio.shield(env.stop(delete=self.config.environment.delete))
             except Exception as exc:
                 self._logger.debug(f"Failed to stop verifier env '{key}': {exc}")
+
 
     def _verifier_env_mounts(
         self,
@@ -515,8 +661,14 @@ class Trial:
         self.result.n_agent_steps = self.result.agent_step_count()
 
         self._trial_paths.result_path.write_text(self.result.model_dump_json(indent=4))
+        self._write_progress(
+            "completed",
+            verifier_attempt=self.result.verifier_attempt,
+            max_verifier_attempts=self.result.max_verifier_attempts,
+        )
 
         await self._invoke_hooks(TrialEvent.END)
+
 
     async def _maybe_download_logs(self, source_dir: str, target_dir: Path) -> None:
         if self._are_agent_logs_downloaded:
@@ -666,7 +818,13 @@ class Trial:
             specific_multiplier=self.config.verifier_timeout_multiplier,
         )
 
-        step_result.verifier = TimingInfo(started_at=datetime.now(timezone.utc))
+        step_result.verifier = TimingInfo(
+            started_at=datetime.now(timezone.utc),
+            attempt=1,
+            max_attempts=1,
+        )
+        step_result.verifier_attempt = 1
+        step_result.max_verifier_attempts = 1
         try:
             await self._invoke_hooks(TrialEvent.VERIFICATION_START)
             # Separate-mode verification runs in its own environment; the agent
@@ -679,13 +837,13 @@ class Trial:
                     chmod_dirs=[env_paths.verifier_dir],
                 )
 
-            step_result.verifier_result = await asyncio.wait_for(
-                self._verify_once(
-                    step_cfg=step_cfg,
-                    verifier_env=step_cfg.verifier.env or None,
-                    artifacts_dir=artifacts_dir,
-                ),
-                timeout=timeout,
+            deadline = time.monotonic() + timeout if timeout is not None else None
+            step_result.verifier_result = await self._verify_once(
+                step_cfg=step_cfg,
+                verifier_env=step_cfg.verifier.env or None,
+                artifacts_dir=artifacts_dir,
+                timeout_sec=timeout,
+                deadline=deadline,
             )
         except Exception as e:
             if step_result.exception_info is None:
@@ -942,116 +1100,119 @@ class Trial:
         return artifacts_dir
 
     async def run(self) -> TrialResult:
-        self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
-        self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
-
-        self._result = TrialResult(
-            trial_name=self.config.trial_name,
-            task_name=self._task.name,
-            task_id=self.config.task.get_task_id(),
-            started_at=datetime.now(timezone.utc),
-            config=self.config,
-            task_checksum=self._task.checksum,
-            trial_uri=self._trial_paths.trial_dir.expanduser().resolve().as_uri(),
-            agent_info=self._agent.to_agent_info(),
-            source=self.config.task.source,
-        )
-
-        await self._invoke_hooks(TrialEvent.START)
-
         try:
-            await self._setup_environment()
-            await self._environment.run_healthcheck()
-            self._environment.default_user = self._task.config.agent.user
-            await self._setup_agent()
-            self._result.agent_info = self._agent.to_agent_info()
+            self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
+            self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
+
+            self._result = TrialResult(
+                trial_name=self.config.trial_name,
+                task_name=self._task.name,
+                task_id=self.config.task.get_task_id(),
+                started_at=datetime.now(timezone.utc),
+                config=self.config,
+                task_checksum=self._task.checksum,
+                trial_uri=self._trial_paths.trial_dir.expanduser().resolve().as_uri(),
+                agent_info=self._agent.to_agent_info(),
+                source=self.config.task.source,
+            )
+
+            await self._invoke_hooks(TrialEvent.START)
+
             try:
-                if self._task.has_steps:
-                    await self._run_steps()
-                else:
-                    try:
-                        await self._execute_agent()
-
-                        await self._maybe_download_logs(
-                            source_dir=self._environment.env_paths.agent_dir.as_posix(),
-                            target_dir=self._trial_paths.agent_dir,
-                        )
-                        self._maybe_populate_agent_context(self.result.agent_result)
-
-                    except (AgentTimeoutError, NonZeroAgentExitCodeError) as e:
-                        self.result.exception_info = ExceptionInfo.from_exception(e)
-                        self._trial_paths.exception_message_path.write_text(
-                            traceback.format_exc()
-                        )
-                        await self._maybe_download_logs(
-                            source_dir=self._environment.env_paths.agent_dir.as_posix(),
-                            target_dir=self._trial_paths.agent_dir,
-                        )
-                        self._maybe_populate_agent_context(self.result.agent_result)
-            finally:
-                self._environment.default_user = None
-
-            # Collect artifacts from the agent environment before verification
-            # so a separate verifier environment can receive them. Multi-step
-            # trials collect artifacts per-step inside _run_steps.
-            if not self._task.has_steps:
-                await self._run_pre_artifacts_script()
-                await self._run_collect_hooks()
-                await self._maybe_upload_agent_logs()
-                await self._collect_artifacts()
-
-                if (
-                    resolve_task_verifier_mode(self._task.config)
-                    == VerifierEnvironmentMode.SEPARATE
-                ):
-                    await self._stop_agent_environment(keep_images=True)
-
-            if not self.config.verifier.disable and not self._task.has_steps:
-                self._environment.default_user = self._task.config.verifier.user
+                await self._setup_environment()
+                await self._environment.run_healthcheck()
+                self._environment.default_user = self._task.config.agent.user
+                await self._setup_agent()
+                self._result.agent_info = self._agent.to_agent_info()
                 try:
-                    await self._run_verification()
+                    if self._task.has_steps:
+                        await self._run_steps()
+                    else:
+                        try:
+                            await self._execute_agent()
+
+                            await self._maybe_download_logs(
+                                source_dir=self._environment.env_paths.agent_dir.as_posix(),
+                                target_dir=self._trial_paths.agent_dir,
+                            )
+                            self._maybe_populate_agent_context(self.result.agent_result)
+
+                        except (AgentTimeoutError, NonZeroAgentExitCodeError) as e:
+                            self.result.exception_info = ExceptionInfo.from_exception(e)
+                            self._trial_paths.exception_message_path.write_text(
+                                traceback.format_exc()
+                            )
+                            await self._maybe_download_logs(
+                                source_dir=self._environment.env_paths.agent_dir.as_posix(),
+                                target_dir=self._trial_paths.agent_dir,
+                            )
+                            self._maybe_populate_agent_context(self.result.agent_result)
                 finally:
                     self._environment.default_user = None
 
-        except asyncio.CancelledError as e:
-            self._logger.debug(f"Trial {self.config.trial_name} cancelled")
-            if self.result.exception_info is None:
-                self.result.exception_info = ExceptionInfo.from_exception(e)
-                self._trial_paths.exception_message_path.write_text(
-                    traceback.format_exc()
+                # Collect artifacts from the agent environment before verification
+                # so a separate verifier environment can receive them. Multi-step
+                # trials collect artifacts per-step inside _run_steps.
+                if not self._task.has_steps:
+                    await self._run_pre_artifacts_script()
+                    await self._run_collect_hooks()
+                    await self._maybe_upload_agent_logs()
+                    await self._collect_artifacts()
+
+                    if (
+                        resolve_task_verifier_mode(self._task.config)
+                        == VerifierEnvironmentMode.SEPARATE
+                    ):
+                        await self._stop_agent_environment(keep_images=True)
+
+                if not self.config.verifier.disable and not self._task.has_steps:
+                    self._environment.default_user = self._task.config.verifier.user
+                    try:
+                        await self._run_verification()
+                    finally:
+                        self._environment.default_user = None
+
+            except asyncio.CancelledError as e:
+                self._logger.debug(f"Trial {self.config.trial_name} cancelled")
+                if self.result.exception_info is None:
+                    self.result.exception_info = ExceptionInfo.from_exception(e)
+                    self._trial_paths.exception_message_path.write_text(
+                        traceback.format_exc()
+                    )
+
+                await self._maybe_download_logs(
+                    source_dir=self._environment.env_paths.agent_dir.as_posix(),
+                    target_dir=self._trial_paths.agent_dir,
                 )
+                self._maybe_populate_agent_context(self.result.agent_result)
+                if not self._task.has_steps:
+                    await self._collect_artifacts()
+                await self._invoke_hooks(TrialEvent.CANCEL)
 
-            await self._maybe_download_logs(
-                source_dir=self._environment.env_paths.agent_dir.as_posix(),
-                target_dir=self._trial_paths.agent_dir,
-            )
-            self._maybe_populate_agent_context(self.result.agent_result)
-            if not self._task.has_steps:
-                await self._collect_artifacts()
-            await self._invoke_hooks(TrialEvent.CANCEL)
+                raise e
 
-            raise e
+            except Exception as e:
+                self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")
 
-        except Exception as e:
-            self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")
-
-            await self._maybe_download_logs(
-                source_dir=self._environment.env_paths.agent_dir.as_posix(),
-                target_dir=self._trial_paths.agent_dir,
-            )
-            self._maybe_populate_agent_context(self.result.agent_result)
-
-            if self.result.exception_info is None:
-                self.result.exception_info = ExceptionInfo.from_exception(e)
-                self._trial_paths.exception_message_path.write_text(
-                    traceback.format_exc()
+                await self._maybe_download_logs(
+                    source_dir=self._environment.env_paths.agent_dir.as_posix(),
+                    target_dir=self._trial_paths.agent_dir,
                 )
+                self._maybe_populate_agent_context(self.result.agent_result)
 
-            if not self._task.has_steps:
-                await self._collect_artifacts()
+                if self.result.exception_info is None:
+                    self.result.exception_info = ExceptionInfo.from_exception(e)
+                    self._trial_paths.exception_message_path.write_text(
+                        traceback.format_exc()
+                    )
 
+                if not self._task.has_steps:
+                    await self._collect_artifacts()
+
+            finally:
+                await self._cleanup_and_finalize()
+
+            return self.result
         finally:
-            await self._cleanup_and_finalize()
             self._close_logger_handler()
 
-        return self.result
