@@ -73,7 +73,7 @@ def write_agent_dockerfile(
     )
     dockerfile.extend(dockerfile_install_commands(install, user=user))
     dockerfile.append("")
-    dockerfile_path.write_text("\n".join(dockerfile))
+    dockerfile_path.write_text("\n".join(dockerfile), newline="\n")
     return dockerfile_path
 
 
@@ -162,9 +162,12 @@ def write_docker_proxy_compose(
                 'CMD ["bash", "/usr/local/bin/start-squid.sh"]',
                 "",
             ]
-        )
+        ),
+        newline="\n",
     )
-    (proxy_dir / "start-squid.sh").write_text(squid_bootstrap_command())
+    (proxy_dir / "start-squid.sh").write_text(
+        squid_bootstrap_command(), newline="\n"
+    )
     compose = {
         "services": {
             "main": {
