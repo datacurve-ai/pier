@@ -102,6 +102,22 @@ set -eu
 printf '%s' "$ALLOWLIST_DOMAINS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' \
   > /tmp/allowed_domains.txt
 
+# An allowlisted host:port (an endpoint on a port other than 80 or 443) is allowed on that port
+# only, before the generic port rules: a literal IP is matched with dst, a name with dstdomain.
+i=0
+printf '%s\n' "${ALLOWLIST_ENDPOINTS:-}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' |
+while IFS= read -r endpoint; do
+  host="${endpoint%:*}"
+  port="${endpoint##*:}"
+  host="${host#[}"
+  host="${host%]}"
+  if [[ "$host" =~ ^[0-9.]+$ || "$host" == *:* ]]; then kind=dst; else kind=dstdomain; fi
+  echo "acl allowed_endpoint_${i}_host ${kind} ${host}"
+  echo "acl allowed_endpoint_${i}_port port ${port}"
+  echo "http_access allow authenticated allowed_endpoint_${i}_host allowed_endpoint_${i}_port"
+  i=$((i + 1))
+done > /tmp/allowed_endpoints.conf
+
 htpasswd -bc /tmp/squid.passwd agent "$PROXY_TOKEN"
 
 cat > /tmp/squid.conf <<'EOF'
@@ -118,6 +134,7 @@ acl Safe_ports port 80 443
 acl CONNECT method CONNECT
 acl allowed_domains dstdomain "/tmp/allowed_domains.txt"
 
+include /tmp/allowed_endpoints.conf
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access allow authenticated allowed_domains
@@ -138,6 +155,7 @@ def proxy_policy_env(allowlist: NetworkAllowlist, token: str) -> dict[str, str]:
     return {
         "PROXY_TOKEN": token,
         "ALLOWLIST_DOMAINS": ",".join(allowlist.domains),
+        "ALLOWLIST_ENDPOINTS": ",".join(allowlist.endpoints),
     }
 
 

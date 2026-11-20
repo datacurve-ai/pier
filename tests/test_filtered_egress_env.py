@@ -1,16 +1,21 @@
 import asyncio
 import json
+import os
+import subprocess
 
 from pier.environments.agent_setup import (
     EGRESS_PROXY_PORT,
     EGRESS_PROXY_SERVICE,
     docker_run_command,
     proxy_environment,
+    proxy_policy_env,
+    squid_bootstrap_command,
     write_docker_proxy_compose,
 )
 from pier.environments.base import ExecResult
 from pier.environments.docker.docker import DockerEnvironment
 from pier.environments.modal import ModalEnvironment, _ModalDinD, _ModalDirect
+from pier.models.agent.network import NetworkAllowlist
 
 
 def test_docker_proxy_compose_does_not_inject_proxy_env_into_main(tmp_path):
@@ -18,7 +23,7 @@ def test_docker_proxy_compose_does_not_inject_proxy_env_into_main(tmp_path):
     write_docker_proxy_compose(
         path=path,
         proxy_dir=tmp_path / "proxy",
-        allowlist=type("Allowlist", (), {"domains": ["api.openai.com"]})(),
+        allowlist=NetworkAllowlist(domains=["api.openai.com"]),
         token="secret",
     )
 
@@ -122,3 +127,43 @@ def test_modal_exec_preserves_env_when_switching_user():
     assert result.return_code == 0
     assert env._strategy.env == {"PATH": "/custom"}
     assert env._strategy.command == "su -m agent -s /bin/bash -c 'echo $PATH'"
+
+
+def test_proxy_policy_passes_allowlisted_endpoints_to_squid():
+    allowlist = NetworkAllowlist(domains=["192.0.2.10"], endpoints=["192.0.2.10:8000"])
+    env = proxy_policy_env(allowlist, "secret")
+    assert env["ALLOWLIST_DOMAINS"] == "192.0.2.10"
+    assert env["ALLOWLIST_ENDPOINTS"] == "192.0.2.10:8000"
+
+
+def test_squid_allows_allowlisted_endpoints_before_the_port_rules(tmp_path):
+    script = squid_bootstrap_command()
+    include = script.index("include /tmp/allowed_endpoints.conf")
+    assert include < script.index("http_access deny !Safe_ports")
+    assert include < script.index("http_access deny CONNECT !SSL_ports")
+
+    # Run the part of the script that writes the endpoint rules.
+    begin = script.index("i=0\n")
+    end = script.index("done > /tmp/allowed_endpoints.conf") + len(
+        "done > /tmp/allowed_endpoints.conf"
+    )
+    conf = tmp_path / "allowed_endpoints.conf"
+    snippet = script[begin:end].replace("/tmp/allowed_endpoints.conf", str(conf))
+    env = {
+        "PATH": os.environ["PATH"],
+        "ALLOWLIST_ENDPOINTS": "192.0.2.10:8000,models.example.com:8080",
+    }
+    subprocess.run(["bash", "-c", snippet], env=env, check=True)
+    assert conf.read_text().splitlines() == [
+        "acl allowed_endpoint_0_host dst 192.0.2.10",
+        "acl allowed_endpoint_0_port port 8000",
+        "http_access allow authenticated allowed_endpoint_0_host allowed_endpoint_0_port",
+        "acl allowed_endpoint_1_host dstdomain models.example.com",
+        "acl allowed_endpoint_1_port port 8080",
+        "http_access allow authenticated allowed_endpoint_1_host allowed_endpoint_1_port",
+    ]
+
+    subprocess.run(
+        ["bash", "-c", snippet], env={"PATH": os.environ["PATH"]}, check=True
+    )
+    assert conf.read_text() == ""

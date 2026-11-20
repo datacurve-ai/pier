@@ -60,7 +60,7 @@ For environments without mounted logs, Pier attempts to copy `/logs/verifier/` i
 
 ## Agent runtime configuration
 
-Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes.
+Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes. A URL on a port other than 80 or 443 (`http://192.0.2.10:8000/v1`) is allowlisted with its port: the egress proxy opens that host on that port only, and every other port stays closed.
 
 A few things we've learned plumbing this through Respan and OpenRouter:
 

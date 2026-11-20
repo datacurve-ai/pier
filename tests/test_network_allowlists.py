@@ -1,9 +1,14 @@
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from pier.agents.installed.codex import Codex
 from pier.agents.installed.gemini_cli import GeminiCli
 from pier.agents.installed.mini_swe_agent import MiniSweAgent
 from pier.agents.installed.opencode import OpenCode
+from pier.agents.network import allowlist_from_urls
+from pier.models.agent.network import NetworkAllowlist
 
 
 def domains(agent) -> set[str]:
@@ -104,3 +109,44 @@ model:
     )
 
     assert {"api.openai.com", "gateway.example.com"} <= domains(agent)
+
+
+def test_mini_swe_agent_allows_a_self_hosted_endpoint_on_its_own_port(tmp_path: Path):
+    # A server on a port other than 80/443 (#37): its host:port is allowlisted, not only its host.
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openai/my-model",
+        extra_env={"OPENAI_BASE_URL": "http://192.0.2.10:8000/v1"},
+    )
+
+    allowlist = agent.network_allowlist()
+    assert "192.0.2.10" in allowlist.domains
+    assert allowlist.endpoints == ["192.0.2.10:8000"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gateway.example.com/v1",
+        "http://gateway.example.com:80/v1",
+        "https://gateway.example.com:443",
+    ],
+)
+def test_default_ports_need_no_endpoint(url: str):
+    allowlist = allowlist_from_urls([url])
+    assert allowlist.domains == ["gateway.example.com"]
+    assert allowlist.endpoints == []
+
+
+def test_endpoints_are_normalized_and_validated():
+    allowlist = NetworkAllowlist(endpoints=["Models.Example.com.:08080", "[::1]:8000"])
+    assert allowlist.endpoints == ["[::1]:8000", "models.example.com:8080"]
+    for bad in [
+        "models.example.com",
+        "models.example.com:0",
+        "models.example.com:http",
+        ":8000",
+        "*.example.com:80",
+    ]:
+        with pytest.raises(ValidationError):
+            NetworkAllowlist(endpoints=[bad])
