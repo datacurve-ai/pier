@@ -7,8 +7,11 @@ from urllib.parse import urlparse
 from pier.models.agent.network import NetworkAllowlist
 
 
-def hostname_from_url(value: Any) -> str | None:
-    """Return the hostname for a URL-like config value."""
+# The ports the egress proxy allows to every allowlisted domain.
+DEFAULT_PORTS = frozenset({80, 443})
+
+
+def _parse_url(value: Any):
     if not isinstance(value, str):
         return None
 
@@ -23,7 +26,27 @@ def hostname_from_url(value: Any) -> str | None:
     parsed = urlparse(raw if has_scheme else f"https://{raw}")
     if not parsed.hostname:
         return None
-    return parsed.hostname.lower().rstrip(".")
+    return parsed
+
+
+def hostname_from_url(value: Any) -> str | None:
+    """Return the hostname for a URL-like config value."""
+    parsed = _parse_url(value)
+    return parsed.hostname.lower().rstrip(".") if parsed else None
+
+
+def endpoint_from_url(value: Any) -> str | None:
+    """Return ``host:port`` for a URL-like config value that names a port other than
+    80 or 443, which the egress proxy does not allow by domain alone."""
+    parsed = _parse_url(value)
+    try:
+        port = parsed.port if parsed else None
+    except ValueError:
+        return None
+    if port is None or port in DEFAULT_PORTS:
+        return None
+    host = parsed.hostname.lower().rstrip(".")
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 def allowlist_from_urls(
@@ -32,10 +55,13 @@ def allowlist_from_urls(
     default_domains: Iterable[str] = (),
 ) -> NetworkAllowlist:
     domains = {domain for domain in default_domains if domain}
+    endpoints: set[str] = set()
     for value in values:
         if hostname := hostname_from_url(value):
             domains.add(hostname)
-    return NetworkAllowlist(domains=sorted(domains))
+        if endpoint := endpoint_from_url(value):
+            endpoints.add(endpoint)
+    return NetworkAllowlist(domains=sorted(domains), endpoints=sorted(endpoints))
 
 
 def collect_url_values(value: Any, *, keys: set[str] | None = None) -> list[str]:
